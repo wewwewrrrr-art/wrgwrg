@@ -95,11 +95,16 @@ export class StagedChannelStore {
   private capacityValue: number;
   private readonly channelIsEnergy: Uint8Array;
 
-  private front: Float64Array[];
-  private back: Float64Array[];
-  private dirtyFlag: Uint8Array;
-  private dirtyList: Uint32Array;
-  private dirtyCountValue = 0;
+  /** @internal */
+  front: Float64Array[];
+  /** @internal */
+  back: Float64Array[];
+  /** @internal */
+  dirtyFlag: Uint8Array;
+  /** @internal */
+  dirtyList: Uint32Array;
+  /** @internal */
+  dirtyCountValue = 0;
   private slotVersion: Uint32Array;
   private swapCountValue = 0;
 
@@ -288,8 +293,74 @@ export class StagedChannelStore {
 
   validateStaged(label: string): void {
     const n = this.dirtyCountValue;
+    if (n === 0) return;
     const dirty = this.dirtyList;
-    for (let c = 0; c < this.channelCount; c++) {
+    const cc = this.channelCount;
+    if (cc === 4) {
+      const b0 = this.back[0];
+      const b1 = this.back[1];
+      const b2 = this.back[2];
+      const b3 = this.back[3];
+      for (let i = 0; i < n; i++) {
+        const slot = dirty[i];
+        const v0 = b0[slot];
+        const v1 = b1[slot];
+        const v2 = b2[slot];
+        const v3 = b3[slot];
+        if (
+          !(v0 >= 0) || v0 > LOCAL_MAX_SAFE_INT || Math.floor(v0) !== v0 ||
+          !(v1 >= 0) || v1 > LOCAL_MAX_SAFE_INT || Math.floor(v1) !== v1 ||
+          !(v2 >= 0) || v2 > LOCAL_MAX_SAFE_INT || Math.floor(v2) !== v2 ||
+          !(v3 >= 0) || v3 > LOCAL_MAX_SAFE_INT || Math.floor(v3) !== v3
+        ) {
+          for (let c = 0; c < 4; c++) {
+            const v = this.back[c][slot];
+            if (!(v >= 0) || v > LOCAL_MAX_SAFE_INT || Math.floor(v) !== v) {
+              throw new EnergyStoreError(
+                `${label}: staged value of channel ${c} slot ${slot} is not a valid quantum count: ${v}`
+              );
+            }
+          }
+        }
+      }
+      return;
+    }
+    if (cc === 6) {
+      const b0 = this.back[0];
+      const b1 = this.back[1];
+      const b2 = this.back[2];
+      const b3 = this.back[3];
+      const b4 = this.back[4];
+      const b5 = this.back[5];
+      for (let i = 0; i < n; i++) {
+        const slot = dirty[i];
+        const v0 = b0[slot];
+        const v1 = b1[slot];
+        const v2 = b2[slot];
+        const v3 = b3[slot];
+        const v4 = b4[slot];
+        const v5 = b5[slot];
+        if (
+          !(v0 >= 0) || v0 > LOCAL_MAX_SAFE_INT || Math.floor(v0) !== v0 ||
+          !(v1 >= 0) || v1 > LOCAL_MAX_SAFE_INT || Math.floor(v1) !== v1 ||
+          !(v2 >= 0) || v2 > LOCAL_MAX_SAFE_INT || Math.floor(v2) !== v2 ||
+          !(v3 >= 0) || v3 > LOCAL_MAX_SAFE_INT || Math.floor(v3) !== v3 ||
+          !(v4 >= 0) || v4 > LOCAL_MAX_SAFE_INT || Math.floor(v4) !== v4 ||
+          !(v5 >= 0) || v5 > LOCAL_MAX_SAFE_INT || Math.floor(v5) !== v5
+        ) {
+          for (let c = 0; c < 6; c++) {
+            const v = this.back[c][slot];
+            if (!(v >= 0) || v > LOCAL_MAX_SAFE_INT || Math.floor(v) !== v) {
+              throw new EnergyStoreError(
+                `${label}: staged value of channel ${c} slot ${slot} is not a valid quantum count: ${v}`
+              );
+            }
+          }
+        }
+      }
+      return;
+    }
+    for (let c = 0; c < cc; c++) {
       const back = this.back[c];
       for (let i = 0; i < n; i++) {
         const slot = dirty[i];
@@ -313,18 +384,81 @@ export class StagedChannelStore {
     const n = this.dirtyCountValue;
     if (n === 0) return;
     const dirty = this.dirtyList;
-    for (let c = 0; c < this.channelCount; c++) {
+    const cc = this.channelCount;
+    const PARTIAL_LIMIT = 35_184_372_088_832; // 2^45 (well below 2^52)
+    if (cc === 4 && this.channelIsEnergy[0] === 0 && this.channelIsEnergy[1] === 1 && this.channelIsEnergy[2] === 0 && this.channelIsEnergy[3] === 1) {
+      const f0 = this.front[0], b0 = this.back[0];
+      const f1 = this.front[1], b1 = this.back[1];
+      const f2 = this.front[2], b2 = this.back[2];
+      const f3 = this.front[3], b3 = this.back[3];
+      let mP = 0, mN = 0, eP = 0, eN = 0;
+      for (let i = 0; i < n; i++) {
+        const slot = dirty[i];
+        const d0 = b0[slot] - f0[slot];
+        if (d0 > 0) {
+          if (d0 >= PARTIAL_LIMIT) acc.addFast(massPos, d0);
+          else { mP += d0; if (mP >= PARTIAL_LIMIT) { acc.addFast(massPos, mP); mP = 0; } }
+        } else if (d0 < 0) {
+          const ad0 = -d0;
+          if (ad0 >= PARTIAL_LIMIT) acc.addFast(massNeg, ad0);
+          else { mN += ad0; if (mN >= PARTIAL_LIMIT) { acc.addFast(massNeg, mN); mN = 0; } }
+        }
+        const d1 = b1[slot] - f1[slot];
+        if (d1 > 0) {
+          if (d1 >= PARTIAL_LIMIT) acc.addFast(energyPos, d1);
+          else { eP += d1; if (eP >= PARTIAL_LIMIT) { acc.addFast(energyPos, eP); eP = 0; } }
+        } else if (d1 < 0) {
+          const ad1 = -d1;
+          if (ad1 >= PARTIAL_LIMIT) acc.addFast(energyNeg, ad1);
+          else { eN += ad1; if (eN >= PARTIAL_LIMIT) { acc.addFast(energyNeg, eN); eN = 0; } }
+        }
+        const d2 = b2[slot] - f2[slot];
+        if (d2 > 0) {
+          if (d2 >= PARTIAL_LIMIT) acc.addFast(massPos, d2);
+          else { mP += d2; if (mP >= PARTIAL_LIMIT) { acc.addFast(massPos, mP); mP = 0; } }
+        } else if (d2 < 0) {
+          const ad2 = -d2;
+          if (ad2 >= PARTIAL_LIMIT) acc.addFast(massNeg, ad2);
+          else { mN += ad2; if (mN >= PARTIAL_LIMIT) { acc.addFast(massNeg, mN); mN = 0; } }
+        }
+        const d3 = b3[slot] - f3[slot];
+        if (d3 > 0) {
+          if (d3 >= PARTIAL_LIMIT) acc.addFast(energyPos, d3);
+          else { eP += d3; if (eP >= PARTIAL_LIMIT) { acc.addFast(energyPos, eP); eP = 0; } }
+        } else if (d3 < 0) {
+          const ad3 = -d3;
+          if (ad3 >= PARTIAL_LIMIT) acc.addFast(energyNeg, ad3);
+          else { eN += ad3; if (eN >= PARTIAL_LIMIT) { acc.addFast(energyNeg, eN); eN = 0; } }
+        }
+      }
+      if (mP > 0) acc.addFast(massPos, mP);
+      if (mN > 0) acc.addFast(massNeg, mN);
+      if (eP > 0) acc.addFast(energyPos, eP);
+      if (eN > 0) acc.addFast(energyNeg, eN);
+      return;
+    }
+    for (let c = 0; c < cc; c++) {
       const isEnergy = this.channelIsEnergy[c] === 1;
       const pos = isEnergy ? energyPos : massPos;
       const neg = isEnergy ? energyNeg : massNeg;
       const front = this.front[c];
       const back = this.back[c];
+      let pSum = 0;
+      let nSum = 0;
       for (let i = 0; i < n; i++) {
         const slot = dirty[i];
         const d = back[slot] - front[slot];
-        if (d > 0) acc.addFast(pos, d);
-        else if (d < 0) acc.addFast(neg, -d);
+        if (d > 0) {
+          if (d >= PARTIAL_LIMIT) acc.addFast(pos, d);
+          else { pSum += d; if (pSum >= PARTIAL_LIMIT) { acc.addFast(pos, pSum); pSum = 0; } }
+        } else if (d < 0) {
+          const ad = -d;
+          if (ad >= PARTIAL_LIMIT) acc.addFast(neg, ad);
+          else { nSum += ad; if (nSum >= PARTIAL_LIMIT) { acc.addFast(neg, nSum); nSum = 0; } }
+        }
       }
+      if (pSum > 0) acc.addFast(pos, pSum);
+      if (nSum > 0) acc.addFast(neg, nSum);
     }
   }
 
@@ -352,14 +486,53 @@ export class StagedChannelStore {
     this.swapCountValue++;
 
     const v = version >>> 0;
+    const cc = this.channelCount;
     if (n === this.capacityValue) {
-      for (let c = 0; c < this.channelCount; c++) {
+      for (let c = 0; c < cc; c++) {
         newBack[c].set(newFront[c]);
       }
       this.slotVersion.fill(v);
       this.dirtyFlag.fill(0);
+    } else if (cc === 4) {
+      const sf0 = newFront[0], db0 = newBack[0];
+      const sf1 = newFront[1], db1 = newBack[1];
+      const sf2 = newFront[2], db2 = newBack[2];
+      const sf3 = newFront[3], db3 = newBack[3];
+      const dirty = this.dirtyList;
+      const versions = this.slotVersion;
+      const flags = this.dirtyFlag;
+      for (let i = 0; i < n; i++) {
+        const slot = dirty[i];
+        db0[slot] = sf0[slot];
+        db1[slot] = sf1[slot];
+        db2[slot] = sf2[slot];
+        db3[slot] = sf3[slot];
+        versions[slot] = v;
+        flags[slot] = 0;
+      }
+    } else if (cc === 6) {
+      const sf0 = newFront[0], db0 = newBack[0];
+      const sf1 = newFront[1], db1 = newBack[1];
+      const sf2 = newFront[2], db2 = newBack[2];
+      const sf3 = newFront[3], db3 = newBack[3];
+      const sf4 = newFront[4], db4 = newBack[4];
+      const sf5 = newFront[5], db5 = newBack[5];
+      const dirty = this.dirtyList;
+      const versions = this.slotVersion;
+      const flags = this.dirtyFlag;
+      for (let i = 0; i < n; i++) {
+        const slot = dirty[i];
+        db0[slot] = sf0[slot];
+        db1[slot] = sf1[slot];
+        db2[slot] = sf2[slot];
+        db3[slot] = sf3[slot];
+        db4[slot] = sf4[slot];
+        db5[slot] = sf5[slot];
+        versions[slot] = v;
+        flags[slot] = 0;
+      }
     } else {
-      for (let c = 0; c < this.channelCount; c++) {
+      for (let c = 0; c < cc; c++) {
         const src = newFront[c];
         const dst = newBack[c];
         for (let i = 0; i < n; i++) {
@@ -379,16 +552,52 @@ export class StagedChannelStore {
   /** Discards staged values by restoring dirty slots from the committed buffer. */
   abort(): void {
     const n = this.dirtyCountValue;
-    for (let c = 0; c < this.channelCount; c++) {
-      const src = this.front[c];
-      const dst = this.back[c];
+    if (n === 0) return;
+    const cc = this.channelCount;
+    const dirty = this.dirtyList;
+    const flags = this.dirtyFlag;
+    if (cc === 4) {
+      const sf0 = this.front[0], db0 = this.back[0];
+      const sf1 = this.front[1], db1 = this.back[1];
+      const sf2 = this.front[2], db2 = this.back[2];
+      const sf3 = this.front[3], db3 = this.back[3];
       for (let i = 0; i < n; i++) {
-        const slot = this.dirtyList[i];
-        dst[slot] = src[slot];
+        const slot = dirty[i];
+        db0[slot] = sf0[slot];
+        db1[slot] = sf1[slot];
+        db2[slot] = sf2[slot];
+        db3[slot] = sf3[slot];
+        flags[slot] = 0;
       }
-    }
-    for (let i = 0; i < n; i++) {
-      this.dirtyFlag[this.dirtyList[i]] = 0;
+    } else if (cc === 6) {
+      const sf0 = this.front[0], db0 = this.back[0];
+      const sf1 = this.front[1], db1 = this.back[1];
+      const sf2 = this.front[2], db2 = this.back[2];
+      const sf3 = this.front[3], db3 = this.back[3];
+      const sf4 = this.front[4], db4 = this.back[4];
+      const sf5 = this.front[5], db5 = this.back[5];
+      for (let i = 0; i < n; i++) {
+        const slot = dirty[i];
+        db0[slot] = sf0[slot];
+        db1[slot] = sf1[slot];
+        db2[slot] = sf2[slot];
+        db3[slot] = sf3[slot];
+        db4[slot] = sf4[slot];
+        db5[slot] = sf5[slot];
+        flags[slot] = 0;
+      }
+    } else {
+      for (let c = 0; c < cc; c++) {
+        const src = this.front[c];
+        const dst = this.back[c];
+        for (let i = 0; i < n; i++) {
+          const slot = dirty[i];
+          dst[slot] = src[slot];
+        }
+      }
+      for (let i = 0; i < n; i++) {
+        flags[dirty[i]] = 0;
+      }
     }
     this.dirtyCountValue = 0;
   }
@@ -710,6 +919,11 @@ export class EntityEnergyStore extends StagedStore {
     if (capacity <= this.store.capacity) return;
     EntityEnergyStore.assertBudget(capacity, this.maxMemoryBytes);
     this.store.grow(capacity);
+  }
+
+  /** @internal Exposes underlying channel store for direct validated transaction staging. */
+  _getChannelStore(): StagedChannelStore {
+    return this.store;
   }
 
   typedArrayBytes(): number {

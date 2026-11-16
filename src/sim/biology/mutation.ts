@@ -279,3 +279,45 @@ export function mutateGenomeWithPlan(
 
   return { mutationCount, records: records ?? EMPTY_MUTATION_RECORDS };
 }
+
+/**
+ * Allocation-free variant of `mutateGenomeWithPlan(..., false)` for hot reproduction loops.
+ */
+export function mutateGenomeWithPlanCount(
+  genome: DiploidGenome,
+  plan: CompiledMutationPlan,
+  rng: SeededRng
+): number {
+  const n = plan.locusCount;
+  const effRates = plan.effRates;
+  const sigmas = plan.sigmas;
+  const meanDeltas = plan.meanDeltas;
+  const minVals = plan.minVals;
+  const maxVals = plan.maxVals;
+  const mat = genome.maternalAlleles;
+  const pat = genome.paternalAlleles;
+  let mutationCount = 0;
+
+  for (let i = 0; i < n; i++) {
+    const effRate = effRates[i];
+    if (effRate <= 0) continue;
+    const sigma = sigmas[i];
+    if (sigma <= 0) continue;
+    const meanDelta = meanDeltas[i];
+    const rMin = minVals[i];
+    const rMax = maxVals[i];
+
+    if (rng.chance(effRate)) {
+      const v = mat[i] + rng.gaussian(meanDelta, sigma);
+      mat[i] = v < rMin ? rMin : v > rMax ? rMax : v;
+      mutationCount++;
+    }
+    if (rng.chance(effRate)) {
+      const v = pat[i] + rng.gaussian(meanDelta, sigma);
+      pat[i] = v < rMin ? rMin : v > rMax ? rMax : v;
+      mutationCount++;
+    }
+  }
+
+  return mutationCount;
+}

@@ -68,34 +68,6 @@ export interface PopulationStats {
   };
 }
 
-function emptyTraitRecord(species: SpeciesDefinition): Record<string, number> {
-  const out: Record<string, number> = {};
-  const loci = species.genomeSchema.loci;
-  for (let l = 0; l < loci.length; l++) {
-    out[loci[l].id] = 0;
-  }
-  return out;
-}
-
-function buildMeanRecord(
-  species: SpeciesDefinition,
-  sums: Float64Array,
-  count: number
-): Record<string, number> {
-  const out: Record<string, number> = {};
-  const loci = species.genomeSchema.loci;
-  if (count <= 0) {
-    for (let l = 0; l < loci.length; l++) {
-      out[loci[l].id] = 0;
-    }
-    return out;
-  }
-  const inv = 1 / count;
-  for (let l = 0; l < loci.length; l++) {
-    out[loci[l].id] = sums[l] * inv;
-  }
-  return out;
-}
 
 /**
  * Population container using a low-allocation `Int32Array` intrusive spatial hash
@@ -114,6 +86,8 @@ export class PopulationManager {
   private nextInCell: Int32Array;
   private spatialIndexBuilt = false;
 
+  private readonly locusIds: readonly string[];
+  private readonly locusCount: number;
   // Reusable scratch accumulators for computeStats()
   private readonly sumGen: Float64Array;
   private readonly sumSqGen: Float64Array;
@@ -152,6 +126,8 @@ export class PopulationManager {
 
     const schema = species.genomeSchema;
     const n = schema.locusCount;
+    this.locusCount = n;
+    const ids: string[] = new Array(n);
     this.sumGen = new Float64Array(n);
     this.sumSqGen = new Float64Array(n);
     this.sumPhen = new Float64Array(n);
@@ -162,10 +138,12 @@ export class PopulationManager {
     this.locusInvSpan = new Float64Array(n);
     for (let l = 0; l < n; l++) {
       const def = schema.loci[l];
+      ids[l] = def.id;
       const range = species.traitRanges[def.id] ?? def.defaultRange;
       const span = range.max - range.min;
       this.locusInvSpan[l] = span > 0 ? 1 / span : 0;
     }
+    this.locusIds = ids;
   }
 
   get size(): number {
@@ -437,9 +415,10 @@ export class PopulationManager {
   }
 
   computeStats(tick: number): PopulationStats {
-    const schema = this.species.genomeSchema;
-    const locusCount = schema.locusCount;
-    const activeLen = this.active.length;
+    const locusIds = this.locusIds;
+    const locusCount = this.locusCount;
+    const active = this.active;
+    const activeLen = active.length;
 
     let totalAlive = 0;
     let female = 0;
@@ -476,75 +455,166 @@ export class PopulationManager {
 
     let sumAbsDiffAlleles = 0;
     let sumNormalizedDiffAlleles = 0;
-    const active = this.active;
 
-    for (let i = 0; i < activeLen; i++) {
-      const org = active[i];
-      if (!org.alive) continue;
+    if (locusCount === 10 && activeLen > 0) {
+      let sg0 = 0, sg1 = 0, sg2 = 0, sg3 = 0, sg4 = 0, sg5 = 0, sg6 = 0, sg7 = 0, sg8 = 0, sg9 = 0;
+      let ss0 = 0, ss1 = 0, ss2 = 0, ss3 = 0, ss4 = 0, ss5 = 0, ss6 = 0, ss7 = 0, ss8 = 0, ss9 = 0;
+      let sp0 = 0, sp1 = 0, sp2 = 0, sp3 = 0, sp4 = 0, sp5 = 0, sp6 = 0, sp7 = 0, sp8 = 0, sp9 = 0;
+      let sa0 = 0, sa1 = 0, sa2 = 0, sa3 = 0, sa4 = 0, sa5 = 0, sa6 = 0, sa7 = 0, sa8 = 0, sa9 = 0;
+      const inv0 = locusInvSpan[0], inv1 = locusInvSpan[1], inv2 = locusInvSpan[2], inv3 = locusInvSpan[3], inv4 = locusInvSpan[4];
+      const inv5 = locusInvSpan[5], inv6 = locusInvSpan[6], inv7 = locusInvSpan[7], inv8 = locusInvSpan[8], inv9 = locusInvSpan[9];
 
-      totalAlive++;
-      if (org.sex === 'female') female++;
-      else male++;
+      for (let i = 0; i < activeLen; i++) {
+        const org = active[i];
+        if (!org.alive) continue;
 
-      const stage = org.stage;
-      let stageSums: Float64Array | null;
-      if (stage === 'adult') {
-        adultCount++;
-        stageSums = sumAdultPhen;
-      } else if (stage === 'egg') {
-        eggCount++;
-        stageSums = sumEggPhen;
-      } else if (stage === 'juvenile') {
-        juvCount++;
-        stageSums = sumJuvPhen;
-      } else if (stage === 'elder') {
-        elderCount++;
-        stageSums = sumElderPhen;
-      } else {
-        stageSums = null;
+        totalAlive++;
+        if (org.sex === 'female') female++;
+        else male++;
+
+        const gNum = org.generation;
+        if (gNum > maxGeneration) maxGeneration = gNum;
+        if (gNum >= 0 && gNum < genLimit) {
+          if (genSeen[gNum] === 0) {
+            genSeen[gNum] = 1;
+            genDirty.push(gNum);
+            uniqueSmallGen++;
+          }
+        } else {
+          generationsAlive.add(gNum);
+        }
+
+        const phenObj = org.phenotype;
+        const gen = phenObj.geneticExpression;
+        const phen = phenObj.expressed;
+        const genomeObj = org.genome;
+        const mat = genomeObj.maternalAlleles;
+        const pat = genomeObj.paternalAlleles;
+
+        const g0 = gen[0]; sg0 += g0; ss0 += g0 * g0;
+        const g1 = gen[1]; sg1 += g1; ss1 += g1 * g1;
+        const g2 = gen[2]; sg2 += g2; ss2 += g2 * g2;
+        const g3 = gen[3]; sg3 += g3; ss3 += g3 * g3;
+        const g4 = gen[4]; sg4 += g4; ss4 += g4 * g4;
+        const g5 = gen[5]; sg5 += g5; ss5 += g5 * g5;
+        const g6 = gen[6]; sg6 += g6; ss6 += g6 * g6;
+        const g7 = gen[7]; sg7 += g7; ss7 += g7 * g7;
+        const g8 = gen[8]; sg8 += g8; ss8 += g8 * g8;
+        const g9 = gen[9]; sg9 += g9; ss9 += g9 * g9;
+
+        const p0 = phen[0], p1 = phen[1], p2 = phen[2], p3 = phen[3], p4 = phen[4];
+        const p5 = phen[5], p6 = phen[6], p7 = phen[7], p8 = phen[8], p9 = phen[9];
+        sp0 += p0; sp1 += p1; sp2 += p2; sp3 += p3; sp4 += p4;
+        sp5 += p5; sp6 += p6; sp7 += p7; sp8 += p8; sp9 += p9;
+
+        const stage = org.stage;
+        if (stage === 'adult') {
+          adultCount++;
+          sa0 += p0; sa1 += p1; sa2 += p2; sa3 += p3; sa4 += p4;
+          sa5 += p5; sa6 += p6; sa7 += p7; sa8 += p8; sa9 += p9;
+        } else if (stage === 'egg') {
+          eggCount++;
+          sumEggPhen[0] += p0; sumEggPhen[1] += p1; sumEggPhen[2] += p2; sumEggPhen[3] += p3; sumEggPhen[4] += p4;
+          sumEggPhen[5] += p5; sumEggPhen[6] += p6; sumEggPhen[7] += p7; sumEggPhen[8] += p8; sumEggPhen[9] += p9;
+        } else if (stage === 'juvenile') {
+          juvCount++;
+          sumJuvPhen[0] += p0; sumJuvPhen[1] += p1; sumJuvPhen[2] += p2; sumJuvPhen[3] += p3; sumJuvPhen[4] += p4;
+          sumJuvPhen[5] += p5; sumJuvPhen[6] += p6; sumJuvPhen[7] += p7; sumJuvPhen[8] += p8; sumJuvPhen[9] += p9;
+        } else if (stage === 'elder') {
+          elderCount++;
+          sumElderPhen[0] += p0; sumElderPhen[1] += p1; sumElderPhen[2] += p2; sumElderPhen[3] += p3; sumElderPhen[4] += p4;
+          sumElderPhen[5] += p5; sumElderPhen[6] += p6; sumElderPhen[7] += p7; sumElderPhen[8] += p8; sumElderPhen[9] += p9;
+        }
+
+        let d = mat[0] - pat[0]; let ad = d < 0 ? -d : d; sumAbsDiffAlleles += ad; sumNormalizedDiffAlleles += ad * inv0;
+        d = mat[1] - pat[1]; ad = d < 0 ? -d : d; sumAbsDiffAlleles += ad; sumNormalizedDiffAlleles += ad * inv1;
+        d = mat[2] - pat[2]; ad = d < 0 ? -d : d; sumAbsDiffAlleles += ad; sumNormalizedDiffAlleles += ad * inv2;
+        d = mat[3] - pat[3]; ad = d < 0 ? -d : d; sumAbsDiffAlleles += ad; sumNormalizedDiffAlleles += ad * inv3;
+        d = mat[4] - pat[4]; ad = d < 0 ? -d : d; sumAbsDiffAlleles += ad; sumNormalizedDiffAlleles += ad * inv4;
+        d = mat[5] - pat[5]; ad = d < 0 ? -d : d; sumAbsDiffAlleles += ad; sumNormalizedDiffAlleles += ad * inv5;
+        d = mat[6] - pat[6]; ad = d < 0 ? -d : d; sumAbsDiffAlleles += ad; sumNormalizedDiffAlleles += ad * inv6;
+        d = mat[7] - pat[7]; ad = d < 0 ? -d : d; sumAbsDiffAlleles += ad; sumNormalizedDiffAlleles += ad * inv7;
+        d = mat[8] - pat[8]; ad = d < 0 ? -d : d; sumAbsDiffAlleles += ad; sumNormalizedDiffAlleles += ad * inv8;
+        d = mat[9] - pat[9]; ad = d < 0 ? -d : d; sumAbsDiffAlleles += ad; sumNormalizedDiffAlleles += ad * inv9;
       }
 
-      const gNum = org.generation;
-      if (gNum > maxGeneration) maxGeneration = gNum;
-      if (gNum >= 0 && gNum < genLimit) {
-        if (genSeen[gNum] === 0) {
-          genSeen[gNum] = 1;
-          genDirty.push(gNum);
-          uniqueSmallGen++;
-        }
-      } else {
-        generationsAlive.add(gNum);
-      }
+      sumGen[0] = sg0; sumGen[1] = sg1; sumGen[2] = sg2; sumGen[3] = sg3; sumGen[4] = sg4;
+      sumGen[5] = sg5; sumGen[6] = sg6; sumGen[7] = sg7; sumGen[8] = sg8; sumGen[9] = sg9;
+      sumSqGen[0] = ss0; sumSqGen[1] = ss1; sumSqGen[2] = ss2; sumSqGen[3] = ss3; sumSqGen[4] = ss4;
+      sumSqGen[5] = ss5; sumSqGen[6] = ss6; sumSqGen[7] = ss7; sumSqGen[8] = ss8; sumSqGen[9] = ss9;
+      sumPhen[0] = sp0; sumPhen[1] = sp1; sumPhen[2] = sp2; sumPhen[3] = sp3; sumPhen[4] = sp4;
+      sumPhen[5] = sp5; sumPhen[6] = sp6; sumPhen[7] = sp7; sumPhen[8] = sp8; sumPhen[9] = sp9;
+      sumAdultPhen[0] = sa0; sumAdultPhen[1] = sa1; sumAdultPhen[2] = sa2; sumAdultPhen[3] = sa3; sumAdultPhen[4] = sa4;
+      sumAdultPhen[5] = sa5; sumAdultPhen[6] = sa6; sumAdultPhen[7] = sa7; sumAdultPhen[8] = sa8; sumAdultPhen[9] = sa9;
+    } else if (activeLen > 0) {
+      for (let i = 0; i < activeLen; i++) {
+        const org = active[i];
+        if (!org.alive) continue;
 
-      const gen = org.phenotype.geneticExpression;
-      const phen = org.phenotype.expressed;
-      const mat = org.genome.maternalAlleles;
-      const pat = org.genome.paternalAlleles;
+        totalAlive++;
+        if (org.sex === 'female') female++;
+        else male++;
 
-      if (stageSums !== null) {
-        for (let l = 0; l < locusCount; l++) {
-          const g = gen[l];
-          const p = phen[l];
-          sumGen[l] += g;
-          sumSqGen[l] += g * g;
-          sumPhen[l] += p;
-          stageSums[l] += p;
-          const d = mat[l] - pat[l];
-          const absDiff = d < 0 ? -d : d;
-          sumAbsDiffAlleles += absDiff;
-          sumNormalizedDiffAlleles += absDiff * locusInvSpan[l];
+        const stage = org.stage;
+        let stageSums: Float64Array | null;
+        if (stage === 'adult') {
+          adultCount++;
+          stageSums = sumAdultPhen;
+        } else if (stage === 'egg') {
+          eggCount++;
+          stageSums = sumEggPhen;
+        } else if (stage === 'juvenile') {
+          juvCount++;
+          stageSums = sumJuvPhen;
+        } else if (stage === 'elder') {
+          elderCount++;
+          stageSums = sumElderPhen;
+        } else {
+          stageSums = null;
         }
-      } else {
-        for (let l = 0; l < locusCount; l++) {
-          const g = gen[l];
-          const p = phen[l];
-          sumGen[l] += g;
-          sumSqGen[l] += g * g;
-          sumPhen[l] += p;
-          const d = mat[l] - pat[l];
-          const absDiff = d < 0 ? -d : d;
-          sumAbsDiffAlleles += absDiff;
-          sumNormalizedDiffAlleles += absDiff * locusInvSpan[l];
+
+        const gNum = org.generation;
+        if (gNum > maxGeneration) maxGeneration = gNum;
+        if (gNum >= 0 && gNum < genLimit) {
+          if (genSeen[gNum] === 0) {
+            genSeen[gNum] = 1;
+            genDirty.push(gNum);
+            uniqueSmallGen++;
+          }
+        } else {
+          generationsAlive.add(gNum);
+        }
+
+        const gen = org.phenotype.geneticExpression;
+        const phen = org.phenotype.expressed;
+        const mat = org.genome.maternalAlleles;
+        const pat = org.genome.paternalAlleles;
+
+        if (stageSums !== null) {
+          for (let l = 0; l < locusCount; l++) {
+            const g = gen[l];
+            const p = phen[l];
+            sumGen[l] += g;
+            sumSqGen[l] += g * g;
+            sumPhen[l] += p;
+            stageSums[l] += p;
+            const d = mat[l] - pat[l];
+            const absDiff = d < 0 ? -d : d;
+            sumAbsDiffAlleles += absDiff;
+            sumNormalizedDiffAlleles += absDiff * locusInvSpan[l];
+          }
+        } else {
+          for (let l = 0; l < locusCount; l++) {
+            const g = gen[l];
+            const p = phen[l];
+            sumGen[l] += g;
+            sumSqGen[l] += g * g;
+            sumPhen[l] += p;
+            const d = mat[l] - pat[l];
+            const absDiff = d < 0 ? -d : d;
+            sumAbsDiffAlleles += absDiff;
+            sumNormalizedDiffAlleles += absDiff * locusInvSpan[l];
+          }
         }
       }
     }
@@ -565,15 +635,28 @@ export class PopulationManager {
     const meanGenotype: Record<string, number> = {};
     const meanPhenotype: Record<string, number> = {};
     const traitStdDev: Record<string, number> = {};
+    const meanEggPhenotype: Record<string, number> = {};
+    const meanJuvenilePhenotype: Record<string, number> = {};
+    const meanAdultPhenotype: Record<string, number> = {};
+    const meanElderPhenotype: Record<string, number> = {};
+    const meanMaturePhenotype: Record<string, number> = {};
+
+    const matureCount = adultCount + elderCount;
+    const invTotal = totalAlive > 0 ? 1 / totalAlive : 0;
+    const invEgg = eggCount > 0 ? 1 / eggCount : 0;
+    const invJuv = juvCount > 0 ? 1 / juvCount : 0;
+    const invAdult = adultCount > 0 ? 1 / adultCount : 0;
+    const invElder = elderCount > 0 ? 1 / elderCount : 0;
+    const invMature = matureCount > 0 ? 1 / matureCount : 0;
 
     let totalVariance = 0;
     let totalStdDev = 0;
 
     for (let l = 0; l < locusCount; l++) {
-      const id = schema.loci[l].id;
+      const id = locusIds[l];
       if (totalAlive > 0) {
         const meanG = sumGen[l] / totalAlive;
-        const meanP = sumPhen[l] / totalAlive;
+        const meanP = sumPhen[l] * invTotal;
         const variance = Math.max(0, sumSqGen[l] / totalAlive - meanG * meanG);
         const stdDev = Math.sqrt(variance);
         meanGenotype[id] = meanG;
@@ -586,23 +669,11 @@ export class PopulationManager {
         meanPhenotype[id] = 0;
         traitStdDev[id] = 0;
       }
-    }
-
-    const meanEggPhenotype = buildMeanRecord(this.species, sumEggPhen, stageCounts.egg);
-    const meanJuvenilePhenotype = buildMeanRecord(this.species, sumJuvPhen, stageCounts.juvenile);
-    const meanAdultPhenotype = buildMeanRecord(this.species, sumAdultPhen, stageCounts.adult);
-    const meanElderPhenotype = buildMeanRecord(this.species, sumElderPhen, stageCounts.elder);
-
-    const matureCount = stageCounts.adult + stageCounts.elder;
-    let meanMaturePhenotype: Record<string, number>;
-    if (matureCount <= 0) {
-      meanMaturePhenotype = emptyTraitRecord(this.species);
-    } else {
-      meanMaturePhenotype = {};
-      const invMature = 1 / matureCount;
-      for (let l = 0; l < locusCount; l++) {
-        meanMaturePhenotype[schema.loci[l].id] = (sumAdultPhen[l] + sumElderPhen[l]) * invMature;
-      }
+      meanEggPhenotype[id] = eggCount > 0 ? sumEggPhen[l] * invEgg : 0;
+      meanJuvenilePhenotype[id] = juvCount > 0 ? sumJuvPhen[l] * invJuv : 0;
+      meanAdultPhenotype[id] = adultCount > 0 ? sumAdultPhen[l] * invAdult : 0;
+      meanElderPhenotype[id] = elderCount > 0 ? sumElderPhen[l] * invElder : 0;
+      meanMaturePhenotype[id] = matureCount > 0 ? (sumAdultPhen[l] + sumElderPhen[l]) * invMature : 0;
     }
 
     const denom = totalAlive * locusCount;
@@ -611,12 +682,16 @@ export class PopulationManager {
 
     const deathsByCause: Record<string, number> = {};
     for (const [cause, count] of this.deathsByCause) {
-      Object.defineProperty(deathsByCause, cause, {
-        value: count,
-        enumerable: true,
-        writable: true,
-        configurable: true,
-      });
+      if (cause === '__proto__') {
+        Object.defineProperty(deathsByCause, cause, {
+          value: count,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        });
+      } else {
+        deathsByCause[cause] = count;
+      }
     }
 
     return {

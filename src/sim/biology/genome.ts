@@ -132,6 +132,8 @@ export class GenomeSchema {
   public readonly locusCount: number;
   /** 0 = physical, 1 = neural, 2 = tolerance/metabolic (precomputed for allocation-free computePhenotype) */
   public readonly traitModKind: Uint8Array;
+  /** @internal True when schema uses the standard 10-locus `[0,0,0,0, 1,1, 2,2,2,2]` modifier layout */
+  public readonly isCoreModPattern: boolean;
   private readonly indexById = new Map<string, number>();
 
   constructor(id: string, loci: readonly GeneDefinition[]) {
@@ -174,6 +176,18 @@ export class GenomeSchema {
     this.loci = loci.slice();
     this.locusCount = loci.length;
     this.traitModKind = modKinds;
+    this.isCoreModPattern =
+      modKinds.length === 10 &&
+      modKinds[0] === 0 &&
+      modKinds[1] === 0 &&
+      modKinds[2] === 0 &&
+      modKinds[3] === 0 &&
+      modKinds[4] === 1 &&
+      modKinds[5] === 1 &&
+      modKinds[6] === 2 &&
+      modKinds[7] === 2 &&
+      modKinds[8] === 2 &&
+      modKinds[9] === 2;
   }
 
   getIndex(traitId: TraitId): number {
@@ -340,10 +354,23 @@ export function createHaploidGamete(
 ): Float32Array {
   const n = schema.locusCount;
   const gamete = targetOut ?? new Float32Array(n);
+  const mat = parentGenome.maternalAlleles;
+  const pat = parentGenome.paternalAlleles;
+  if (n === 10) {
+    gamete[0] = rng.chance(0.5) ? mat[0] : pat[0];
+    gamete[1] = rng.chance(0.5) ? mat[1] : pat[1];
+    gamete[2] = rng.chance(0.5) ? mat[2] : pat[2];
+    gamete[3] = rng.chance(0.5) ? mat[3] : pat[3];
+    gamete[4] = rng.chance(0.5) ? mat[4] : pat[4];
+    gamete[5] = rng.chance(0.5) ? mat[5] : pat[5];
+    gamete[6] = rng.chance(0.5) ? mat[6] : pat[6];
+    gamete[7] = rng.chance(0.5) ? mat[7] : pat[7];
+    gamete[8] = rng.chance(0.5) ? mat[8] : pat[8];
+    gamete[9] = rng.chance(0.5) ? mat[9] : pat[9];
+    return gamete;
+  }
   for (let i = 0; i < n; i++) {
-    gamete[i] = rng.chance(0.5)
-      ? parentGenome.maternalAlleles[i]
-      : parentGenome.paternalAlleles[i];
+    gamete[i] = rng.chance(0.5) ? mat[i] : pat[i];
   }
   return gamete;
 }
@@ -374,24 +401,46 @@ export function computePhenotype(
   const maternal = genome.maternalAlleles;
   const paternal = genome.paternalAlleles;
   const dom = genome.dominance;
-  const modKinds = schema.traitModKind;
-
   const physScale = ctx.physicalMaturityScale;
   const condScale = ctx.conditionScale;
   const modPhys = physScale * ctx.senescencePhysicalScale * condScale;
   const modNeur = ctx.neuralMaturityScale * (0.75 + 0.25 * condScale);
   const modOther = (0.65 + 0.35 * physScale) * (0.85 + 0.15 * condScale);
 
-  for (let i = 0; i < n; i++) {
-    const a = maternal[i];
-    const b = paternal[i];
-    const low = a <= b ? a : b;
-    const high = a <= b ? b : a;
-    const genVal = low + (high - low) * dom[i];
-    geneticExpression[i] = genVal;
-    const kind = modKinds[i];
-    const mod = kind === 0 ? modPhys : kind === 1 ? modNeur : modOther;
-    expressed[i] = genVal * mod;
+  if (schema.isCoreModPattern) {
+    let a = maternal[0], b = paternal[0], g = a <= b ? a + (b - a) * dom[0] : b + (a - b) * dom[0];
+    geneticExpression[0] = g; expressed[0] = g * modPhys;
+    a = maternal[1]; b = paternal[1]; g = a <= b ? a + (b - a) * dom[1] : b + (a - b) * dom[1];
+    geneticExpression[1] = g; expressed[1] = g * modPhys;
+    a = maternal[2]; b = paternal[2]; g = a <= b ? a + (b - a) * dom[2] : b + (a - b) * dom[2];
+    geneticExpression[2] = g; expressed[2] = g * modPhys;
+    a = maternal[3]; b = paternal[3]; g = a <= b ? a + (b - a) * dom[3] : b + (a - b) * dom[3];
+    geneticExpression[3] = g; expressed[3] = g * modPhys;
+    a = maternal[4]; b = paternal[4]; g = a <= b ? a + (b - a) * dom[4] : b + (a - b) * dom[4];
+    geneticExpression[4] = g; expressed[4] = g * modNeur;
+    a = maternal[5]; b = paternal[5]; g = a <= b ? a + (b - a) * dom[5] : b + (a - b) * dom[5];
+    geneticExpression[5] = g; expressed[5] = g * modNeur;
+    a = maternal[6]; b = paternal[6]; g = a <= b ? a + (b - a) * dom[6] : b + (a - b) * dom[6];
+    geneticExpression[6] = g; expressed[6] = g * modOther;
+    a = maternal[7]; b = paternal[7]; g = a <= b ? a + (b - a) * dom[7] : b + (a - b) * dom[7];
+    geneticExpression[7] = g; expressed[7] = g * modOther;
+    a = maternal[8]; b = paternal[8]; g = a <= b ? a + (b - a) * dom[8] : b + (a - b) * dom[8];
+    geneticExpression[8] = g; expressed[8] = g * modOther;
+    a = maternal[9]; b = paternal[9]; g = a <= b ? a + (b - a) * dom[9] : b + (a - b) * dom[9];
+    geneticExpression[9] = g; expressed[9] = g * modOther;
+  } else {
+    const modKinds = schema.traitModKind;
+    for (let i = 0; i < n; i++) {
+      const a = maternal[i];
+      const b = paternal[i];
+      const low = a <= b ? a : b;
+      const high = a <= b ? b : a;
+      const genVal = low + (high - low) * dom[i];
+      geneticExpression[i] = genVal;
+      const kind = modKinds[i];
+      const mod = kind === 0 ? modPhys : kind === 1 ? modNeur : modOther;
+      expressed[i] = genVal * mod;
+    }
   }
 
   if (target) {

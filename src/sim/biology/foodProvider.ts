@@ -513,7 +513,8 @@ export class DeterministicPreyFoodProvider implements FoodProvider {
         'stepTickConservative() requires conservative backing configuration'
       );
     }
-    if (this.regenerationRatePpm <= 0) return 0;
+    const regenPpm = this.regenerationRatePpm;
+    if (regenPpm <= 0) return 0;
     if (b.regenerableDirty) {
       let count = 0;
       const capArr = b.capacityQ;
@@ -529,9 +530,113 @@ export class DeterministicPreyFoodProvider implements FoodProvider {
       b.regenerableDirty = false;
     }
     const cells = b.regenerableCells;
+    if (b.ledger.activeTransaction !== tx) {
+      let totalDepositedQ = 0;
+      for (let i = 0; i < cells.length; i++) {
+        totalDepositedQ += this.regenerateCellConservative(tx, cells[i]);
+      }
+      return totalDepositedQ;
+    }
+
+    const capArr = b.capacityQ;
+    const preyChBack = b.preyStore._getChannelStore().back;
+    const preyStructBack = preyChBack[0];
+    const preyReserveBack = preyChBack[2];
+    const gridChBack = b.energyGrid._getChannelStore().back;
+    const plantBack = gridChBack[0];
+    const detritusBack = gridChBack[4];
+    const preySlotOffset = b.preySlotOffset;
+    const plantSharePpm = b.plantDonorSharePpm;
+    const absorptionPpm = b.absorptionPpm;
+    const assimilationPpm = b.assimilationPpm;
+    const sdaPpm = b.sdaPpm;
+    const grossNumSafe = b.grossNumSafe;
+    const grossDenSafe = b.grossDenSafe;
+    const grossSafeTargetLimit = b.grossSafeTargetLimit;
+    const grossNumBig = b.grossNumBig;
+    const grossDenBig = b.grossDenBig;
+
     let totalDepositedQ = 0;
     for (let i = 0; i < cells.length; i++) {
-      totalDepositedQ += this.regenerateCellConservative(tx, cells[i]);
+      const cellIndex = cells[i];
+      const capQ = capArr[cellIndex];
+      const slot = preySlotOffset + cellIndex;
+      const curMassQ = preyStructBack[slot] + preyReserveBack[slot];
+      if (curMassQ >= capQ) continue;
+
+      const deficitQ = capQ - curMassQ;
+      const prodDef = deficitQ * regenPpm;
+      const targetGainMassQ =
+        prodDef <= LOCAL_MAX_SAFE_INT
+          ? (prodDef - (prodDef % LOCAL_PPM)) / LOCAL_PPM
+          : applyPpm(deficitQ, regenPpm, 'floor');
+      if (targetGainMassQ <= 0) continue;
+
+      const plantAvailQ = plantBack[cellIndex];
+      const detritusAvailQ = detritusBack[cellIndex];
+      if (plantAvailQ === 0 && detritusAvailQ === 0) continue;
+
+      let grossNeededQ: number;
+      if (targetGainMassQ <= grossSafeTargetLimit) {
+        const num = targetGainMassQ * grossNumSafe;
+        const r = num % grossDenSafe;
+        const q = (num - r) / grossDenSafe;
+        grossNeededQ = r === 0 ? q : q + 1;
+      } else {
+        const grossNeededBig = divCeilBig(BigInt(targetGainMassQ) * grossNumBig, grossDenBig);
+        grossNeededQ =
+          grossNeededBig > BigInt(LOCAL_MAX_SAFE_INT) ? LOCAL_MAX_SAFE_INT : Number(grossNeededBig);
+      }
+
+      const plantProd = grossNeededQ * plantSharePpm;
+      const desiredPlantMassQ =
+        plantProd <= LOCAL_MAX_SAFE_INT
+          ? (plantProd - (plantProd % LOCAL_PPM)) / LOCAL_PPM
+          : applyPpm(grossNeededQ, plantSharePpm, 'floor');
+      const desiredDetritusMassQ = grossNeededQ - desiredPlantMassQ;
+
+      let remainingHeadroomQ = targetGainMassQ;
+      const grazePlantQ = plantAvailQ < desiredPlantMassQ ? plantAvailQ : desiredPlantMassQ;
+      if (grazePlantQ > 0 && remainingHeadroomQ > 0) {
+        stageFeedingFast(
+          tx,
+          AK_CELL_PLANT,
+          cellIndex,
+          slot,
+          cellIndex,
+          grazePlantQ,
+          grazePlantQ <= PLANT_SAFE_MASS_LIMIT ? grazePlantQ * 3 : energyOfMass(grazePlantQ, RHO_PLANT),
+          absorptionPpm,
+          assimilationPpm,
+          sdaPpm,
+          remainingHeadroomQ,
+          _preyFeedScratch
+        );
+        totalDepositedQ += _preyFeedScratch.depositMassQ;
+        remainingHeadroomQ -= _preyFeedScratch.depositMassQ;
+      }
+
+      const grazeDetritusQ = detritusAvailQ < desiredDetritusMassQ ? detritusAvailQ : desiredDetritusMassQ;
+      if (grazeDetritusQ > 0 && remainingHeadroomQ > 0) {
+        stageFeedingFast(
+          tx,
+          AK_CELL_DETRITUS,
+          cellIndex,
+          slot,
+          cellIndex,
+          grazeDetritusQ,
+          grazeDetritusQ <= PLANT_SAFE_MASS_LIMIT
+            ? grazeDetritusQ * 3
+            : energyOfMass(grazeDetritusQ, RHO_DETRITUS),
+          absorptionPpm,
+          assimilationPpm,
+          sdaPpm,
+          remainingHeadroomQ,
+          _preyFeedScratch
+        );
+        totalDepositedQ += _preyFeedScratch.depositMassQ;
+        remainingHeadroomQ -= _preyFeedScratch.depositMassQ;
+      }
     }
     return totalDepositedQ;
   }

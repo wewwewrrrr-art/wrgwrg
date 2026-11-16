@@ -37,9 +37,10 @@ import {
   LEDGER_ACCUMULATOR_COUNT,
   LedgerState,
 } from './energyTransaction';
-import { StagedStore } from './stagedStore';
+import { EntityEnergyStore, StagedStore } from './stagedStore';
 import { MAX_SAFE_INT } from './detMath';
 import { ExactAccumulators, assertNonNegativeBig, assertQuanta } from './units';
+import { WorldEnergyGrid } from './worldEnergyGrid';
 
 export interface EnergyLedgerConfig {
   /** Initial size of the single global abiotic matter pool, in mass quanta. */
@@ -151,6 +152,21 @@ export class EnergyLedger {
     }
     for (const kind of store.ownedKinds) {
       L.storeByKind[kind] = store;
+    }
+    if (store instanceof EntityEnergyStore) {
+      const chStore = store._getChannelStore();
+      L.fastStoreByKind[AccountKind.ORGANISM_STRUCT] = chStore;
+      L.fastChannelBaseByKind[AccountKind.ORGANISM_STRUCT] = 0;
+      L.fastStoreByKind[AccountKind.ORGANISM_RESERVE] = chStore;
+      L.fastChannelBaseByKind[AccountKind.ORGANISM_RESERVE] = 2;
+    } else if (store instanceof WorldEnergyGrid) {
+      const chStore = store._getChannelStore();
+      L.fastStoreByKind[AccountKind.CELL_PLANT] = chStore;
+      L.fastChannelBaseByKind[AccountKind.CELL_PLANT] = 0;
+      L.fastStoreByKind[AccountKind.CELL_CARRION] = chStore;
+      L.fastChannelBaseByKind[AccountKind.CELL_CARRION] = 2;
+      L.fastStoreByKind[AccountKind.CELL_DETRITUS] = chStore;
+      L.fastChannelBaseByKind[AccountKind.CELL_DETRITUS] = 4;
     }
     L.stores.push(store);
   }

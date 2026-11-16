@@ -27,13 +27,14 @@ import {
   EnergyPosting,
   MassPosting,
   POSTING_REASON_COUNT,
+  PostingReason,
   PostingReasonId,
   checkEnergyRoute,
   checkMassRoute,
   isEnergyRouteAllowedFast,
   isMassRouteAllowedFast,
 } from './energyAccounts';
-import { InsufficientBalanceError, StagedStore } from './stagedStore';
+import { InsufficientBalanceError, StagedChannelStore, StagedStore } from './stagedStore';
 import { ExactAccumulators, UnitsError } from './units';
 
 const AK_SUN = AccountKind.SUN;
@@ -41,6 +42,17 @@ const AK_HEAT = AccountKind.HEAT;
 const AK_GENESIS = AccountKind.GENESIS;
 const AK_ABIOTIC = AccountKind.ABIOTIC;
 const AK_ESCROW = AccountKind.ESCROW;
+const AK_CELL_PLANT = AccountKind.CELL_PLANT;
+const AK_CELL_CARRION = AccountKind.CELL_CARRION;
+const AK_CELL_DETRITUS = AccountKind.CELL_DETRITUS;
+const AK_ORGANISM_STRUCT = AccountKind.ORGANISM_STRUCT;
+const AK_ORGANISM_RESERVE = AccountKind.ORGANISM_RESERVE;
+const PR_INGESTION = PostingReason.INGESTION;
+const PR_EGESTION = PostingReason.EGESTION;
+const PR_SDA = PostingReason.SDA;
+const PR_GROWTH = PostingReason.GROWTH;
+const PR_REPRODUCTION = PostingReason.REPRODUCTION;
+const PR_DEATH = PostingReason.DEATH;
 const PR_COUNT = POSTING_REASON_COUNT;
 const LOCAL_MAX_SAFE_INT = Number.MAX_SAFE_INTEGER;
 
@@ -118,10 +130,12 @@ export class PostingBuffer {
     return this.capacity * POSTING_BUFFER_BYTES_PER_ENTRY;
   }
 
-  /** Guarantees room for one more posting. May allocate; only called while ACTIVE. */
-  ensureRoom(): void {
-    if (this.count < this.capacity) return;
-    const next = this.capacity * 2;
+  /** Guarantees room for `extra` more postings. May allocate; only called while ACTIVE. */
+  ensureRoom(extra = 1): void {
+    const needed = this.count + extra;
+    if (needed <= this.capacity) return;
+    let next = this.capacity * 2;
+    while (next < needed) next *= 2;
     const grow = <T extends Uint8Array | Uint32Array | Float64Array>(old: T, fresh: T): T => {
       fresh.set(old as never);
       return fresh;
@@ -333,6 +347,8 @@ const ACC_CHECK_GENESIS_ENERGY = Acc.CHECK_GENESIS_ENERGY;
 export class LedgerState {
   readonly stores: StagedStore[] = [];
   readonly storeByKind: Array<StagedStore | null> = new Array<StagedStore | null>(ACCOUNT_KIND_COUNT).fill(null);
+  readonly fastStoreByKind: Array<StagedChannelStore | null> = new Array<StagedChannelStore | null>(ACCOUNT_KIND_COUNT).fill(null);
+  readonly fastChannelBaseByKind = new Int8Array(ACCOUNT_KIND_COUNT).fill(-1);
   readonly acc = new ExactAccumulators(LEDGER_ACCUMULATOR_COUNT);
   readonly escrowSlots: number;
   readonly escrowCommittedMass: ExactAccumulators;
@@ -472,51 +488,89 @@ export class EnergyTransaction {
     if (srcKind === dstKind && srcId === dstId) {
       throw new EnergyRuleError('Mass posting rejected: source and destination are the same account');
     }
+
+    const fastSrc = L.fastStoreByKind[srcKind];
+    const fastDst = L.fastStoreByKind[dstKind];
     let srcStore: StagedStore | null = null;
     let dstStore: StagedStore | null = null;
+    let srcBack: Float64Array | null = null;
+    let dstBack: Float64Array | null = null;
 
     // --- validate source ---
-    if (srcKind === AK_GENESIS) {
+    if (fastSrc !== null) {
+      const ch = L.fastChannelBaseByKind[srcKind];
+      srcBack = fastSrc.back[ch];
+      if (srcId >= srcBack.length || srcBack[srcId] < massQ) {
+        fastSrc.checkDebit(ch, srcId, massQ, ACCOUNT_KIND_NAMES[srcKind]);
+      }
+    } else if (srcKind === AK_GENESIS) {
       if (!this.genesis) {
         throw new EnergyRuleError('Mass posting rejected: GENESIS is only available to genesis transactions');
       }
       if (srcId !== 0) EnergyTransaction.assertSingleton(srcKind, srcId);
     } else if (srcKind === AK_ABIOTIC) {
       if (srcId !== 0) EnergyTransaction.assertSingleton(srcKind, srcId);
-      if (!L.acc.gte(ACC_ABIOTIC_STAGED, massQ)) {
+      if (!L.acc.gteFast(ACC_ABIOTIC_STAGED, massQ)) {
         throw new InsufficientBalanceError(
           `ABIOTIC pool holds ${L.acc.toBigInt(ACC_ABIOTIC_STAGED)} quanta, cannot debit ${massQ}`
         );
       }
     } else if (srcKind === AK_ESCROW) {
       this.assertEscrowSlot(srcId);
-      if (!L.escrowStagedMass.gte(srcId, massQ)) {
+      if (!L.escrowStagedMass.gteFast(srcId, massQ)) {
         throw new InsufficientBalanceError(`ESCROW[${srcId}] mass cannot cover ${massQ} quanta`);
       }
     } else {
       srcStore = L.storeByKind[srcKind] ?? this.storeFor(srcKind);
       srcStore.checkDebit(srcKind, srcId, false, massQ);
     }
+
     // --- validate destination ---
-    if (dstKind === AK_ABIOTIC) {
+    if (fastDst !== null) {
+      const ch = L.fastChannelBaseByKind[dstKind];
+      dstBack = fastDst.back[ch];
+      if (dstId >= dstBack.length || dstBack[dstId] + massQ > LOCAL_MAX_SAFE_INT) {
+        fastDst.checkCredit(ch, dstId, massQ, ACCOUNT_KIND_NAMES[dstKind]);
+      }
+    } else if (dstKind === AK_ABIOTIC) {
       if (dstId !== 0) EnergyTransaction.assertSingleton(dstKind, dstId);
     } else {
       dstStore = L.storeByKind[dstKind] ?? this.storeFor(dstKind);
       dstStore.checkCredit(dstKind, dstId, false, massQ);
     }
+
     if (massQ === 0) return;
-    L.massBuffer.ensureRoom();
+    const mb = L.massBuffer;
+    if (mb.count >= mb.reason.length) mb.ensureRoom();
 
     // --- apply (cannot fail) ---
-    if (srcKind === AK_GENESIS) L.acc.addFast(ACC_TX_GENESIS_MASS, massQ);
-    else if (srcKind === AK_ABIOTIC) L.acc.sub(ACC_ABIOTIC_STAGED, massQ);
-    else if (srcKind === AK_ESCROW) L.escrowStagedMass.sub(srcId, massQ);
+    if (fastSrc !== null) {
+      if (fastSrc.dirtyFlag[srcId] === 0) {
+        fastSrc.dirtyFlag[srcId] = 1;
+        fastSrc.dirtyList[fastSrc.dirtyCountValue++] = srcId;
+      }
+      (srcBack as Float64Array)[srcId] -= massQ;
+    } else if (srcKind === AK_GENESIS) L.acc.addFast(ACC_TX_GENESIS_MASS, massQ);
+    else if (srcKind === AK_ABIOTIC) L.acc.subFast(ACC_ABIOTIC_STAGED, massQ);
+    else if (srcKind === AK_ESCROW) L.escrowStagedMass.subFast(srcId, massQ);
     else (srcStore as StagedStore).applyDebit(srcKind, srcId, false, massQ);
 
-    if (dstKind === AK_ABIOTIC) L.acc.addFast(ACC_ABIOTIC_STAGED, massQ);
+    if (fastDst !== null) {
+      if (fastDst.dirtyFlag[dstId] === 0) {
+        fastDst.dirtyFlag[dstId] = 1;
+        fastDst.dirtyList[fastDst.dirtyCountValue++] = dstId;
+      }
+      (dstBack as Float64Array)[dstId] += massQ;
+    } else if (dstKind === AK_ABIOTIC) L.acc.addFast(ACC_ABIOTIC_STAGED, massQ);
     else (dstStore as StagedStore).applyCredit(dstKind, dstId, false, massQ);
 
-    L.massBuffer.push(reason, srcKind, srcId, dstKind, dstId, massQ);
+    const idx = mb.count++;
+    mb.reason[idx] = reason;
+    mb.srcKind[idx] = srcKind;
+    mb.dstKind[idx] = dstKind;
+    mb.srcId[idx] = srcId;
+    mb.dstId[idx] = dstId;
+    mb.amount[idx] = massQ;
     L.reasonTxMass.addFast(reason, massQ);
   }
 
@@ -551,10 +605,21 @@ export class EnergyTransaction {
     if (srcKind === dstKind && srcId === dstId) {
       throw new EnergyRuleError('Energy posting rejected: source and destination are the same account');
     }
+
+    const fastSrc = L.fastStoreByKind[srcKind];
+    const fastDst = L.fastStoreByKind[dstKind];
     let srcStore: StagedStore | null = null;
     let dstStore: StagedStore | null = null;
+    let srcBack: Float64Array | null = null;
+    let dstBack: Float64Array | null = null;
 
-    if (srcKind === AK_GENESIS) {
+    if (fastSrc !== null) {
+      const ch = L.fastChannelBaseByKind[srcKind] + 1;
+      srcBack = fastSrc.back[ch];
+      if (srcId >= srcBack.length || srcBack[srcId] < energyQ) {
+        fastSrc.checkDebit(ch, srcId, energyQ, ACCOUNT_KIND_NAMES[srcKind]);
+      }
+    } else if (srcKind === AK_GENESIS) {
       if (!this.genesis) {
         throw new EnergyRuleError('Energy posting rejected: GENESIS is only available to genesis transactions');
       }
@@ -563,32 +628,794 @@ export class EnergyTransaction {
       if (srcId !== 0) EnergyTransaction.assertSingleton(srcKind, srcId);
     } else if (srcKind === AK_ESCROW) {
       this.assertEscrowSlot(srcId);
-      if (!L.escrowStagedEnergy.gte(srcId, energyQ)) {
+      if (!L.escrowStagedEnergy.gteFast(srcId, energyQ)) {
         throw new InsufficientBalanceError(`ESCROW[${srcId}] energy cannot cover ${energyQ} quanta`);
       }
     } else {
       srcStore = L.storeByKind[srcKind] ?? this.storeFor(srcKind);
       srcStore.checkDebit(srcKind, srcId, true, energyQ);
     }
-    if (dstKind === AK_HEAT) {
+
+    if (fastDst !== null) {
+      const ch = L.fastChannelBaseByKind[dstKind] + 1;
+      dstBack = fastDst.back[ch];
+      if (dstId >= dstBack.length || dstBack[dstId] + energyQ > LOCAL_MAX_SAFE_INT) {
+        fastDst.checkCredit(ch, dstId, energyQ, ACCOUNT_KIND_NAMES[dstKind]);
+      }
+    } else if (dstKind === AK_HEAT) {
       if (dstId !== 0) EnergyTransaction.assertSingleton(dstKind, dstId);
     } else {
       dstStore = L.storeByKind[dstKind] ?? this.storeFor(dstKind);
       dstStore.checkCredit(dstKind, dstId, true, energyQ);
     }
-    if (energyQ === 0) return;
-    L.energyBuffer.ensureRoom();
 
-    if (srcKind === AK_GENESIS) L.acc.addFast(ACC_TX_GENESIS_ENERGY, energyQ);
+    if (energyQ === 0) return;
+    const eb = L.energyBuffer;
+    if (eb.count >= eb.reason.length) eb.ensureRoom();
+
+    if (fastSrc !== null) {
+      if (fastSrc.dirtyFlag[srcId] === 0) {
+        fastSrc.dirtyFlag[srcId] = 1;
+        fastSrc.dirtyList[fastSrc.dirtyCountValue++] = srcId;
+      }
+      (srcBack as Float64Array)[srcId] -= energyQ;
+    } else if (srcKind === AK_GENESIS) L.acc.addFast(ACC_TX_GENESIS_ENERGY, energyQ);
     else if (srcKind === AK_SUN) L.acc.addFast(ACC_TX_SUN, energyQ);
-    else if (srcKind === AK_ESCROW) L.escrowStagedEnergy.sub(srcId, energyQ);
+    else if (srcKind === AK_ESCROW) L.escrowStagedEnergy.subFast(srcId, energyQ);
     else (srcStore as StagedStore).applyDebit(srcKind, srcId, true, energyQ);
 
-    if (dstKind === AK_HEAT) L.acc.addFast(ACC_TX_HEAT, energyQ);
+    if (fastDst !== null) {
+      if (fastDst.dirtyFlag[dstId] === 0) {
+        fastDst.dirtyFlag[dstId] = 1;
+        fastDst.dirtyList[fastDst.dirtyCountValue++] = dstId;
+      }
+      (dstBack as Float64Array)[dstId] += energyQ;
+    } else if (dstKind === AK_HEAT) L.acc.addFast(ACC_TX_HEAT, energyQ);
     else (dstStore as StagedStore).applyCredit(dstKind, dstId, true, energyQ);
 
-    L.energyBuffer.push(reason, srcKind, srcId, dstKind, dstId, energyQ);
+    const idx = eb.count++;
+    eb.reason[idx] = reason;
+    eb.srcKind[idx] = srcKind;
+    eb.dstKind[idx] = dstKind;
+    eb.srcId[idx] = srcId;
+    eb.dstId[idx] = dstId;
+    eb.amount[idx] = energyQ;
     L.reasonTxEnergy.addFast(reason, energyQ);
+  }
+
+  /**
+   * @internal Atomically validates and stages `(srcKind, srcId)` mass -> `ABIOTIC` and energy -> `HEAT`.
+   * Produces bit-identical buffer/accumulator state as sequential `postMass` + `postEnergy` with single check/dirty mark.
+   */
+  postConsumePairFast(
+    reason: PostingReasonId,
+    srcKind: AccountKindId,
+    srcId: number,
+    massQ: number,
+    energyQ: number
+  ): void {
+    const L = this.ledger;
+    const fastSrc = L.fastStoreByKind[srcKind];
+    if (
+      fastSrc === null ||
+      this.stateValue !== 'ACTIVE' ||
+      L.active !== this ||
+      massQ <= 0 ||
+      energyQ <= 0 ||
+      ((reason | srcKind) >>> 4) !== 0 ||
+      LOCAL_MASS_ROUTE_LUT[(reason << 8) | (srcKind << 4) | AK_ABIOTIC] !== 1 ||
+      LOCAL_ENERGY_ROUTE_LUT[(reason << 8) | (srcKind << 4) | AK_HEAT] !== 1 ||
+      (srcId >>> 0) !== srcId ||
+      massQ > LOCAL_MAX_SAFE_INT ||
+      energyQ > LOCAL_MAX_SAFE_INT ||
+      Math.floor(massQ) !== massQ ||
+      Math.floor(energyQ) !== energyQ
+    ) {
+      if (massQ > 0) this.postMass(reason, srcKind, srcId, AK_ABIOTIC, 0, massQ);
+      if (energyQ > 0) this.postEnergy(reason, srcKind, srcId, AK_HEAT, 0, energyQ);
+      return;
+    }
+
+    const ch = L.fastChannelBaseByKind[srcKind];
+    const srcBackM = fastSrc.back[ch];
+    const srcBackE = fastSrc.back[ch + 1];
+    if (srcId >= srcBackM.length || srcBackM[srcId] < massQ) {
+      fastSrc.checkDebit(ch, srcId, massQ, ACCOUNT_KIND_NAMES[srcKind]);
+    }
+    if (srcBackE[srcId] < energyQ) {
+      fastSrc.checkDebit(ch + 1, srcId, energyQ, ACCOUNT_KIND_NAMES[srcKind]);
+    }
+
+    const mb = L.massBuffer;
+    const eb = L.energyBuffer;
+    if (mb.count >= mb.reason.length) mb.ensureRoom();
+    if (eb.count >= eb.reason.length) eb.ensureRoom();
+
+    if (fastSrc.dirtyFlag[srcId] === 0) {
+      fastSrc.dirtyFlag[srcId] = 1;
+      fastSrc.dirtyList[fastSrc.dirtyCountValue++] = srcId;
+    }
+    srcBackM[srcId] -= massQ;
+    srcBackE[srcId] -= energyQ;
+
+    const acc = L.acc;
+    acc.addFast(ACC_ABIOTIC_STAGED, massQ);
+    acc.addFast(ACC_TX_HEAT, energyQ);
+
+    const mi = mb.count++;
+    mb.reason[mi] = reason;
+    mb.srcKind[mi] = srcKind;
+    mb.dstKind[mi] = AK_ABIOTIC;
+    mb.srcId[mi] = srcId;
+    mb.dstId[mi] = 0;
+    mb.amount[mi] = massQ;
+    L.reasonTxMass.addFast(reason, massQ);
+
+    const ei = eb.count++;
+    eb.reason[ei] = reason;
+    eb.srcKind[ei] = srcKind;
+    eb.dstKind[ei] = AK_HEAT;
+    eb.srcId[ei] = srcId;
+    eb.dstId[ei] = 0;
+    eb.amount[ei] = energyQ;
+    L.reasonTxEnergy.addFast(reason, energyQ);
+  }
+
+  /**
+   * @internal Atomically validates and stages photosynthesis/assimilation pair:
+   * `ABIOTIC -> dstKind[dstId]` (massQ) and `SUN -> dstKind[dstId]` (energyQ).
+   */
+  postPhotosynthesisPairFast(
+    reason: PostingReasonId,
+    dstKind: AccountKindId,
+    dstId: number,
+    massQ: number,
+    energyQ: number
+  ): void {
+    const L = this.ledger;
+    const fastDst = L.fastStoreByKind[dstKind];
+    if (
+      fastDst === null ||
+      this.stateValue !== 'ACTIVE' ||
+      L.active !== this ||
+      massQ <= 0 ||
+      energyQ <= 0 ||
+      ((reason | dstKind) >>> 4) !== 0 ||
+      LOCAL_MASS_ROUTE_LUT[(reason << 8) | (AK_ABIOTIC << 4) | dstKind] !== 1 ||
+      LOCAL_ENERGY_ROUTE_LUT[(reason << 8) | (AK_SUN << 4) | dstKind] !== 1 ||
+      (dstId >>> 0) !== dstId ||
+      massQ > LOCAL_MAX_SAFE_INT ||
+      energyQ > LOCAL_MAX_SAFE_INT ||
+      Math.floor(massQ) !== massQ ||
+      Math.floor(energyQ) !== energyQ ||
+      !L.acc.gteFast(ACC_ABIOTIC_STAGED, massQ)
+    ) {
+      if (massQ > 0) this.postMass(reason, AK_ABIOTIC, 0, dstKind, dstId, massQ);
+      if (energyQ > 0) this.postEnergy(reason, AK_SUN, 0, dstKind, dstId, energyQ);
+      return;
+    }
+
+    const ch = L.fastChannelBaseByKind[dstKind];
+    const dstBackM = fastDst.back[ch];
+    const dstBackE = fastDst.back[ch + 1];
+    if (dstId >= dstBackM.length || dstBackM[dstId] + massQ > LOCAL_MAX_SAFE_INT) {
+      fastDst.checkCredit(ch, dstId, massQ, ACCOUNT_KIND_NAMES[dstKind]);
+    }
+    if (dstBackE[dstId] + energyQ > LOCAL_MAX_SAFE_INT) {
+      fastDst.checkCredit(ch + 1, dstId, energyQ, ACCOUNT_KIND_NAMES[dstKind]);
+    }
+
+    const mb = L.massBuffer;
+    const eb = L.energyBuffer;
+    if (mb.count >= mb.reason.length) mb.ensureRoom();
+    if (eb.count >= eb.reason.length) eb.ensureRoom();
+
+    L.acc.subFast(ACC_ABIOTIC_STAGED, massQ);
+    L.acc.addFast(ACC_TX_SUN, energyQ);
+
+    if (fastDst.dirtyFlag[dstId] === 0) {
+      fastDst.dirtyFlag[dstId] = 1;
+      fastDst.dirtyList[fastDst.dirtyCountValue++] = dstId;
+    }
+    dstBackM[dstId] += massQ;
+    dstBackE[dstId] += energyQ;
+
+    const mi = mb.count++;
+    mb.reason[mi] = reason;
+    mb.srcKind[mi] = AK_ABIOTIC;
+    mb.dstKind[mi] = dstKind;
+    mb.srcId[mi] = 0;
+    mb.dstId[mi] = dstId;
+    mb.amount[mi] = massQ;
+    L.reasonTxMass.addFast(reason, massQ);
+
+    const ei = eb.count++;
+    eb.reason[ei] = reason;
+    eb.srcKind[ei] = AK_SUN;
+    eb.dstKind[ei] = dstKind;
+    eb.srcId[ei] = 0;
+    eb.dstId[ei] = dstId;
+    eb.amount[ei] = energyQ;
+    L.reasonTxEnergy.addFast(reason, energyQ);
+  }
+
+  /** @internal Fuses feeding legs (INGESTION + optional EGESTION + SDA) for fast-store sources. */
+  postFeedingFast(
+    srcKind: AccountKindId,
+    srcId: number,
+    eaterSlot: number,
+    detritusCellIndex: number,
+    depositMassQ: number,
+    depositEnergyQ: number,
+    egestaMassQ: number,
+    egestaEnergyQ: number,
+    abioticMassQ: number,
+    heatQ: number
+  ): void {
+    const L = this.ledger;
+    const fastSrc = L.fastStoreByKind[srcKind];
+    const fastOrg = L.fastStoreByKind[AK_ORGANISM_RESERVE];
+    const fastDet = L.fastStoreByKind[AK_CELL_DETRITUS];
+    const doIng = depositMassQ > 0 || depositEnergyQ > 0;
+    const doEg =
+      (egestaMassQ > 0 || egestaEnergyQ > 0) &&
+      !(srcKind === AK_CELL_DETRITUS && srcId === detritusCellIndex);
+    if (
+      fastSrc === null ||
+      fastOrg === null ||
+      fastDet === null ||
+      this.stateValue !== 'ACTIVE' ||
+      L.active !== this ||
+      (srcId >>> 0) !== srcId ||
+      (eaterSlot >>> 0) !== eaterSlot ||
+      (detritusCellIndex >>> 0) !== detritusCellIndex ||
+      !(depositMassQ >= 0 && depositMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(depositMassQ) === depositMassQ) ||
+      !(depositEnergyQ >= 0 && depositEnergyQ <= LOCAL_MAX_SAFE_INT && Math.floor(depositEnergyQ) === depositEnergyQ) ||
+      !(egestaMassQ >= 0 && egestaMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(egestaMassQ) === egestaMassQ) ||
+      !(egestaEnergyQ >= 0 && egestaEnergyQ <= LOCAL_MAX_SAFE_INT && Math.floor(egestaEnergyQ) === egestaEnergyQ) ||
+      !(abioticMassQ >= 0 && abioticMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(abioticMassQ) === abioticMassQ) ||
+      !(heatQ >= 0 && heatQ <= LOCAL_MAX_SAFE_INT && Math.floor(heatQ) === heatQ) ||
+      (srcKind !== AK_CELL_PLANT && srcKind !== AK_CELL_CARRION && srcKind !== AK_CELL_DETRITUS)
+    ) {
+      if (doIng) this.transferBiomass(PR_INGESTION, srcKind, srcId, AK_ORGANISM_RESERVE, eaterSlot, depositMassQ, depositEnergyQ);
+      if (doEg) this.transferBiomass(PR_EGESTION, srcKind, srcId, AK_CELL_DETRITUS, detritusCellIndex, egestaMassQ, egestaEnergyQ);
+      if (abioticMassQ > 0) this.postMass(PR_SDA, srcKind, srcId, AK_ABIOTIC, 0, abioticMassQ);
+      if (heatQ > 0) this.postEnergy(PR_SDA, srcKind, srcId, AK_HEAT, 0, heatQ);
+      return;
+    }
+
+    const totalSrcDebitM = (doIng ? depositMassQ : 0) + (doEg ? egestaMassQ : 0) + abioticMassQ;
+    const totalSrcDebitE = (doIng ? depositEnergyQ : 0) + (doEg ? egestaEnergyQ : 0) + heatQ;
+    const sCh = L.fastChannelBaseByKind[srcKind];
+    const srcBackM = fastSrc.back[sCh];
+    const srcBackE = fastSrc.back[sCh + 1];
+    if (srcId >= srcBackM.length || srcBackM[srcId] < totalSrcDebitM) {
+      fastSrc.checkDebit(sCh, srcId, totalSrcDebitM, ACCOUNT_KIND_NAMES[srcKind]);
+    }
+    if (srcBackE[srcId] < totalSrcDebitE) {
+      fastSrc.checkDebit(sCh + 1, srcId, totalSrcDebitE, ACCOUNT_KIND_NAMES[srcKind]);
+    }
+
+    const orgCh = L.fastChannelBaseByKind[AK_ORGANISM_RESERVE];
+    const orgBackM = fastOrg.back[orgCh];
+    const orgBackE = fastOrg.back[orgCh + 1];
+    if (doIng) {
+      if (eaterSlot >= orgBackM.length || orgBackM[eaterSlot] + depositMassQ > LOCAL_MAX_SAFE_INT) {
+        fastOrg.checkCredit(orgCh, eaterSlot, depositMassQ, ACCOUNT_KIND_NAMES[AK_ORGANISM_RESERVE]);
+      }
+      if (orgBackE[eaterSlot] + depositEnergyQ > LOCAL_MAX_SAFE_INT) {
+        fastOrg.checkCredit(orgCh + 1, eaterSlot, depositEnergyQ, ACCOUNT_KIND_NAMES[AK_ORGANISM_RESERVE]);
+      }
+    }
+
+    let detBackM: Float64Array | null = null;
+    let detBackE: Float64Array | null = null;
+    if (doEg) {
+      const detCh = L.fastChannelBaseByKind[AK_CELL_DETRITUS];
+      detBackM = fastDet.back[detCh];
+      detBackE = fastDet.back[detCh + 1];
+      if (detritusCellIndex >= detBackM.length || detBackM[detritusCellIndex] + egestaMassQ > LOCAL_MAX_SAFE_INT) {
+        fastDet.checkCredit(detCh, detritusCellIndex, egestaMassQ, ACCOUNT_KIND_NAMES[AK_CELL_DETRITUS]);
+      }
+      if (detBackE[detritusCellIndex] + egestaEnergyQ > LOCAL_MAX_SAFE_INT) {
+        fastDet.checkCredit(detCh + 1, detritusCellIndex, egestaEnergyQ, ACCOUNT_KIND_NAMES[AK_CELL_DETRITUS]);
+      }
+    }
+
+    const mb = L.massBuffer;
+    const eb = L.energyBuffer;
+    if (mb.count + 3 > mb.reason.length) mb.ensureRoom(3);
+    if (eb.count + 3 > eb.reason.length) eb.ensureRoom(3);
+
+    if (totalSrcDebitM > 0 || totalSrcDebitE > 0) {
+      if (fastSrc.dirtyFlag[srcId] === 0) {
+        fastSrc.dirtyFlag[srcId] = 1;
+        fastSrc.dirtyList[fastSrc.dirtyCountValue++] = srcId;
+      }
+      srcBackM[srcId] -= totalSrcDebitM;
+      srcBackE[srcId] -= totalSrcDebitE;
+    }
+
+    if (doIng) {
+      if (fastOrg.dirtyFlag[eaterSlot] === 0) {
+        fastOrg.dirtyFlag[eaterSlot] = 1;
+        fastOrg.dirtyList[fastOrg.dirtyCountValue++] = eaterSlot;
+      }
+      if (depositMassQ > 0) {
+        orgBackM[eaterSlot] += depositMassQ;
+        const mi = mb.count++;
+        mb.reason[mi] = PR_INGESTION;
+        mb.srcKind[mi] = srcKind;
+        mb.dstKind[mi] = AK_ORGANISM_RESERVE;
+        mb.srcId[mi] = srcId;
+        mb.dstId[mi] = eaterSlot;
+        mb.amount[mi] = depositMassQ;
+        L.reasonTxMass.addFast(PR_INGESTION, depositMassQ);
+      }
+      if (depositEnergyQ > 0) {
+        orgBackE[eaterSlot] += depositEnergyQ;
+        const ei = eb.count++;
+        eb.reason[ei] = PR_INGESTION;
+        eb.srcKind[ei] = srcKind;
+        eb.dstKind[ei] = AK_ORGANISM_RESERVE;
+        eb.srcId[ei] = srcId;
+        eb.dstId[ei] = eaterSlot;
+        eb.amount[ei] = depositEnergyQ;
+        L.reasonTxEnergy.addFast(PR_INGESTION, depositEnergyQ);
+      }
+    }
+
+    if (doEg && detBackM !== null && detBackE !== null) {
+      if (fastDet.dirtyFlag[detritusCellIndex] === 0) {
+        fastDet.dirtyFlag[detritusCellIndex] = 1;
+        fastDet.dirtyList[fastDet.dirtyCountValue++] = detritusCellIndex;
+      }
+      if (egestaMassQ > 0) {
+        detBackM[detritusCellIndex] += egestaMassQ;
+        const mi = mb.count++;
+        mb.reason[mi] = PR_EGESTION;
+        mb.srcKind[mi] = srcKind;
+        mb.dstKind[mi] = AK_CELL_DETRITUS;
+        mb.srcId[mi] = srcId;
+        mb.dstId[mi] = detritusCellIndex;
+        mb.amount[mi] = egestaMassQ;
+        L.reasonTxMass.addFast(PR_EGESTION, egestaMassQ);
+      }
+      if (egestaEnergyQ > 0) {
+        detBackE[detritusCellIndex] += egestaEnergyQ;
+        const ei = eb.count++;
+        eb.reason[ei] = PR_EGESTION;
+        eb.srcKind[ei] = srcKind;
+        eb.dstKind[ei] = AK_CELL_DETRITUS;
+        eb.srcId[ei] = srcId;
+        eb.dstId[ei] = detritusCellIndex;
+        eb.amount[ei] = egestaEnergyQ;
+        L.reasonTxEnergy.addFast(PR_EGESTION, egestaEnergyQ);
+      }
+    }
+
+    if (abioticMassQ > 0) {
+      L.acc.addFast(ACC_ABIOTIC_STAGED, abioticMassQ);
+      const mi = mb.count++;
+      mb.reason[mi] = PR_SDA;
+      mb.srcKind[mi] = srcKind;
+      mb.dstKind[mi] = AK_ABIOTIC;
+      mb.srcId[mi] = srcId;
+      mb.dstId[mi] = 0;
+      mb.amount[mi] = abioticMassQ;
+      L.reasonTxMass.addFast(PR_SDA, abioticMassQ);
+    }
+    if (heatQ > 0) {
+      L.acc.addFast(ACC_TX_HEAT, heatQ);
+      const ei = eb.count++;
+      eb.reason[ei] = PR_SDA;
+      eb.srcKind[ei] = srcKind;
+      eb.dstKind[ei] = AK_HEAT;
+      eb.srcId[ei] = srcId;
+      eb.dstId[ei] = 0;
+      eb.amount[ei] = heatQ;
+      L.reasonTxEnergy.addFast(PR_SDA, heatQ);
+    }
+  }
+
+  /** @internal Fuses somatic growth postings for one organism slot cleanly. */
+  postSomaticGrowthFast(
+    organismSlot: number,
+    structGainEnergyQ: number,
+    heatQ: number,
+    directReserveToStruct: number,
+    abioticInMassQ: number,
+    abioticOutMassQ: number
+  ): void {
+    const L = this.ledger;
+    const fastOrg = L.fastStoreByKind[AK_ORGANISM_RESERVE];
+    if (
+      fastOrg === null ||
+      this.stateValue !== 'ACTIVE' ||
+      L.active !== this ||
+      (organismSlot >>> 0) !== organismSlot ||
+      structGainEnergyQ <= 0 ||
+      abioticInMassQ > 0 && !L.acc.gteFast(ACC_ABIOTIC_STAGED, abioticInMassQ)
+    ) {
+      this.postEnergy(PR_GROWTH, AK_ORGANISM_RESERVE, organismSlot, AK_ORGANISM_STRUCT, organismSlot, structGainEnergyQ);
+      if (heatQ > 0) this.postEnergy(PR_GROWTH, AK_ORGANISM_RESERVE, organismSlot, AK_HEAT, 0, heatQ);
+      if (directReserveToStruct > 0) this.postMass(PR_GROWTH, AK_ORGANISM_RESERVE, organismSlot, AK_ORGANISM_STRUCT, organismSlot, directReserveToStruct);
+      if (abioticInMassQ > 0) this.postMass(PR_GROWTH, AK_ABIOTIC, 0, AK_ORGANISM_STRUCT, organismSlot, abioticInMassQ);
+      if (abioticOutMassQ > 0) this.postMass(PR_GROWTH, AK_ORGANISM_RESERVE, organismSlot, AK_ABIOTIC, 0, abioticOutMassQ);
+      return;
+    }
+
+    const sCh = L.fastChannelBaseByKind[AK_ORGANISM_STRUCT];
+    const rCh = L.fastChannelBaseByKind[AK_ORGANISM_RESERVE];
+    const sBackM = fastOrg.back[sCh];
+    const sBackE = fastOrg.back[sCh + 1];
+    const rBackM = fastOrg.back[rCh];
+    const rBackE = fastOrg.back[rCh + 1];
+
+    const resDebitM = directReserveToStruct + abioticOutMassQ;
+    const resDebitE = structGainEnergyQ + heatQ;
+    const structCreditM = directReserveToStruct + abioticInMassQ;
+    if (organismSlot >= rBackM.length || rBackM[organismSlot] < resDebitM) {
+      fastOrg.checkDebit(rCh, organismSlot, resDebitM, ACCOUNT_KIND_NAMES[AK_ORGANISM_RESERVE]);
+    }
+    if (rBackE[organismSlot] < resDebitE) {
+      fastOrg.checkDebit(rCh + 1, organismSlot, resDebitE, ACCOUNT_KIND_NAMES[AK_ORGANISM_RESERVE]);
+    }
+    if (sBackM[organismSlot] + structCreditM > LOCAL_MAX_SAFE_INT) {
+      fastOrg.checkCredit(sCh, organismSlot, structCreditM, ACCOUNT_KIND_NAMES[AK_ORGANISM_STRUCT]);
+    }
+    if (sBackE[organismSlot] + structGainEnergyQ > LOCAL_MAX_SAFE_INT) {
+      fastOrg.checkCredit(sCh + 1, organismSlot, structGainEnergyQ, ACCOUNT_KIND_NAMES[AK_ORGANISM_STRUCT]);
+    }
+
+    const mb = L.massBuffer;
+    const eb = L.energyBuffer;
+    if (mb.count + 3 > mb.reason.length) mb.ensureRoom(3);
+    if (eb.count + 2 > eb.reason.length) eb.ensureRoom(2);
+
+    if (fastOrg.dirtyFlag[organismSlot] === 0) {
+      fastOrg.dirtyFlag[organismSlot] = 1;
+      fastOrg.dirtyList[fastOrg.dirtyCountValue++] = organismSlot;
+    }
+    rBackM[organismSlot] -= resDebitM;
+    rBackE[organismSlot] -= resDebitE;
+    sBackM[organismSlot] += structCreditM;
+    sBackE[organismSlot] += structGainEnergyQ;
+    if (abioticInMassQ > 0) L.acc.subFast(ACC_ABIOTIC_STAGED, abioticInMassQ);
+    if (abioticOutMassQ > 0) L.acc.addFast(ACC_ABIOTIC_STAGED, abioticOutMassQ);
+    if (heatQ > 0) L.acc.addFast(ACC_TX_HEAT, heatQ);
+
+    let ei = eb.count++;
+    eb.reason[ei] = PR_GROWTH;
+    eb.srcKind[ei] = AK_ORGANISM_RESERVE;
+    eb.dstKind[ei] = AK_ORGANISM_STRUCT;
+    eb.srcId[ei] = organismSlot;
+    eb.dstId[ei] = organismSlot;
+    eb.amount[ei] = structGainEnergyQ;
+    L.reasonTxEnergy.addFast(PR_GROWTH, structGainEnergyQ);
+
+    if (heatQ > 0) {
+      ei = eb.count++;
+      eb.reason[ei] = PR_GROWTH;
+      eb.srcKind[ei] = AK_ORGANISM_RESERVE;
+      eb.dstKind[ei] = AK_HEAT;
+      eb.srcId[ei] = organismSlot;
+      eb.dstId[ei] = 0;
+      eb.amount[ei] = heatQ;
+      L.reasonTxEnergy.addFast(PR_GROWTH, heatQ);
+    }
+
+    if (directReserveToStruct > 0) {
+      const mi = mb.count++;
+      mb.reason[mi] = PR_GROWTH;
+      mb.srcKind[mi] = AK_ORGANISM_RESERVE;
+      mb.dstKind[mi] = AK_ORGANISM_STRUCT;
+      mb.srcId[mi] = organismSlot;
+      mb.dstId[mi] = organismSlot;
+      mb.amount[mi] = directReserveToStruct;
+      L.reasonTxMass.addFast(PR_GROWTH, directReserveToStruct);
+    }
+    if (abioticInMassQ > 0) {
+      const mi = mb.count++;
+      mb.reason[mi] = PR_GROWTH;
+      mb.srcKind[mi] = AK_ABIOTIC;
+      mb.dstKind[mi] = AK_ORGANISM_STRUCT;
+      mb.srcId[mi] = 0;
+      mb.dstId[mi] = organismSlot;
+      mb.amount[mi] = abioticInMassQ;
+      L.reasonTxMass.addFast(PR_GROWTH, abioticInMassQ);
+    }
+    if (abioticOutMassQ > 0) {
+      const mi = mb.count++;
+      mb.reason[mi] = PR_GROWTH;
+      mb.srcKind[mi] = AK_ORGANISM_RESERVE;
+      mb.dstKind[mi] = AK_ABIOTIC;
+      mb.srcId[mi] = organismSlot;
+      mb.dstId[mi] = 0;
+      mb.amount[mi] = abioticOutMassQ;
+      L.reasonTxMass.addFast(PR_GROWTH, abioticOutMassQ);
+    }
+  }
+
+  /** @internal Fuses reproduction provisioning postings between motherSlot and childSlot. */
+  postReproductionProvisioningFast(
+    motherSlot: number,
+    childSlot: number,
+    childStructEnergyQ: number,
+    childReserveEnergyQ: number,
+    heatQ: number,
+    desiredOffspringReserveMassQ: number,
+    directReserveToStruct: number,
+    abioticInMassQ: number,
+    abioticOutMassQ: number
+  ): void {
+    const L = this.ledger;
+    const fastOrg = L.fastStoreByKind[AK_ORGANISM_RESERVE];
+    if (
+      fastOrg === null ||
+      this.stateValue !== 'ACTIVE' ||
+      L.active !== this ||
+      (motherSlot >>> 0) !== motherSlot ||
+      (childSlot >>> 0) !== childSlot ||
+      motherSlot === childSlot ||
+      (abioticInMassQ > 0 && !L.acc.gteFast(ACC_ABIOTIC_STAGED, abioticInMassQ))
+    ) {
+      if (childStructEnergyQ > 0) this.postEnergy(PR_REPRODUCTION, AK_ORGANISM_RESERVE, motherSlot, AK_ORGANISM_STRUCT, childSlot, childStructEnergyQ);
+      if (childReserveEnergyQ > 0) this.postEnergy(PR_REPRODUCTION, AK_ORGANISM_RESERVE, motherSlot, AK_ORGANISM_RESERVE, childSlot, childReserveEnergyQ);
+      if (heatQ > 0) this.postEnergy(PR_REPRODUCTION, AK_ORGANISM_RESERVE, motherSlot, AK_HEAT, 0, heatQ);
+      if (desiredOffspringReserveMassQ > 0) this.postMass(PR_REPRODUCTION, AK_ORGANISM_RESERVE, motherSlot, AK_ORGANISM_RESERVE, childSlot, desiredOffspringReserveMassQ);
+      if (directReserveToStruct > 0) this.postMass(PR_REPRODUCTION, AK_ORGANISM_RESERVE, motherSlot, AK_ORGANISM_STRUCT, childSlot, directReserveToStruct);
+      if (abioticInMassQ > 0) this.postMass(PR_REPRODUCTION, AK_ABIOTIC, 0, AK_ORGANISM_STRUCT, childSlot, abioticInMassQ);
+      if (abioticOutMassQ > 0) this.postMass(PR_REPRODUCTION, AK_ORGANISM_RESERVE, motherSlot, AK_ABIOTIC, 0, abioticOutMassQ);
+      return;
+    }
+
+    const sCh = L.fastChannelBaseByKind[AK_ORGANISM_STRUCT];
+    const rCh = L.fastChannelBaseByKind[AK_ORGANISM_RESERVE];
+    const sBackM = fastOrg.back[sCh];
+    const sBackE = fastOrg.back[sCh + 1];
+    const rBackM = fastOrg.back[rCh];
+    const rBackE = fastOrg.back[rCh + 1];
+
+    const motherDebitM = desiredOffspringReserveMassQ + directReserveToStruct + abioticOutMassQ;
+    const motherDebitE = childStructEnergyQ + childReserveEnergyQ + heatQ;
+    const childStructCreditM = directReserveToStruct + abioticInMassQ;
+    if (motherSlot >= rBackM.length || rBackM[motherSlot] < motherDebitM) {
+      fastOrg.checkDebit(rCh, motherSlot, motherDebitM, ACCOUNT_KIND_NAMES[AK_ORGANISM_RESERVE]);
+    }
+    if (rBackE[motherSlot] < motherDebitE) {
+      fastOrg.checkDebit(rCh + 1, motherSlot, motherDebitE, ACCOUNT_KIND_NAMES[AK_ORGANISM_RESERVE]);
+    }
+    if (childSlot >= sBackM.length || sBackM[childSlot] + childStructCreditM > LOCAL_MAX_SAFE_INT) {
+      fastOrg.checkCredit(sCh, childSlot, childStructCreditM, ACCOUNT_KIND_NAMES[AK_ORGANISM_STRUCT]);
+    }
+    if (sBackE[childSlot] + childStructEnergyQ > LOCAL_MAX_SAFE_INT) {
+      fastOrg.checkCredit(sCh + 1, childSlot, childStructEnergyQ, ACCOUNT_KIND_NAMES[AK_ORGANISM_STRUCT]);
+    }
+    if (rBackM[childSlot] + desiredOffspringReserveMassQ > LOCAL_MAX_SAFE_INT) {
+      fastOrg.checkCredit(rCh, childSlot, desiredOffspringReserveMassQ, ACCOUNT_KIND_NAMES[AK_ORGANISM_RESERVE]);
+    }
+    if (rBackE[childSlot] + childReserveEnergyQ > LOCAL_MAX_SAFE_INT) {
+      fastOrg.checkCredit(rCh + 1, childSlot, childReserveEnergyQ, ACCOUNT_KIND_NAMES[AK_ORGANISM_RESERVE]);
+    }
+
+    const mb = L.massBuffer;
+    const eb = L.energyBuffer;
+    if (mb.count + 4 > mb.reason.length) mb.ensureRoom(4);
+    if (eb.count + 3 > eb.reason.length) eb.ensureRoom(3);
+
+    if (fastOrg.dirtyFlag[motherSlot] === 0) {
+      fastOrg.dirtyFlag[motherSlot] = 1;
+      fastOrg.dirtyList[fastOrg.dirtyCountValue++] = motherSlot;
+    }
+    if (fastOrg.dirtyFlag[childSlot] === 0) {
+      fastOrg.dirtyFlag[childSlot] = 1;
+      fastOrg.dirtyList[fastOrg.dirtyCountValue++] = childSlot;
+    }
+    rBackM[motherSlot] -= motherDebitM;
+    rBackE[motherSlot] -= motherDebitE;
+    sBackM[childSlot] += childStructCreditM;
+    sBackE[childSlot] += childStructEnergyQ;
+    rBackM[childSlot] += desiredOffspringReserveMassQ;
+    rBackE[childSlot] += childReserveEnergyQ;
+    if (abioticInMassQ > 0) L.acc.subFast(ACC_ABIOTIC_STAGED, abioticInMassQ);
+    if (abioticOutMassQ > 0) L.acc.addFast(ACC_ABIOTIC_STAGED, abioticOutMassQ);
+    if (heatQ > 0) L.acc.addFast(ACC_TX_HEAT, heatQ);
+
+    if (childStructEnergyQ > 0) {
+      const ei = eb.count++;
+      eb.reason[ei] = PR_REPRODUCTION;
+      eb.srcKind[ei] = AK_ORGANISM_RESERVE;
+      eb.dstKind[ei] = AK_ORGANISM_STRUCT;
+      eb.srcId[ei] = motherSlot;
+      eb.dstId[ei] = childSlot;
+      eb.amount[ei] = childStructEnergyQ;
+      L.reasonTxEnergy.addFast(PR_REPRODUCTION, childStructEnergyQ);
+    }
+    if (childReserveEnergyQ > 0) {
+      const ei = eb.count++;
+      eb.reason[ei] = PR_REPRODUCTION;
+      eb.srcKind[ei] = AK_ORGANISM_RESERVE;
+      eb.dstKind[ei] = AK_ORGANISM_RESERVE;
+      eb.srcId[ei] = motherSlot;
+      eb.dstId[ei] = childSlot;
+      eb.amount[ei] = childReserveEnergyQ;
+      L.reasonTxEnergy.addFast(PR_REPRODUCTION, childReserveEnergyQ);
+    }
+    if (heatQ > 0) {
+      const ei = eb.count++;
+      eb.reason[ei] = PR_REPRODUCTION;
+      eb.srcKind[ei] = AK_ORGANISM_RESERVE;
+      eb.dstKind[ei] = AK_HEAT;
+      eb.srcId[ei] = motherSlot;
+      eb.dstId[ei] = 0;
+      eb.amount[ei] = heatQ;
+      L.reasonTxEnergy.addFast(PR_REPRODUCTION, heatQ);
+    }
+
+    if (desiredOffspringReserveMassQ > 0) {
+      const mi = mb.count++;
+      mb.reason[mi] = PR_REPRODUCTION;
+      mb.srcKind[mi] = AK_ORGANISM_RESERVE;
+      mb.dstKind[mi] = AK_ORGANISM_RESERVE;
+      mb.srcId[mi] = motherSlot;
+      mb.dstId[mi] = childSlot;
+      mb.amount[mi] = desiredOffspringReserveMassQ;
+      L.reasonTxMass.addFast(PR_REPRODUCTION, desiredOffspringReserveMassQ);
+    }
+    if (directReserveToStruct > 0) {
+      const mi = mb.count++;
+      mb.reason[mi] = PR_REPRODUCTION;
+      mb.srcKind[mi] = AK_ORGANISM_RESERVE;
+      mb.dstKind[mi] = AK_ORGANISM_STRUCT;
+      mb.srcId[mi] = motherSlot;
+      mb.dstId[mi] = childSlot;
+      mb.amount[mi] = directReserveToStruct;
+      L.reasonTxMass.addFast(PR_REPRODUCTION, directReserveToStruct);
+    }
+    if (abioticInMassQ > 0) {
+      const mi = mb.count++;
+      mb.reason[mi] = PR_REPRODUCTION;
+      mb.srcKind[mi] = AK_ABIOTIC;
+      mb.dstKind[mi] = AK_ORGANISM_STRUCT;
+      mb.srcId[mi] = 0;
+      mb.dstId[mi] = childSlot;
+      mb.amount[mi] = abioticInMassQ;
+      L.reasonTxMass.addFast(PR_REPRODUCTION, abioticInMassQ);
+    }
+    if (abioticOutMassQ > 0) {
+      const mi = mb.count++;
+      mb.reason[mi] = PR_REPRODUCTION;
+      mb.srcKind[mi] = AK_ORGANISM_RESERVE;
+      mb.dstKind[mi] = AK_ABIOTIC;
+      mb.srcId[mi] = motherSlot;
+      mb.dstId[mi] = 0;
+      mb.amount[mi] = abioticOutMassQ;
+      L.reasonTxMass.addFast(PR_REPRODUCTION, abioticOutMassQ);
+    }
+  }
+
+  /** @internal Fuses STRUCT + RESERVE -> CELL_CARRION death transfers into a single store pass. */
+  postDeathToCarrionFast(
+    organismSlot: number,
+    cellIndex: number,
+    structMassQ: number,
+    structEnergyQ: number,
+    reserveMassQ: number,
+    reserveEnergyQ: number
+  ): void {
+    if (structMassQ === 0 && reserveMassQ === 0) return;
+    const L = this.ledger;
+    const fastOrg = L.fastStoreByKind[AK_ORGANISM_STRUCT];
+    const fastCar = L.fastStoreByKind[AK_CELL_CARRION];
+    if (
+      fastOrg === null ||
+      fastCar === null ||
+      this.stateValue !== 'ACTIVE' ||
+      L.active !== this ||
+      (organismSlot >>> 0) !== organismSlot ||
+      (cellIndex >>> 0) !== cellIndex ||
+      structMassQ < 0 ||
+      reserveMassQ < 0
+    ) {
+      if (structMassQ > 0) this.transferBiomass(PR_DEATH, AK_ORGANISM_STRUCT, organismSlot, AK_CELL_CARRION, cellIndex, structMassQ, structEnergyQ);
+      if (reserveMassQ > 0) this.transferBiomass(PR_DEATH, AK_ORGANISM_RESERVE, organismSlot, AK_CELL_CARRION, cellIndex, reserveMassQ, reserveEnergyQ);
+      return;
+    }
+
+    const sCh = L.fastChannelBaseByKind[AK_ORGANISM_STRUCT];
+    const rCh = L.fastChannelBaseByKind[AK_ORGANISM_RESERVE];
+    const cCh = L.fastChannelBaseByKind[AK_CELL_CARRION];
+    const sBackM = fastOrg.back[sCh];
+    const sBackE = fastOrg.back[sCh + 1];
+    const rBackM = fastOrg.back[rCh];
+    const rBackE = fastOrg.back[rCh + 1];
+    const cBackM = fastCar.back[cCh];
+    const cBackE = fastCar.back[cCh + 1];
+
+    if (organismSlot >= sBackM.length || sBackM[organismSlot] < structMassQ) {
+      fastOrg.checkDebit(sCh, organismSlot, structMassQ, ACCOUNT_KIND_NAMES[AK_ORGANISM_STRUCT]);
+    }
+    if (sBackE[organismSlot] < structEnergyQ) {
+      fastOrg.checkDebit(sCh + 1, organismSlot, structEnergyQ, ACCOUNT_KIND_NAMES[AK_ORGANISM_STRUCT]);
+    }
+    if (rBackM[organismSlot] < reserveMassQ) {
+      fastOrg.checkDebit(rCh, organismSlot, reserveMassQ, ACCOUNT_KIND_NAMES[AK_ORGANISM_RESERVE]);
+    }
+    if (rBackE[organismSlot] < reserveEnergyQ) {
+      fastOrg.checkDebit(rCh + 1, organismSlot, reserveEnergyQ, ACCOUNT_KIND_NAMES[AK_ORGANISM_RESERVE]);
+    }
+    const totM = structMassQ + reserveMassQ;
+    const totE = structEnergyQ + reserveEnergyQ;
+    if (cellIndex >= cBackM.length || cBackM[cellIndex] + totM > LOCAL_MAX_SAFE_INT) {
+      fastCar.checkCredit(cCh, cellIndex, totM, ACCOUNT_KIND_NAMES[AK_CELL_CARRION]);
+    }
+    if (cBackE[cellIndex] + totE > LOCAL_MAX_SAFE_INT) {
+      fastCar.checkCredit(cCh + 1, cellIndex, totE, ACCOUNT_KIND_NAMES[AK_CELL_CARRION]);
+    }
+
+    const mb = L.massBuffer;
+    const eb = L.energyBuffer;
+    if (mb.count + 2 > mb.reason.length) mb.ensureRoom(2);
+    if (eb.count + 2 > eb.reason.length) eb.ensureRoom(2);
+
+    if (fastOrg.dirtyFlag[organismSlot] === 0) {
+      fastOrg.dirtyFlag[organismSlot] = 1;
+      fastOrg.dirtyList[fastOrg.dirtyCountValue++] = organismSlot;
+    }
+    if (fastCar.dirtyFlag[cellIndex] === 0) {
+      fastCar.dirtyFlag[cellIndex] = 1;
+      fastCar.dirtyList[fastCar.dirtyCountValue++] = cellIndex;
+    }
+
+    if (structMassQ > 0) {
+      sBackM[organismSlot] -= structMassQ;
+      cBackM[cellIndex] += structMassQ;
+      const mi = mb.count++;
+      mb.reason[mi] = PR_DEATH;
+      mb.srcKind[mi] = AK_ORGANISM_STRUCT;
+      mb.dstKind[mi] = AK_CELL_CARRION;
+      mb.srcId[mi] = organismSlot;
+      mb.dstId[mi] = cellIndex;
+      mb.amount[mi] = structMassQ;
+      L.reasonTxMass.addFast(PR_DEATH, structMassQ);
+    }
+    if (structEnergyQ > 0) {
+      sBackE[organismSlot] -= structEnergyQ;
+      cBackE[cellIndex] += structEnergyQ;
+      const ei = eb.count++;
+      eb.reason[ei] = PR_DEATH;
+      eb.srcKind[ei] = AK_ORGANISM_STRUCT;
+      eb.dstKind[ei] = AK_CELL_CARRION;
+      eb.srcId[ei] = organismSlot;
+      eb.dstId[ei] = cellIndex;
+      eb.amount[ei] = structEnergyQ;
+      L.reasonTxEnergy.addFast(PR_DEATH, structEnergyQ);
+    }
+    if (reserveMassQ > 0) {
+      rBackM[organismSlot] -= reserveMassQ;
+      cBackM[cellIndex] += reserveMassQ;
+      const mi = mb.count++;
+      mb.reason[mi] = PR_DEATH;
+      mb.srcKind[mi] = AK_ORGANISM_RESERVE;
+      mb.dstKind[mi] = AK_CELL_CARRION;
+      mb.srcId[mi] = organismSlot;
+      mb.dstId[mi] = cellIndex;
+      mb.amount[mi] = reserveMassQ;
+      L.reasonTxMass.addFast(PR_DEATH, reserveMassQ);
+    }
+    if (reserveEnergyQ > 0) {
+      rBackE[organismSlot] -= reserveEnergyQ;
+      cBackE[cellIndex] += reserveEnergyQ;
+      const ei = eb.count++;
+      eb.reason[ei] = PR_DEATH;
+      eb.srcKind[ei] = AK_ORGANISM_RESERVE;
+      eb.dstKind[ei] = AK_CELL_CARRION;
+      eb.srcId[ei] = organismSlot;
+      eb.dstId[ei] = cellIndex;
+      eb.amount[ei] = reserveEnergyQ;
+      L.reasonTxEnergy.addFast(PR_DEATH, reserveEnergyQ);
+    }
   }
 
   /**
@@ -630,21 +1457,37 @@ export class EnergyTransaction {
       throw new EnergyRuleError('Biomass transfer rejected: source and destination are the same account');
     }
 
+    const fastSrc = L.fastStoreByKind[srcKind];
+    const fastDst = L.fastStoreByKind[dstKind];
     let srcStore: StagedStore | null = null;
     let dstStore: StagedStore | null = null;
+    let srcBackM: Float64Array | null = null;
+    let srcBackE: Float64Array | null = null;
+    let dstBackM: Float64Array | null = null;
+    let dstBackE: Float64Array | null = null;
 
     // --- Validate source for both mass and energy legs ---
-    if (srcKind === AK_GENESIS) {
+    if (fastSrc !== null) {
+      const sCh = L.fastChannelBaseByKind[srcKind];
+      srcBackM = fastSrc.back[sCh];
+      srcBackE = fastSrc.back[sCh + 1];
+      if (srcId >= srcBackM.length || srcBackM[srcId] < massQ) {
+        fastSrc.checkDebit(sCh, srcId, massQ, ACCOUNT_KIND_NAMES[srcKind]);
+      }
+      if (srcBackE[srcId] < energyQ) {
+        fastSrc.checkDebit(sCh + 1, srcId, energyQ, ACCOUNT_KIND_NAMES[srcKind]);
+      }
+    } else if (srcKind === AK_GENESIS) {
       if (!this.genesis) {
         throw new EnergyRuleError('Biomass transfer rejected: GENESIS is only available to genesis transactions');
       }
       if (srcId !== 0) EnergyTransaction.assertSingleton(srcKind, srcId);
     } else if (srcKind === AK_ESCROW) {
       this.assertEscrowSlot(srcId);
-      if (!L.escrowStagedMass.gte(srcId, massQ)) {
+      if (!L.escrowStagedMass.gteFast(srcId, massQ)) {
         throw new InsufficientBalanceError(`ESCROW[${srcId}] mass cannot cover ${massQ} quanta`);
       }
-      if (!L.escrowStagedEnergy.gte(srcId, energyQ)) {
+      if (!L.escrowStagedEnergy.gteFast(srcId, energyQ)) {
         throw new InsufficientBalanceError(`ESCROW[${srcId}] energy cannot cover ${energyQ} quanta`);
       }
     } else {
@@ -654,32 +1497,82 @@ export class EnergyTransaction {
     }
 
     // --- Validate destination for both mass and energy legs ---
-    dstStore = L.storeByKind[dstKind] ?? this.storeFor(dstKind);
-    dstStore.checkCredit(dstKind, dstId, false, massQ);
-    dstStore.checkCredit(dstKind, dstId, true, energyQ);
+    if (fastDst !== null) {
+      const dCh = L.fastChannelBaseByKind[dstKind];
+      dstBackM = fastDst.back[dCh];
+      dstBackE = fastDst.back[dCh + 1];
+      if (dstId >= dstBackM.length || dstBackM[dstId] + massQ > LOCAL_MAX_SAFE_INT) {
+        fastDst.checkCredit(dCh, dstId, massQ, ACCOUNT_KIND_NAMES[dstKind]);
+      }
+      if (dstBackE[dstId] + energyQ > LOCAL_MAX_SAFE_INT) {
+        fastDst.checkCredit(dCh + 1, dstId, energyQ, ACCOUNT_KIND_NAMES[dstKind]);
+      }
+    } else {
+      dstStore = L.storeByKind[dstKind] ?? this.storeFor(dstKind);
+      dstStore.checkCredit(dstKind, dstId, false, massQ);
+      dstStore.checkCredit(dstKind, dstId, true, energyQ);
+    }
+
+    if (massQ === 0 && energyQ === 0) return;
 
     // --- Pre-reserve BOTH posting buffers before any state mutation ---
-    if (massQ > 0) L.massBuffer.ensureRoom();
-    if (energyQ > 0) L.energyBuffer.ensureRoom();
+    const mb = L.massBuffer;
+    const eb = L.energyBuffer;
+    if (massQ > 0) mb.ensureRoom();
+    if (energyQ > 0) eb.ensureRoom();
 
     // --- Apply atomically (cannot fail) ---
-    if (massQ > 0) {
-      if (srcKind === AK_GENESIS) L.acc.addFast(ACC_TX_GENESIS_MASS, massQ);
-      else if (srcKind === AK_ESCROW) L.escrowStagedMass.sub(srcId, massQ);
-      else (srcStore as StagedStore).applyDebit(srcKind, srcId, false, massQ);
+    if (fastSrc !== null) {
+      if (fastSrc.dirtyFlag[srcId] === 0) {
+        fastSrc.dirtyFlag[srcId] = 1;
+        fastSrc.dirtyList[fastSrc.dirtyCountValue++] = srcId;
+      }
+      if (massQ > 0) (srcBackM as Float64Array)[srcId] -= massQ;
+      if (energyQ > 0) (srcBackE as Float64Array)[srcId] -= energyQ;
+    } else {
+      if (massQ > 0) {
+        if (srcKind === AK_GENESIS) L.acc.addFast(ACC_TX_GENESIS_MASS, massQ);
+        else if (srcKind === AK_ESCROW) L.escrowStagedMass.subFast(srcId, massQ);
+        else (srcStore as StagedStore).applyDebit(srcKind, srcId, false, massQ);
+      }
+      if (energyQ > 0) {
+        if (srcKind === AK_GENESIS) L.acc.addFast(ACC_TX_GENESIS_ENERGY, energyQ);
+        else if (srcKind === AK_ESCROW) L.escrowStagedEnergy.subFast(srcId, energyQ);
+        else (srcStore as StagedStore).applyDebit(srcKind, srcId, true, energyQ);
+      }
+    }
 
-      dstStore.applyCredit(dstKind, dstId, false, massQ);
-      L.massBuffer.push(reason, srcKind, srcId, dstKind, dstId, massQ);
+    if (fastDst !== null) {
+      if (fastDst.dirtyFlag[dstId] === 0) {
+        fastDst.dirtyFlag[dstId] = 1;
+        fastDst.dirtyList[fastDst.dirtyCountValue++] = dstId;
+      }
+      if (massQ > 0) (dstBackM as Float64Array)[dstId] += massQ;
+      if (energyQ > 0) (dstBackE as Float64Array)[dstId] += energyQ;
+    } else {
+      if (massQ > 0) (dstStore as StagedStore).applyCredit(dstKind, dstId, false, massQ);
+      if (energyQ > 0) (dstStore as StagedStore).applyCredit(dstKind, dstId, true, energyQ);
+    }
+
+    if (massQ > 0) {
+      const mi = mb.count++;
+      mb.reason[mi] = reason;
+      mb.srcKind[mi] = srcKind;
+      mb.dstKind[mi] = dstKind;
+      mb.srcId[mi] = srcId;
+      mb.dstId[mi] = dstId;
+      mb.amount[mi] = massQ;
       L.reasonTxMass.addFast(reason, massQ);
     }
 
     if (energyQ > 0) {
-      if (srcKind === AK_GENESIS) L.acc.addFast(ACC_TX_GENESIS_ENERGY, energyQ);
-      else if (srcKind === AK_ESCROW) L.escrowStagedEnergy.sub(srcId, energyQ);
-      else (srcStore as StagedStore).applyDebit(srcKind, srcId, true, energyQ);
-
-      dstStore.applyCredit(dstKind, dstId, true, energyQ);
-      L.energyBuffer.push(reason, srcKind, srcId, dstKind, dstId, energyQ);
+      const ei = eb.count++;
+      eb.reason[ei] = reason;
+      eb.srcKind[ei] = srcKind;
+      eb.dstKind[ei] = dstKind;
+      eb.srcId[ei] = srcId;
+      eb.dstId[ei] = dstId;
+      eb.amount[ei] = energyQ;
       L.reasonTxEnergy.addFast(reason, energyQ);
     }
   }
@@ -805,6 +1698,7 @@ export class EnergyTransaction {
     }
 
     // I4: re-derive external flows from the posting buffers.
+    const PARTIAL_LIMIT = 35_184_372_088_832; // 2^45
     acc.reset(ACC_CHECK_SUN);
     acc.reset(ACC_CHECK_HEAT);
     acc.reset(ACC_CHECK_GENESIS_MASS);
@@ -815,6 +1709,7 @@ export class EnergyTransaction {
     const mbDstKind = mb.dstKind;
     const mbAmount = mb.amount;
     const mbCount = mb.count;
+    let genMassSum = 0;
     for (let i = 0; i < mbCount; i++) {
       const r = mbReason[i];
       const sk = mbSrcKind[i];
@@ -824,15 +1719,28 @@ export class EnergyTransaction {
       }
       if (sk === AK_GENESIS) {
         if (!this.genesis) throw new EnergyInvariantError('I4', `mass posting #${i} draws from GENESIS`);
-        acc.addFast(ACC_CHECK_GENESIS_MASS, mbAmount[i]);
+        const v = mbAmount[i];
+        if (v >= PARTIAL_LIMIT) acc.addFast(ACC_CHECK_GENESIS_MASS, v);
+        else {
+          genMassSum += v;
+          if (genMassSum >= PARTIAL_LIMIT) {
+            acc.addFast(ACC_CHECK_GENESIS_MASS, genMassSum);
+            genMassSum = 0;
+          }
+        }
       }
     }
+    if (genMassSum > 0) acc.addFast(ACC_CHECK_GENESIS_MASS, genMassSum);
+
     const eb = L.energyBuffer;
     const ebReason = eb.reason;
     const ebSrcKind = eb.srcKind;
     const ebDstKind = eb.dstKind;
     const ebAmount = eb.amount;
     const ebCount = eb.count;
+    let sunSum = 0;
+    let heatSum = 0;
+    let genEnergySum = 0;
     for (let i = 0; i < ebCount; i++) {
       const r = ebReason[i];
       const sk = ebSrcKind[i];
@@ -842,12 +1750,41 @@ export class EnergyTransaction {
       }
       if (sk === AK_GENESIS) {
         if (!this.genesis) throw new EnergyInvariantError('I4', `energy posting #${i} draws from GENESIS`);
-        acc.addFast(ACC_CHECK_GENESIS_ENERGY, ebAmount[i]);
+        const v = ebAmount[i];
+        if (v >= PARTIAL_LIMIT) acc.addFast(ACC_CHECK_GENESIS_ENERGY, v);
+        else {
+          genEnergySum += v;
+          if (genEnergySum >= PARTIAL_LIMIT) {
+            acc.addFast(ACC_CHECK_GENESIS_ENERGY, genEnergySum);
+            genEnergySum = 0;
+          }
+        }
       } else if (sk === AK_SUN) {
-        acc.addFast(ACC_CHECK_SUN, ebAmount[i]);
+        const v = ebAmount[i];
+        if (v >= PARTIAL_LIMIT) acc.addFast(ACC_CHECK_SUN, v);
+        else {
+          sunSum += v;
+          if (sunSum >= PARTIAL_LIMIT) {
+            acc.addFast(ACC_CHECK_SUN, sunSum);
+            sunSum = 0;
+          }
+        }
       }
-      if (dk === AK_HEAT) acc.addFast(ACC_CHECK_HEAT, ebAmount[i]);
+      if (dk === AK_HEAT) {
+        const v = ebAmount[i];
+        if (v >= PARTIAL_LIMIT) acc.addFast(ACC_CHECK_HEAT, v);
+        else {
+          heatSum += v;
+          if (heatSum >= PARTIAL_LIMIT) {
+            acc.addFast(ACC_CHECK_HEAT, heatSum);
+            heatSum = 0;
+          }
+        }
+      }
     }
+    if (genEnergySum > 0) acc.addFast(ACC_CHECK_GENESIS_ENERGY, genEnergySum);
+    if (sunSum > 0) acc.addFast(ACC_CHECK_SUN, sunSum);
+    if (heatSum > 0) acc.addFast(ACC_CHECK_HEAT, heatSum);
     if (
       !acc.equalsAt(ACC_CHECK_SUN, acc, ACC_TX_SUN) ||
       !acc.equalsAt(ACC_CHECK_HEAT, acc, ACC_TX_HEAT) ||

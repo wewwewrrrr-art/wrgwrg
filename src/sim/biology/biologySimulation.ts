@@ -15,14 +15,18 @@ import {
   applyPpm,
   energyOfMass,
   euToQ,
+  euToQFloorFast,
+  euToQHalfEvenFast,
   fractionToPpm,
+  fractionToPpmFloorFast,
+  fractionToPpmHalfEvenFast,
   massForEnergy,
   muToQ,
   qToMU,
   resolveContention,
   scaleByRatio,
 } from '../units';
-import { EnergyPool, WorldEnergyGrid, WorldEnergyReadView } from '../worldEnergyGrid';
+import { EnergyPool, EnergyPoolId, WorldEnergyGrid, WorldEnergyReadView } from '../worldEnergyGrid';
 import { TerrainType, WorldBiomeId, WorldGrid } from '../worldGrid';
 import {
   DeterministicPreyFoodProvider,
@@ -48,6 +52,7 @@ import {
   MutationRecord,
   compileMutationPlan,
   mutateGenomeWithPlan,
+  mutateGenomeWithPlanCount,
   validateMutationConfig,
 } from './mutation';
 import {
@@ -115,6 +120,36 @@ const LOCAL_MAX_SAFE_INT = Number.MAX_SAFE_INTEGER;
 const LOCAL_PPM = PPM;
 const PLANT_SAFE_MASS_LIMIT = 3_002_399_751_580_330; // floor(MAX_SAFE_INT / 3)
 const RESERVE_SAFE_MASS_LIMIT = 300_239_975_158_033; // floor(MAX_SAFE_INT / 30)
+
+// Local bindings for cross-module functions/constants to avoid CJS exports getter dispatch in hot loops
+const _safeAdd = safeAdd;
+const _energyOfMass = energyOfMass;
+const _euToQFloorFast = euToQFloorFast;
+const _euToQHalfEvenFast = euToQHalfEvenFast;
+const _fractionToPpmFloorFast = fractionToPpmFloorFast;
+const _fractionToPpmHalfEvenFast = fractionToPpmHalfEvenFast;
+const _qToMU = qToMU;
+const _resolveContention = resolveContention;
+const _scaleByRatio = scaleByRatio;
+const _RHO_PLANT = RHO_PLANT;
+const _RHO_DETRITUS = RHO_DETRITUS;
+const _RHO_RESERVE = RHO_RESERVE;
+const _computePhenotype = computePhenotype;
+const _createHaploidGamete = createHaploidGamete;
+const _mutateGenomeWithPlan = mutateGenomeWithPlan;
+const _mutateGenomeWithPlanCount = mutateGenomeWithPlanCount;
+const _processOrganismDeath = processOrganismDeath;
+const _computeTotalMetabolicDemandFast = computeTotalMetabolicDemandFast;
+const _computeFeedingPlanFast = computeFeedingPlanFast;
+const _stageFeedingFast = stageFeedingFast;
+const _stageCarrionScavengeFast = stageCarrionScavengeFast;
+const _stagePreyPredationFast = stagePreyPredationFast;
+const _stageSomaticGrowthFast = stageSomaticGrowthFast;
+const _stageReproductionProvisioningFast = stageReproductionProvisioningFast;
+const _stageDeathToCarrionFast = stageDeathToCarrionFast;
+const _stageCarrionDecompositionFast = stageCarrionDecompositionFast;
+const _stageDetritusDecompositionFast = stageDetritusDecompositionFast;
+const _stageMetabolismFast = stageMetabolismFast;
 
 const AK_ABIOTIC = AccountKind.ABIOTIC;
 const AK_SUN = AccountKind.SUN;
@@ -549,6 +584,25 @@ function sortInt32IndicesByFloat64Key(
   }
 }
 
+function sortOrScanDirtyCells(
+  dirtyCount: number,
+  cellCount: number,
+  cellHead: Int32Array,
+  dirtyCells: Uint32Array
+): void {
+  if (dirtyCount <= 1) return;
+  if (dirtyCount > (cellCount >>> 3)) {
+    let idx = 0;
+    for (let c = 0; c < cellCount; c++) {
+      if (cellHead[c] !== -1) {
+        dirtyCells[idx++] = c;
+      }
+    }
+  } else {
+    dirtyCells.subarray(0, dirtyCount).sort();
+  }
+}
+
 /**
  * Main deterministic coordinator for biological simulation (Phase 2.2.1b P3).
  *
@@ -790,6 +844,41 @@ export class BiologySimulation {
   private eggMutationRecords: (readonly MutationRecord[] | undefined)[] = [];
   private slotPlanSlots = new Int32Array(64);
   private slotPlanReused = new Uint8Array(64);
+
+  // Reusable per-tick species scratch buffers & mate cursor
+  private stepSpeciesCap = 0;
+  private stepTouchedPops: PopulationManager[] = [];
+  private stepPopBySpeciesIdx: Array<PopulationManager | null> = [];
+  private stepSpeciesDraftStart = new Int32Array(0);
+  private stepSpeciesDraftEnd = new Int32Array(0);
+  private stepSpeciesWasCanonical = new Uint8Array(0);
+  private stepSpeciesActiveMapOffsets = new Int32Array(0);
+  private stepUnsortedIdToDraftMaps: Array<Map<number, number> | null> = [];
+  private stepSpeciesEligibleCounts = new Int32Array(0);
+  private stepSpeciesEggStart = new Int32Array(0);
+  private stepSpeciesEggCount = new Int32Array(0);
+  private stepCommittedDeathEvents: OrganismDeathEvent[] = [];
+
+  private readonly mateCellCursor: Int32Array;
+  private readonly mateCellTouched: Uint32Array;
+  private mateTouchedCount = 0;
+
+  // Active tick counters (for clean modular phases & guaranteed finally cleanup)
+  private curDraftCount = 0;
+  private curEggPlanCount = 0;
+  private curReproPlanCount = 0;
+  private curPredBiteCount = 0;
+  private curPlantDirtyCount = 0;
+  private curCarrionDirtyCount = 0;
+  private curDetritusDirtyCount = 0;
+  private curPreyDirtyCount = 0;
+  private curAliveDirtyCount = 0;
+  private curPhotoCount = 0;
+  private curPreyRemTouchedCount = 0;
+  private curNewlyDiedCellCount = 0;
+  private curDiedCount = 0;
+  private curGloballySorted = true;
+  private curPrevGlobalId = -1;
 
   constructor(config: BiologySimulationConfig) {
     this.grid = config.grid;
@@ -1066,6 +1155,9 @@ export class BiologySimulation {
     this.projectedPlantCellMass.fill(-1);
     this.newlyDiedCellFlags = new Uint8Array(cc);
     this.newlyDiedCellList = new Uint32Array(cc);
+    this.mateCellCursor = new Int32Array(cc);
+    this.mateCellCursor.fill(-2);
+    this.mateCellTouched = new Uint32Array(cc);
   }
 
   private tryRegisterStoreIfUnregistered(store: WorldEnergyGrid | EntityEnergyStore): void {
@@ -1679,6 +1771,93 @@ export class BiologySimulation {
     return bestDraftIdx;
   }
 
+  private findMateDraftWithCursor(
+    seekerX: number,
+    seekerY: number,
+    seekerCellIdx: number,
+    cellHead: Int32Array,
+    cellNext: Int32Array,
+    active: readonly Organism[],
+    activeToDraft: Int32Array
+  ): number {
+    const draftFlags = this.draftFlags;
+    const draftOrgId = this.draftOrgId;
+    const reqFlags = FLAG_ELIGIBLE;
+    const forbidFlags = FLAG_DIED | FLAG_FEMALE;
+    const cursor = this.mateCellCursor;
+    const touched = this.mateCellTouched;
+
+    let idx = cursor[seekerCellIdx];
+    if (idx === -2) {
+      touched[this.mateTouchedCount++] = seekerCellIdx;
+      idx = cellHead[seekerCellIdx];
+      cursor[seekerCellIdx] = idx;
+    }
+    while (idx !== -1) {
+      const cand = active[idx];
+      if (cand.alive && cand.sex !== 'female') {
+        const candDraftIdx = activeToDraft[idx];
+        if (candDraftIdx !== -1) {
+          const flags = draftFlags[candDraftIdx];
+          if ((flags & reqFlags) !== 0 && (flags & forbidFlags) === 0) {
+            cursor[seekerCellIdx] = idx;
+            return candDraftIdx;
+          }
+        }
+      }
+      idx = cellNext[idx];
+    }
+    cursor[seekerCellIdx] = -1;
+
+    let bestDraftIdx = -1;
+    let bestOrgId = Infinity;
+    const width = this.grid.width;
+    const height = this.grid.height;
+    const wrapX = this.effectiveWrapX;
+    for (let k = 0; k < 8; k++) {
+      let nx = seekerX + MOORE_DX[k];
+      const ny = seekerY + MOORE_DY[k];
+      if (ny < 0 || ny >= height) continue;
+      if (wrapX) {
+        nx = ((nx % width) + width) % width;
+      } else if (nx < 0 || nx >= width) {
+        continue;
+      }
+      const nIdx = ny * width + nx;
+      if (nIdx === seekerCellIdx) continue;
+      let nCursor = cursor[nIdx];
+      if (nCursor === -2) {
+        touched[this.mateTouchedCount++] = nIdx;
+        nCursor = cellHead[nIdx];
+        cursor[nIdx] = nCursor;
+      }
+      while (nCursor !== -1) {
+        const cand = active[nCursor];
+        if (cand.alive && cand.sex !== 'female') {
+          const candDraftIdx = activeToDraft[nCursor];
+          if (candDraftIdx !== -1) {
+            const flags = draftFlags[candDraftIdx];
+            if ((flags & reqFlags) !== 0 && (flags & forbidFlags) === 0) {
+              cursor[nIdx] = nCursor;
+              const candId = draftOrgId[candDraftIdx];
+              if (candId < bestOrgId) {
+                bestOrgId = candId;
+                bestDraftIdx = candDraftIdx;
+              }
+              break;
+            }
+          }
+        }
+        nCursor = cellNext[nCursor];
+      }
+      if (nCursor === -1) {
+        cursor[nIdx] = -1;
+      }
+    }
+
+    return bestDraftIdx;
+  }
+
   /**
    * Exposes unique neighbor cells visited for a coordinate (primarily for testing tiny/wrapX grids).
    */
@@ -2163,1533 +2342,1725 @@ export class BiologySimulation {
     this.slotPlanReused = new Uint8Array(nextCap);
   }
 
-  /**
-   * Executes one deterministic biological tick across the atomic transactional pipeline:
-   *   GATHER -> RESOLVE -> PREPARE -> COMMIT / ABORT -> POST_COMMIT
-   */
-  private stepInternal(computeStatsForTick: boolean, pushToHistory: boolean): BiologyTickSummary {
-    const rngSnapshot = this.streams.snapshotStates();
-    const targetTick = this.tickCount + 1;
-    let plannedNextId = this.nextId;
+  private ensureStepSpeciesCapacity(sCount: number): void {
+    if (sCount > this.stepSpeciesCap) {
+      let nextCap = Math.max(8, this.stepSpeciesCap);
+      while (nextCap < sCount) nextCap *= 2;
+      this.stepSpeciesCap = nextCap;
+      this.stepPopBySpeciesIdx = new Array<PopulationManager | null>(nextCap).fill(null);
+      this.stepSpeciesDraftStart = new Int32Array(nextCap);
+      this.stepSpeciesDraftEnd = new Int32Array(nextCap);
+      this.stepSpeciesWasCanonical = new Uint8Array(nextCap);
+      this.stepSpeciesActiveMapOffsets = new Int32Array(nextCap);
+      this.stepUnsortedIdToDraftMaps = new Array<Map<number, number> | null>(nextCap).fill(null);
+      this.stepSpeciesEligibleCounts = new Int32Array(nextCap);
+      this.stepSpeciesEggStart = new Int32Array(nextCap);
+      this.stepSpeciesEggCount = new Int32Array(nextCap);
+    }
+    this.stepTouchedPops.length = 0;
+    for (let s = 0; s < sCount; s++) {
+      this.stepPopBySpeciesIdx[s] = null;
+      this.stepUnsortedIdToDraftMaps[s] = null;
+      this.stepSpeciesEligibleCounts[s] = 0;
+      this.stepSpeciesEggStart[s] = 0;
+      this.stepSpeciesEggCount[s] = 0;
+    }
+  }
 
-    const lifecycleRng = this.streams.get('biology:lifecycle');
-    const geneticsRng = this.streams.get('biology:genetics');
-    const mutationRng = this.streams.get('biology:mutation');
-    const reproductionRng = this.streams.get('biology:reproduction');
-    const speciesList = this.speciesRegistry.list();
-    const sCount = speciesList.length;
-    const speciesCaches = this.ensureSpeciesCaches(speciesList);
+  private gatherSingleSpeciesDrafts(
+    s: number,
+    pop: PopulationManager,
+    sc: SpeciesRuntimeCache,
+    isLegacyMode: boolean,
+    hasStrictFoodSources: boolean,
+    legacySnapshotAvailable: Map<number, number> | null,
+    targetTick: number,
+    entityStructFront: Float64Array | null,
+    entityReserveFront: Float64Array | null,
+    activeMapOffsetRef: { value: number }
+  ): void {
+    const species = sc.species;
+    const schema = sc.schema;
+    const pq = sc.pq;
+    const maxReserveRatioScaled = pq.maxReserveRatioScaled;
+    const dietPpm = sc.dietPpm;
+    const plantPpm = dietPpm.plantPpm;
+    const preyPpm = dietPpm.preyPpm;
+    const carrionPpm = dietPpm.carrionPpm;
+    const detritusPpm = dietPpm.detritusPpm;
+    const effAbsorptionAssimPpm = sc.effAbsorptionAssimPpm;
+    const modKinds = schema.traitModKind;
 
-    let tx: EnergyTransaction | null = null;
-    const isLegacyMode = this.conservationMode === 'legacy-external-escrow';
-    const hasAnyExternalSource = Boolean(
-      this.externalPlantSource ||
-        this.externalPreySource ||
-        this.externalCarrionSource ||
-        this.externalDetritusSource
-    );
-    const hasStrictFoodSources = !isLegacyMode || hasAnyExternalSource;
-    const legacySnapshotAvailable = isLegacyMode ? new Map<number, number>() : null;
+    const entityStore = this.entityStore;
+    const gridWidth = this.grid.width;
+    const gridTemps = this.grid.temperature;
+    const organismIdToSlot = this.organismIdToSlot;
+    const slotCarryCreditQ = this.slotCarryCreditQ;
+    const slotLastSyncedEnergy = this.slotLastSyncedEnergy;
 
-    let draftCount = 0;
-    let eggPlanCount = 0;
+    const draftOrg = this.draftOrg;
+    const draftPop = this.draftPop;
+    const draftDeathCause = this.draftDeathCause;
+    const draftSlot = this.draftSlot;
+    const draftCellIndex = this.draftCellIndex;
+    const draftOrgId = this.draftOrgId;
+    const draftSpeciesIdx = this.draftSpeciesIdx;
+    const draftNextAgeTicks = this.draftNextAgeTicks;
+    const draftNextStage = this.draftNextStage;
+    const draftNextCooldown = this.draftNextCooldown;
+    const draftFlags = this.draftFlags;
+    const draftKillerId = this.draftKillerId;
+    const draftOffspringDelta = this.draftOffspringDelta;
+    const draftStructMassQ = this.draftStructMassQ;
+    const draftReserveMassQ = this.draftReserveMassQ;
+    const draftMaxReserveMassQ = this.draftMaxReserveMassQ;
+    const draftCarryCreditQ = this.draftCarryCreditQ;
+    const draftExternalDeltaQ = this.draftExternalDeltaQ;
+    const draftMetabolicDemandQ = this.draftMetabolicDemandQ;
+    const draftHealingDemandQ = this.draftHealingDemandQ;
+    const draftBurnMassQ = this.draftBurnMassQ;
+    const draftPostMetabResQ = this.draftPostMetabResQ;
+    const draftPostMetabCarryQ = this.draftPostMetabCarryQ;
+    const draftReqPlantQ = this.draftReqPlantQ;
+    const draftReqPreyQ = this.draftReqPreyQ;
+    const draftReqCarrionQ = this.draftReqCarrionQ;
+    const draftReqDetritusQ = this.draftReqDetritusQ;
+    const draftReqLegacyNorm = this.draftReqLegacyNorm;
+    const draftGrantPlantQ = this.draftGrantPlantQ;
+    const draftGrantPreyQ = this.draftGrantPreyQ;
+    const draftGrantCarrionQ = this.draftGrantCarrionQ;
+    const draftGrantDetritusQ = this.draftGrantDetritusQ;
+    const draftNextEnergy = this.draftNextEnergy;
+    const draftNextHealth = this.draftNextHealth;
+    const draftGrowthTargetStructQ = this.draftGrowthTargetStructQ;
+    const draftDevPhys = this.draftDevPhys;
+    const draftDevNeural = this.draftDevNeural;
+    const draftDevSenesc = this.draftDevSenesc;
+    const draftThermalStress = this.draftThermalStress;
+    const draftEndurance = this.draftEndurance;
+    const draftCanonicalOrder = this.draftCanonicalOrder;
+    const activeIdxToDraftIdx = this.activeIdxToDraftIdx;
+
+    const rawOrgs = pop.getActiveOrganisms();
+    const orderedOrgs = this.getCanonicalOrderedOrganisms(pop);
+    const isPopSorted = orderedOrgs === rawOrgs;
+    this.stepSpeciesWasCanonical[s] = isPopSorted ? 1 : 0;
+    const mapOffset = activeMapOffsetRef.value;
+    this.stepSpeciesActiveMapOffsets[s] = mapOffset;
+    let unsortedMap: Map<number, number> | null = null;
+    if (isPopSorted) {
+      activeIdxToDraftIdx.fill(-1, mapOffset, mapOffset + rawOrgs.length);
+      activeMapOffsetRef.value = mapOffset + rawOrgs.length;
+    } else {
+      unsortedMap = new Map<number, number>();
+      this.stepUnsortedIdToDraftMaps[s] = unsortedMap;
+    }
+
+    this.stepSpeciesDraftStart[s] = this.curDraftCount;
+
+    const incubationTicks = sc.incubationTicks;
+    const maturityAge = sc.maturityAge;
+    const elderAgeTicks = sc.elderAgeTicks;
+    const adultMassQ = pq.adultMassQ;
+    const hatchScale = sc.hatchlingPhysicalScale;
+    const tpy = sc.tpy;
+    const incubationBio = sc.incubationBio;
+    const maturityBio = sc.maturityBio;
+    const juvenileBioSpan = sc.juvenileBioSpan;
+    const elderBio = sc.elderBio;
+    const maxBio = sc.maxLifespanTicks / tpy;
+    const minBioStep = sc.minBioStep;
+    const maxForageIntake = sc.maxForageIntakePerTick;
+    const eggIncubCost = sc.eggIncubationCostPerTick;
+    const optTemp = sc.optTemp;
+    const halfWidth = sc.halfWidth;
+    const basalFactor = sc.basalFactor;
+    const thermoFactor = sc.thermoFactor;
+    const activityFactor = sc.activityFactor;
+    const pIdx = sc.idx;
+    const idxStrength = pIdx.strength;
+    const idxSpeed = pIdx.speed;
+    const idxEndurance = pIdx.endurance;
+    const idxPerception = pIdx.perception;
+    const idxIntelligence = pIdx.intelligence;
+    const idxHeatTol = pIdx.heatTolerance;
+    const idxColdTol = pIdx.coldTolerance;
+    const idxMetEff = pIdx.metabolismEfficiency;
+    const idxAdapt = pIdx.environmentalAdaptability;
+
+    let localDraftCount = this.curDraftCount;
+    let localGloballySorted = this.curGloballySorted;
+    let localPrevGlobalId = this.curPrevGlobalId;
+
+    const isStandardCoreLoci =
+      schema.isCoreModPattern &&
+      idxStrength === 1 &&
+      idxSpeed === 2 &&
+      idxEndurance === 3 &&
+      idxPerception === 4 &&
+      idxIntelligence === 5 &&
+      idxHeatTol === 6 &&
+      idxColdTol === 7 &&
+      idxMetEff === 8 &&
+      idxAdapt === 9;
+
+    const ordLen = orderedOrgs.length;
+    for (let i = 0; i < ordLen; i++) {
+      const org = orderedOrgs[i];
+      if (!org.alive) continue;
+
+      const orgId = org.id;
+      const slot = organismIdToSlot.get(orgId);
+      if (slot === undefined) {
+        throw new Error(`Organism ${orgId} (${species.id}) is missing an EntityEnergyStore slot`);
+      }
+
+      const dIdx = localDraftCount++;
+      draftCanonicalOrder[dIdx] = dIdx;
+      if (orgId < localPrevGlobalId) {
+        localGloballySorted = false;
+      }
+      localPrevGlobalId = orgId;
+
+      if (isPopSorted) {
+        activeIdxToDraftIdx[mapOffset + i] = dIdx;
+      } else {
+        unsortedMap!.set(orgId, dIdx);
+      }
+
+      const cellIdx = org.cellIndex;
+      const structMassQ = entityStructFront !== null ? entityStructFront[slot] : entityStore.structMassQ(slot);
+      let reserveMassQ = entityReserveFront !== null ? entityReserveFront[slot] : entityStore.reserveMassQ(slot);
+      const ratioProd = structMassQ * maxReserveRatioScaled;
+      const maxReserveMassQ =
+        ratioProd <= LOCAL_MAX_SAFE_INT
+          ? (ratioProd - (ratioProd % LOCAL_PPM)) / LOCAL_PPM
+          : _scaleByRatio(structMassQ, maxReserveRatioScaled, LOCAL_PPM, 'floor');
+      const carryCreditQ = slotCarryCreditQ[slot];
+      let externalDeltaQ = 0;
+
+      if (isLegacyMode) {
+        const lastSynced = slotLastSyncedEnergy[slot];
+        if (Math.abs(org.energy - lastSynced) > 1e-9) {
+          const clamped = Math.min(1, Math.max(0, org.energy));
+          const desiredReserveQ = applyPpmFloorFast(
+            maxReserveMassQ,
+            _fractionToPpmHalfEvenFast(clamped)
+          );
+          externalDeltaQ = desiredReserveQ - reserveMassQ;
+          reserveMassQ = desiredReserveQ;
+        }
+      }
+
+      const nextAgeTicks = org.ageTicks + 1;
+      const nextCooldown = org.reproductionCooldown > 0 ? org.reproductionCooldown - 1 : 0;
+      let nextStageCode = stageToCode(org.stage);
+      if (nextStageCode === STAGE_EGG && nextAgeTicks >= incubationTicks) {
+        nextStageCode = STAGE_JUVENILE;
+      } else if (nextStageCode === STAGE_JUVENILE && nextAgeTicks >= maturityAge) {
+        nextStageCode = STAGE_ADULT;
+      } else if (nextStageCode === STAGE_ADULT && nextAgeTicks >= elderAgeTicks) {
+        nextStageCode = STAGE_ELDER;
+      }
+
+      const isEgg = nextStageCode === STAGE_EGG;
+      let devPhysicalScale: number;
+      let devNeuralScale: number;
+      let devSenescenceScale: number;
+      if (isEgg) {
+        devPhysicalScale = 0.15;
+        devNeuralScale = 0.15;
+        devSenescenceScale = 1.0;
+      } else {
+        const bioAge = nextAgeTicks / tpy;
+        if (nextStageCode === STAGE_JUVENILE) {
+          const t = juvenileBioSpan > 0 ? Math.min(1, Math.max(0, (bioAge - incubationBio) / juvenileBioSpan)) : 1;
+          devPhysicalScale = hatchScale + (1 - hatchScale) * t;
+          devNeuralScale = 0.45 + 0.55 * t;
+          devSenescenceScale = 1.0;
+        } else if (nextStageCode === STAGE_ELDER) {
+          const elderBioSpan = Math.max(minBioStep, maxBio - elderBio);
+          const t = Math.min(1, Math.max(0, (bioAge - elderBio) / elderBioSpan));
+          devPhysicalScale = 1.0;
+          devNeuralScale = 1.0;
+          devSenescenceScale = 1.0 - 0.18 * t;
+        } else if (bioAge < maturityBio && maturityBio > 0) {
+          const t = Math.max(0, bioAge / maturityBio);
+          devPhysicalScale = hatchScale + (1 - hatchScale) * t;
+          devNeuralScale = 0.45 + 0.55 * t;
+          devSenescenceScale = 1.0;
+        } else {
+          devPhysicalScale = 1.0;
+          devNeuralScale = 1.0;
+          devSenescenceScale = 1.0;
+        }
+      }
+
+      const currentNormEnergy = maxReserveMassQ > 0 ? reserveMassQ / maxReserveMassQ : 0;
+      const condScale =
+        0.45 + 0.55 * Math.min(1, Math.max(0, org.health * 0.65 + currentNormEnergy * 0.35));
+      const modPhys = devPhysicalScale * devSenescenceScale * condScale;
+      const modNeur = devNeuralScale * (0.75 + 0.25 * condScale);
+      const modOther = (0.65 + 0.35 * devPhysicalScale) * (0.85 + 0.15 * condScale);
+
+      const genome = org.genome;
+      const gMat = genome.maternalAlleles;
+      const gPat = genome.paternalAlleles;
+      const gDom = genome.dominance;
+
+      const envTemp = gridTemps[cellIdx];
+      let heatTol: number;
+      let coldTol: number;
+      let adapt: number;
+      if (isStandardCoreLoci) {
+        let a = gMat[6], b = gPat[6];
+        heatTol = Math.fround((a <= b ? a + (b - a) * gDom[6] : b + (a - b) * gDom[6]) * modOther);
+        a = gMat[7]; b = gPat[7];
+        coldTol = Math.fround((a <= b ? a + (b - a) * gDom[7] : b + (a - b) * gDom[7]) * modOther);
+        a = gMat[9]; b = gPat[9];
+        adapt = Math.fround((a <= b ? a + (b - a) * gDom[9] : b + (a - b) * gDom[9]) * modOther);
+      } else {
+        heatTol =
+          idxHeatTol >= 0
+            ? expressTraitF32(gMat, gPat, gDom, modKinds, idxHeatTol, modPhys, modNeur, modOther)
+            : sc.baseHeatTolerance;
+        coldTol =
+          idxColdTol >= 0
+            ? expressTraitF32(gMat, gPat, gDom, modKinds, idxColdTol, modPhys, modNeur, modOther)
+            : sc.baseColdTolerance;
+        adapt =
+          idxAdapt >= 0
+            ? expressTraitF32(gMat, gPat, gDom, modKinds, idxAdapt, modPhys, modNeur, modOther)
+            : sc.baseEnvironmentalAdaptability;
+      }
+      const upperLimit = optTemp + halfWidth + heatTol * 7.5 + adapt * 3.5;
+      const lowerLimit = optTemp - halfWidth - coldTol * 8.0 - adapt * 3.5;
+      const thermalStress =
+        envTemp > upperLimit
+          ? (envTemp - upperLimit) / 10
+          : envTemp < lowerLimit
+            ? (lowerLimit - envTemp) / 10
+            : 0;
+
+      let foragePower = 0;
+      let metabolicDemandQ = 0;
+      let endurance = 1;
+      if (isEgg) {
+        const eggCostEU = eggIncubCost * (maxReserveMassQ / LOCAL_PPM) * 30 + thermalStress * 0.45;
+        metabolicDemandQ = _euToQHalfEvenFast(Math.max(0, eggCostEU));
+      } else {
+        let strength: number;
+        let speed: number;
+        let perception: number;
+        let intelligence: number;
+        let metEff: number;
+        if (isStandardCoreLoci) {
+          let a = gMat[1], b = gPat[1];
+          strength = Math.fround((a <= b ? a + (b - a) * gDom[1] : b + (a - b) * gDom[1]) * modPhys);
+          a = gMat[2]; b = gPat[2];
+          speed = Math.fround((a <= b ? a + (b - a) * gDom[2] : b + (a - b) * gDom[2]) * modPhys);
+          a = gMat[3]; b = gPat[3];
+          endurance = Math.fround((a <= b ? a + (b - a) * gDom[3] : b + (a - b) * gDom[3]) * modPhys);
+          a = gMat[4]; b = gPat[4];
+          perception = Math.fround((a <= b ? a + (b - a) * gDom[4] : b + (a - b) * gDom[4]) * modNeur);
+          a = gMat[5]; b = gPat[5];
+          intelligence = Math.fround((a <= b ? a + (b - a) * gDom[5] : b + (a - b) * gDom[5]) * modNeur);
+          a = gMat[8]; b = gPat[8];
+          metEff = Math.fround((a <= b ? a + (b - a) * gDom[8] : b + (a - b) * gDom[8]) * modOther);
+        } else {
+          endurance =
+            idxEndurance >= 0
+              ? expressTraitF32(gMat, gPat, gDom, modKinds, idxEndurance, modPhys, modNeur, modOther)
+              : sc.baseEndurance;
+          strength =
+            idxStrength >= 0
+              ? expressTraitF32(gMat, gPat, gDom, modKinds, idxStrength, modPhys, modNeur, modOther)
+              : sc.baseStrength;
+          speed =
+            idxSpeed >= 0
+              ? expressTraitF32(gMat, gPat, gDom, modKinds, idxSpeed, modPhys, modNeur, modOther)
+              : sc.baseSpeed;
+          perception =
+            idxPerception >= 0
+              ? expressTraitF32(gMat, gPat, gDom, modKinds, idxPerception, modPhys, modNeur, modOther)
+              : sc.basePerception;
+          intelligence =
+            idxIntelligence >= 0
+              ? expressTraitF32(gMat, gPat, gDom, modKinds, idxIntelligence, modPhys, modNeur, modOther)
+              : sc.baseIntelligence;
+          metEff =
+            idxMetEff >= 0
+              ? expressTraitF32(gMat, gPat, gDom, modKinds, idxMetEff, modPhys, modNeur, modOther)
+              : sc.baseMetabolismEfficiency;
+        }
+
+        foragePower = 0.45 + 0.22 * speed + 0.18 * perception + 0.1 * strength + 0.08 * intelligence;
+        const traitDemand = 0.45 + 0.30 * speed + 0.15 * strength + 0.10 * intelligence;
+        const effScale = Math.max(0.45, 0.55 + 0.45 * metEff);
+        const activityLevel = Math.max(0, (3.8 * traitDemand) / effScale);
+        metabolicDemandQ = _computeTotalMetabolicDemandFast(
+          basalFactor,
+          thermoFactor,
+          activityFactor,
+          structMassQ,
+          reserveMassQ,
+          thermalStress,
+          activityLevel
+        );
+      }
+
+      let metabBurnMassQ = 0;
+      let metabNextCarryQ = 0;
+      if (metabolicDemandQ <= carryCreditQ) {
+        metabNextCarryQ = carryCreditQ - metabolicDemandQ;
+      } else {
+        const netDemandQ = metabolicDemandQ - carryCreditQ;
+        const rem30 = netDemandQ % 30;
+        const neededMassQ = rem30 === 0 ? netDemandQ / 30 : (netDemandQ - rem30) / 30 + 1;
+        metabBurnMassQ = neededMassQ < reserveMassQ ? neededMassQ : reserveMassQ;
+        const burnEnergyQ =
+          metabBurnMassQ <= RESERVE_SAFE_MASS_LIMIT
+            ? metabBurnMassQ * 30
+            : _energyOfMass(metabBurnMassQ, _RHO_RESERVE);
+        metabNextCarryQ = burnEnergyQ >= netDemandQ ? burnEnergyQ - netDemandQ : 0;
+      }
+
+      const postMetabReserveQ = reserveMassQ - metabBurnMassQ;
+      const headroomMassQ = maxReserveMassQ > postMetabReserveQ ? maxReserveMassQ - postMetabReserveQ : 0;
+      const normAfterMetab = maxReserveMassQ > 0 ? postMetabReserveQ / maxReserveMassQ : 0;
+
+      let reqPlantMassQ = 0;
+      let reqPreyMassQ = 0;
+      let reqCarrionMassQ = 0;
+      let reqDetritusMassQ = 0;
+      let reqLegacyNormalized = 0;
+
+      if (!isEgg && normAfterMetab < 0.96 && headroomMassQ > 0) {
+        const hungerGapNorm = 1 - normAfterMetab;
+        const maxIntake = maxForageIntake * foragePower;
+        const desiredNormGain = hungerGapNorm < maxIntake ? hungerGapNorm : maxIntake;
+        if (desiredNormGain > 0) {
+          reqLegacyNormalized = desiredNormGain;
+          if (hasStrictFoodSources) {
+            const desiredGainQ = applyPpmFloorFast(
+              maxReserveMassQ,
+              _fractionToPpmHalfEvenFast(desiredNormGain)
+            );
+            const desiredDepositMassQ = headroomMassQ < desiredGainQ ? headroomMassQ : desiredGainQ;
+            if (desiredDepositMassQ > 0) {
+              const neededReserveEnergyQ =
+                desiredDepositMassQ <= RESERVE_SAFE_MASS_LIMIT
+                  ? desiredDepositMassQ * 30
+                  : _energyOfMass(desiredDepositMassQ, _RHO_RESERVE);
+              const numProd = neededReserveEnergyQ * LOCAL_PPM;
+              let neededGrossEnergyQ: number;
+              if (numProd <= LOCAL_MAX_SAFE_INT) {
+                const r = numProd % effAbsorptionAssimPpm;
+                const q = (numProd - r) / effAbsorptionAssimPpm;
+                neededGrossEnergyQ = r === 0 ? q : q + 1;
+              } else {
+                neededGrossEnergyQ = _scaleByRatio(
+                  neededReserveEnergyQ,
+                  LOCAL_PPM,
+                  effAbsorptionAssimPpm,
+                  'ceil'
+                );
+              }
+              if (plantPpm > 0) {
+                reqPlantMassQ = applyPpmFloorFast(massForPlantEnergyCeil(neededGrossEnergyQ), plantPpm);
+              }
+              if (preyPpm > 0) {
+                reqPreyMassQ = applyPpmFloorFast(massForReserveEnergyCeil(neededGrossEnergyQ), preyPpm);
+              }
+              if (carrionPpm > 0) {
+                reqCarrionMassQ = applyPpmFloorFast(massForCarrionEnergyCeil(neededGrossEnergyQ), carrionPpm);
+              }
+              if (detritusPpm > 0) {
+                reqDetritusMassQ = applyPpmFloorFast(massForPlantEnergyCeil(neededGrossEnergyQ), detritusPpm);
+              }
+            }
+          }
+        }
+      }
+
+      if (legacySnapshotAvailable !== null && !isEgg && !legacySnapshotAvailable.has(cellIdx)) {
+        const cy = (cellIdx / gridWidth) | 0;
+        const cx = cellIdx - cy * gridWidth;
+        const env = this.populateEnvContext(cx, cy, cellIdx, targetTick);
+        legacySnapshotAvailable.set(cellIdx, this.foodProvider.getAvailablePrey(env));
+      }
+
+      let growthTargetStructQ = 0;
+      if (!isEgg) {
+        if (devPhysicalScale === 1) {
+          growthTargetStructQ = adultMassQ;
+        } else {
+          const gt = applyPpmFloorFast(adultMassQ, _fractionToPpmHalfEvenFast(devPhysicalScale));
+          growthTargetStructQ = gt > 1 ? gt : 1;
+        }
+      }
+
+      draftOrg[dIdx] = org;
+      draftPop[dIdx] = pop;
+      draftSlot[dIdx] = slot;
+      draftCellIndex[dIdx] = cellIdx;
+      draftOrgId[dIdx] = orgId;
+      draftSpeciesIdx[dIdx] = s;
+      draftNextAgeTicks[dIdx] = nextAgeTicks;
+      draftNextStage[dIdx] = nextStageCode;
+      draftNextCooldown[dIdx] = nextCooldown;
+      draftFlags[dIdx] = org.sex === 'female' ? FLAG_FEMALE : 0;
+      draftStructMassQ[dIdx] = structMassQ;
+      draftReserveMassQ[dIdx] = reserveMassQ;
+      draftMaxReserveMassQ[dIdx] = maxReserveMassQ;
+      draftCarryCreditQ[dIdx] = carryCreditQ;
+      draftExternalDeltaQ[dIdx] = externalDeltaQ;
+      draftMetabolicDemandQ[dIdx] = metabolicDemandQ;
+      draftBurnMassQ[dIdx] = metabBurnMassQ;
+      draftPostMetabResQ[dIdx] = postMetabReserveQ;
+      draftPostMetabCarryQ[dIdx] = metabNextCarryQ;
+      draftReqPlantQ[dIdx] = reqPlantMassQ;
+      draftReqPreyQ[dIdx] = reqPreyMassQ;
+      draftReqCarrionQ[dIdx] = reqCarrionMassQ;
+      draftReqDetritusQ[dIdx] = reqDetritusMassQ;
+      draftReqLegacyNorm[dIdx] = reqLegacyNormalized;
+      draftNextEnergy[dIdx] = normAfterMetab;
+      draftNextHealth[dIdx] = org.health;
+      draftGrowthTargetStructQ[dIdx] = growthTargetStructQ;
+      draftDevPhys[dIdx] = devPhysicalScale;
+      draftDevNeural[dIdx] = devNeuralScale;
+      draftDevSenesc[dIdx] = devSenescenceScale;
+      draftThermalStress[dIdx] = thermalStress;
+      draftEndurance[dIdx] = endurance;
+    }
+
+    this.curDraftCount = localDraftCount;
+    this.curGloballySorted = localGloballySorted;
+    this.curPrevGlobalId = localPrevGlobalId;
+    this.stepSpeciesDraftEnd[s] = localDraftCount;
+  }
+
+  private runPhotosynthesisPlan(): void {
+    const photoRatePpm = this.plantPhotosynthesisRatePpm;
+    if (photoRatePpm <= 0) return;
+
+    const landCells = this.landCellIndices;
+    const landLen = landCells.length;
+    const plantCapQ = this.plantCapacityQ;
+    const projectedPlantCellMass = this.projectedPlantCellMass;
+    const photoCellIdx = this.photoCellIdx;
+    const photoGainMassQ = this.photoGainMassQ;
+    const photoGainEnergyQ = this.photoGainEnergyQ;
+    const plantFront = this.useDirectEnergyGrid
+      ? this.energyGrid._getChannelStore().front[0]
+      : null;
+    const energyGrid = this.energyGrid;
+
+    const remainingAbioticBig = this.ledger.globalAbioticMassQ;
+    if (remainingAbioticBig <= 0n) return;
+
+    let photoCount = 0;
+    if (remainingAbioticBig <= BigInt(LOCAL_MAX_SAFE_INT)) {
+      let remAbiotic = Number(remainingAbioticBig);
+      for (let k = 0; k < landLen; k++) {
+        if (remAbiotic <= 0) break;
+        const cellIndex = landCells[k];
+        const capQ = plantCapQ[cellIndex];
+        if (capQ <= 0) continue;
+        const curQ = plantFront !== null ? plantFront[cellIndex] : energyGrid.getMassQ(POOL_PLANT, cellIndex);
+        if (curQ >= capQ) continue;
+        let gainQ = applyPpmFloorFast(capQ - curQ, photoRatePpm);
+        if (gainQ <= 0) continue;
+        if (gainQ > remAbiotic) gainQ = remAbiotic;
+        remAbiotic -= gainQ;
+        projectedPlantCellMass[cellIndex] = curQ + gainQ;
+        const pIdx = photoCount++;
+        photoCellIdx[pIdx] = cellIndex;
+        photoGainMassQ[pIdx] = gainQ;
+        photoGainEnergyQ[pIdx] =
+          gainQ <= PLANT_SAFE_MASS_LIMIT ? gainQ * 3 : energyOfMass(gainQ, RHO_PLANT);
+      }
+    } else {
+      let remBig = remainingAbioticBig;
+      for (let k = 0; k < landLen; k++) {
+        if (remBig <= 0n) break;
+        const cellIndex = landCells[k];
+        const capQ = plantCapQ[cellIndex];
+        if (capQ <= 0) continue;
+        const curQ = plantFront !== null ? plantFront[cellIndex] : energyGrid.getMassQ(POOL_PLANT, cellIndex);
+        if (curQ >= capQ) continue;
+        let gainQ = applyPpmFloorFast(capQ - curQ, photoRatePpm);
+        if (gainQ <= 0) continue;
+        const gainBig = BigInt(gainQ);
+        if (gainBig > remBig) {
+          gainQ = Number(remBig);
+        }
+        if (gainQ <= 0) continue;
+        remBig -= BigInt(gainQ);
+        projectedPlantCellMass[cellIndex] = curQ + gainQ;
+        const pIdx = photoCount++;
+        photoCellIdx[pIdx] = cellIndex;
+        photoGainMassQ[pIdx] = gainQ;
+        photoGainEnergyQ[pIdx] =
+          gainQ <= PLANT_SAFE_MASS_LIMIT ? gainQ * 3 : energyOfMass(gainQ, RHO_PLANT);
+      }
+    }
+    this.curPhotoCount = photoCount;
+  }
+
+  private resolveSimplePoolContention(
+    dirtyCount: number,
+    dirtyCells: Uint32Array,
+    cellHead: Int32Array,
+    nextDraft: Int32Array,
+    reqArr: Float64Array,
+    grantArr: Float64Array,
+    pool: EnergyPoolId,
+    extSrc: TransactionalFoodSource | undefined,
+    projectedPlantCellMass: Float64Array | null,
+    gridFrontArr: Float64Array | null
+  ): void {
+    if (dirtyCount <= 0) return;
+    sortOrScanDirtyCells(dirtyCount, this.grid.cellCount, cellHead, dirtyCells);
+    const energyGrid = this.energyGrid;
+    const draftOrgId = this.draftOrgId;
+
+    for (let ci = 0; ci < dirtyCount; ci++) {
+      const cellIdx = dirtyCells[ci];
+      let avail: number;
+      if (extSrc) {
+        avail = extSrc.inspect(cellIdx).massQ;
+      } else if (projectedPlantCellMass !== null && projectedPlantCellMass[cellIdx] >= 0) {
+        avail = projectedPlantCellMass[cellIdx];
+      } else if (gridFrontArr !== null) {
+        avail = gridFrontArr[cellIdx];
+      } else {
+        avail = energyGrid.getMassQ(pool, cellIdx);
+      }
+      if (avail <= 0) continue;
+      const first = cellHead[cellIdx];
+      const second = nextDraft[first];
+      if (second === -1) {
+        const req = reqArr[first];
+        if (req > 0) {
+          grantArr[first] = req < avail ? req : avail;
+        }
+      } else {
+        let n = 0;
+        for (let cur = first; cur !== -1; cur = nextDraft[cur]) n++;
+        this.ensureResolveScratch(n);
+        const demands = this.resolveScratchDemands;
+        const orgIds = this.resolveScratchOrgIds;
+        const grants = this.resolveScratchGrants;
+        const idxList = this.resolveScratchDraftIdx;
+        let j = 0;
+        for (let cur = first; cur !== -1; cur = nextDraft[cur]) {
+          demands[j] = reqArr[cur];
+          orgIds[j] = draftOrgId[cur];
+          grants[j] = 0;
+          idxList[j] = cur;
+          j++;
+        }
+        _resolveContention(demands, n, avail, grants, orgIds);
+        for (j = 0; j < n; j++) {
+          grantArr[idxList[j]] = grants[j];
+        }
+      }
+    }
+  }
+
+  private resolveResourceContentionPhase(
+    sCount: number,
+    conservativePreyProvider: DeterministicPreyFoodProvider | null
+  ): void {
+    const draftCount = this.curDraftCount;
+    const draftCanonicalOrder = this.draftCanonicalOrder;
+    const draftCellIndex = this.draftCellIndex;
+    const draftOrgId = this.draftOrgId;
+    const draftSpeciesIdx = this.draftSpeciesIdx;
+    const draftNextStage = this.draftNextStage;
+    const draftFlags = this.draftFlags;
+    const draftDeathCause = this.draftDeathCause;
+    const draftKillerId = this.draftKillerId;
+    const draftNextHealth = this.draftNextHealth;
+    const draftStructMassQ = this.draftStructMassQ;
+    const draftPostMetabResQ = this.draftPostMetabResQ;
+    const draftReqPlantQ = this.draftReqPlantQ;
+    const draftReqCarrionQ = this.draftReqCarrionQ;
+    const draftReqDetritusQ = this.draftReqDetritusQ;
+    const draftReqPreyQ = this.draftReqPreyQ;
+    const draftGrantPlantQ = this.draftGrantPlantQ;
+    const draftGrantCarrionQ = this.draftGrantCarrionQ;
+    const draftGrantDetritusQ = this.draftGrantDetritusQ;
+    const draftGrantPreyQ = this.draftGrantPreyQ;
+
+    const hasMultiSpecies = sCount > 1;
+    const plantCellHead = this.plantCellHead;
+    const plantDirtyCells = this.plantDirtyCells;
+    const plantNextDraft = this.plantNextDraft;
+    const carrionCellHead = this.carrionCellHead;
+    const carrionDirtyCells = this.carrionDirtyCells;
+    const carrionNextDraft = this.carrionNextDraft;
+    const detritusCellHead = this.detritusCellHead;
+    const detritusDirtyCells = this.detritusDirtyCells;
+    const detritusNextDraft = this.detritusNextDraft;
+    const preyCellHead = this.preyCellHead;
+    const preyDirtyCells = this.preyDirtyCells;
+    const preyNextDraft = this.preyNextDraft;
+    const aliveCellHead = this.aliveCellHead;
+    const aliveDirtyCells = this.aliveDirtyCells;
+    const aliveNextDraft = this.aliveNextDraft;
 
     let plantDirtyCount = 0;
     let carrionDirtyCount = 0;
     let detritusDirtyCount = 0;
     let preyDirtyCount = 0;
     let aliveDirtyCount = 0;
-    let photoCount = 0;
+
+    for (let ci = draftCount - 1; ci >= 0; ci--) {
+      const dIdx = draftCanonicalOrder[ci];
+      const cellIdx = draftCellIndex[dIdx];
+      if (hasMultiSpecies) {
+        const prevHead = aliveCellHead[cellIdx];
+        if (prevHead === -1) aliveDirtyCells[aliveDirtyCount++] = cellIdx;
+        aliveNextDraft[dIdx] = prevHead;
+        aliveCellHead[cellIdx] = dIdx;
+      }
+      if (draftReqPlantQ[dIdx] > 0) {
+        const prevHead = plantCellHead[cellIdx];
+        if (prevHead === -1) plantDirtyCells[plantDirtyCount++] = cellIdx;
+        plantNextDraft[dIdx] = prevHead;
+        plantCellHead[cellIdx] = dIdx;
+      }
+      if (draftReqCarrionQ[dIdx] > 0) {
+        const prevHead = carrionCellHead[cellIdx];
+        if (prevHead === -1) carrionDirtyCells[carrionDirtyCount++] = cellIdx;
+        carrionNextDraft[dIdx] = prevHead;
+        carrionCellHead[cellIdx] = dIdx;
+      }
+      if (draftReqDetritusQ[dIdx] > 0) {
+        const prevHead = detritusCellHead[cellIdx];
+        if (prevHead === -1) detritusDirtyCells[detritusDirtyCount++] = cellIdx;
+        detritusNextDraft[dIdx] = prevHead;
+        detritusCellHead[cellIdx] = dIdx;
+      }
+      if (draftReqPreyQ[dIdx] > 0) {
+        const prevHead = preyCellHead[cellIdx];
+        if (prevHead === -1) preyDirtyCells[preyDirtyCount++] = cellIdx;
+        preyNextDraft[dIdx] = prevHead;
+        preyCellHead[cellIdx] = dIdx;
+      }
+    }
+
+    this.curPlantDirtyCount = plantDirtyCount;
+    this.curCarrionDirtyCount = carrionDirtyCount;
+    this.curDetritusDirtyCount = detritusDirtyCount;
+    this.curPreyDirtyCount = preyDirtyCount;
+    this.curAliveDirtyCount = aliveDirtyCount;
+
+    const gridFront = this.useDirectEnergyGrid ? this.energyGrid._getChannelStore().front : null;
+
+    this.resolveSimplePoolContention(
+      plantDirtyCount,
+      plantDirtyCells,
+      plantCellHead,
+      plantNextDraft,
+      draftReqPlantQ,
+      draftGrantPlantQ,
+      POOL_PLANT,
+      this.externalPlantSource,
+      this.projectedPlantCellMass,
+      gridFront ? gridFront[0] : null
+    );
+    this.resolveSimplePoolContention(
+      carrionDirtyCount,
+      carrionDirtyCells,
+      carrionCellHead,
+      carrionNextDraft,
+      draftReqCarrionQ,
+      draftGrantCarrionQ,
+      POOL_CARRION,
+      this.externalCarrionSource,
+      null,
+      gridFront ? gridFront[2] : null
+    );
+    this.resolveSimplePoolContention(
+      detritusDirtyCount,
+      detritusDirtyCells,
+      detritusCellHead,
+      detritusNextDraft,
+      draftReqDetritusQ,
+      draftGrantDetritusQ,
+      POOL_DETRITUS,
+      this.externalDetritusSource,
+      null,
+      gridFront ? gridFront[4] : null
+    );
+
+    // 2c. Live prey predation & background prey pool
+    let predBiteCount = 0;
     let preyRemTouchedCount = 0;
-    let newlyDiedCellCount = 0;
+    const preyRemStructQ = this.preyRemStructQ;
+    const preyRemReserveQ = this.preyRemReserveQ;
+    const preyRemTouched = this.preyRemTouched;
+    const preyMatrix = this.speciesPreyMatrix;
+    const extPreySource = this.externalPreySource;
 
-    try {
-      // =========================================================================
-      // PHASE 1: GATHER (Pure inspection & draft preparation — zero live mutation)
-      // =========================================================================
-      this.onPhase?.({ tick: targetTick, phase: 'GATHER' });
+    if (preyDirtyCount > 0) {
+      sortOrScanDirtyCells(preyDirtyCount, this.grid.cellCount, preyCellHead, preyDirtyCells);
+      for (let ci = 0; ci < preyDirtyCount; ci++) {
+        const cellIdx = preyDirtyCells[ci];
+        const firstAlive = hasMultiSpecies ? aliveCellHead[cellIdx] : -1;
+        if (firstAlive !== -1 && aliveNextDraft[firstAlive] !== -1) {
+          for (let pCur = preyCellHead[cellIdx]; pCur !== -1; pCur = preyNextDraft[pCur]) {
+            let remReq = draftReqPreyQ[pCur];
+            if (remReq <= 0) continue;
+            const predSpeciesOffset = draftSpeciesIdx[pCur] * sCount;
+            const predId = draftOrgId[pCur];
+            for (let vCur = firstAlive; vCur !== -1 && remReq > 0; vCur = aliveNextDraft[vCur]) {
+              if ((draftFlags[vCur] & FLAG_DIED) !== 0 || draftNextStage[vCur] === STAGE_EGG) continue;
+              if (preyMatrix[predSpeciesOffset + draftSpeciesIdx[vCur]] === 0) continue;
 
-      const touchedPops: PopulationManager[] = [];
-      const popBySpeciesIdx: Array<PopulationManager | null> = new Array(sCount).fill(null);
-      const speciesDraftStart = new Int32Array(sCount);
-      const speciesDraftEnd = new Int32Array(sCount);
-      const speciesWasCanonical = new Uint8Array(sCount);
-
-      let totalUpperOrgs = 0;
-      for (let s = 0; s < sCount; s++) {
-        const pop = this.populations.get(speciesList[s].id);
-        if (pop) {
-          popBySpeciesIdx[s] = pop;
-          touchedPops.push(pop);
-          totalUpperOrgs += pop.size;
-        }
-      }
-      this.ensureDraftCapacity(totalUpperOrgs);
-      if (this.activeIdxToDraftIdx.length < totalUpperOrgs) {
-        let nextCap = Math.max(256, this.activeIdxToDraftIdx.length);
-        while (nextCap < totalUpperOrgs) nextCap *= 2;
-        this.activeIdxToDraftIdx = new Int32Array(nextCap);
-      }
-
-      const entityStore = this.entityStore;
-      const gridWidth = this.grid.width;
-      const gridTemps = this.grid.temperature;
-      const organismIdToSlot = this.organismIdToSlot;
-      let slotCarryCreditQ = this.slotCarryCreditQ;
-      let slotLastSyncedEnergy = this.slotLastSyncedEnergy;
-
-      const draftOrg = this.draftOrg;
-      const draftPop = this.draftPop;
-      const draftDeathCause = this.draftDeathCause;
-      const draftSlot = this.draftSlot;
-      const draftCellIndex = this.draftCellIndex;
-      const draftOrgId = this.draftOrgId;
-      const draftSpeciesIdx = this.draftSpeciesIdx;
-      const draftNextAgeTicks = this.draftNextAgeTicks;
-      const draftNextStage = this.draftNextStage;
-      const draftNextCooldown = this.draftNextCooldown;
-      const draftFlags = this.draftFlags;
-      const draftKillerId = this.draftKillerId;
-      const draftOffspringDelta = this.draftOffspringDelta;
-      const draftStructMassQ = this.draftStructMassQ;
-      const draftReserveMassQ = this.draftReserveMassQ;
-      const draftMaxReserveMassQ = this.draftMaxReserveMassQ;
-      const draftCarryCreditQ = this.draftCarryCreditQ;
-      const draftExternalDeltaQ = this.draftExternalDeltaQ;
-      const draftMetabolicDemandQ = this.draftMetabolicDemandQ;
-      const draftHealingDemandQ = this.draftHealingDemandQ;
-      const draftBurnMassQ = this.draftBurnMassQ;
-      const draftPostMetabResQ = this.draftPostMetabResQ;
-      const draftPostMetabCarryQ = this.draftPostMetabCarryQ;
-      const draftReqPlantQ = this.draftReqPlantQ;
-      const draftReqPreyQ = this.draftReqPreyQ;
-      const draftReqCarrionQ = this.draftReqCarrionQ;
-      const draftReqDetritusQ = this.draftReqDetritusQ;
-      const draftReqLegacyNorm = this.draftReqLegacyNorm;
-      const draftGrantPlantQ = this.draftGrantPlantQ;
-      const draftGrantPreyQ = this.draftGrantPreyQ;
-      const draftGrantCarrionQ = this.draftGrantCarrionQ;
-      const draftGrantDetritusQ = this.draftGrantDetritusQ;
-      const draftNextEnergy = this.draftNextEnergy;
-      const draftNextHealth = this.draftNextHealth;
-      const draftGrowthTargetStructQ = this.draftGrowthTargetStructQ;
-      const draftDevPhys = this.draftDevPhys;
-      const draftDevNeural = this.draftDevNeural;
-      const draftDevSenesc = this.draftDevSenesc;
-      const draftThermalStress = this.draftThermalStress;
-      const draftEndurance = this.draftEndurance;
-      const draftCanonicalOrder = this.draftCanonicalOrder;
-      const phenCtx = this.reusablePhenContext;
-
-      let activeMapOffset = 0;
-      const speciesActiveMapOffsets = new Int32Array(sCount);
-      const unsortedIdToDraftMaps: Array<Map<number, number> | null> = new Array(sCount).fill(null);
-
-      let prevGlobalId = -1;
-      let globallySorted = true;
-
-      for (let s = 0; s < sCount; s++) {
-        const pop = popBySpeciesIdx[s];
-        if (!pop) continue;
-
-        const sc = speciesCaches[s];
-        const species = sc.species;
-        const schema = sc.schema;
-        const profile = sc.profile;
-        const pq = sc.pq;
-        const maxReserveRatioScaled = pq.maxReserveRatioScaled;
-        const dietPpm = sc.dietPpm;
-        const plantPpm = dietPpm.plantPpm;
-        const preyPpm = dietPpm.preyPpm;
-        const carrionPpm = dietPpm.carrionPpm;
-        const detritusPpm = dietPpm.detritusPpm;
-        const effAbsorptionAssimPpm = sc.effAbsorptionAssimPpm;
-        const modKinds = schema.traitModKind;
-
-        const rawOrgs = pop.getActiveOrganisms();
-        const orderedOrgs = this.getCanonicalOrderedOrganisms(pop);
-        const isPopSorted = orderedOrgs === rawOrgs;
-        speciesWasCanonical[s] = isPopSorted ? 1 : 0;
-        speciesActiveMapOffsets[s] = activeMapOffset;
-        if (isPopSorted) {
-          for (let ai = 0; ai < rawOrgs.length; ai++) {
-            this.activeIdxToDraftIdx[activeMapOffset + ai] = -1;
-          }
-          activeMapOffset += rawOrgs.length;
-        } else {
-          unsortedIdToDraftMaps[s] = new Map<number, number>();
-        }
-
-        speciesDraftStart[s] = draftCount;
-
-        const incubationTicks = sc.incubationTicks;
-        const maturityAge = sc.maturityAge;
-        const elderAgeTicks = sc.elderAgeTicks;
-        const adultMassQ = pq.adultMassQ;
-        const hatchScale = sc.hatchlingPhysicalScale;
-        const tpy = sc.tpy;
-        const incubationBio = sc.incubationBio;
-        const maturityBio = sc.maturityBio;
-        const juvenileBioSpan = sc.juvenileBioSpan;
-        const elderBio = sc.elderBio;
-        const maxBio = sc.maxLifespanTicks / tpy;
-        const minBioStep = sc.minBioStep;
-        const maxForageIntake = sc.maxForageIntakePerTick;
-        const eggIncubCost = sc.eggIncubationCostPerTick;
-        const optTemp = sc.optTemp;
-        const halfWidth = sc.halfWidth;
-        const basalFactor = sc.basalFactor;
-        const thermoFactor = sc.thermoFactor;
-        const activityFactor = sc.activityFactor;
-        const pIdx = sc.idx;
-        const idxStrength = pIdx.strength;
-        const idxSpeed = pIdx.speed;
-        const idxEndurance = pIdx.endurance;
-        const idxPerception = pIdx.perception;
-        const idxIntelligence = pIdx.intelligence;
-        const idxHeatTol = pIdx.heatTolerance;
-        const idxColdTol = pIdx.coldTolerance;
-        const idxMetEff = pIdx.metabolismEfficiency;
-        const idxAdapt = pIdx.environmentalAdaptability;
-
-        for (let i = 0; i < orderedOrgs.length; i++) {
-          const org = orderedOrgs[i];
-          if (!org.alive) continue;
-
-          const orgId = org.id;
-          const slot = organismIdToSlot.get(orgId);
-          if (slot === undefined) {
-            throw new Error(`Organism ${orgId} (${species.id}) is missing an EntityEnergyStore slot`);
-          }
-
-          const dIdx = draftCount++;
-          draftCanonicalOrder[dIdx] = dIdx;
-          if (orgId < prevGlobalId) {
-            globallySorted = false;
-          }
-          prevGlobalId = orgId;
-
-          if (isPopSorted) {
-            this.activeIdxToDraftIdx[speciesActiveMapOffsets[s] + i] = dIdx;
-          } else {
-            unsortedIdToDraftMaps[s]!.set(orgId, dIdx);
-          }
-
-          const cellIdx = org.cellIndex;
-          const structMassQ = entityStore.structMassQ(slot);
-          let reserveMassQ = entityStore.reserveMassQ(slot);
-          const ratioProd = structMassQ * maxReserveRatioScaled;
-          const maxReserveMassQ =
-            ratioProd <= LOCAL_MAX_SAFE_INT
-              ? (ratioProd - (ratioProd % LOCAL_PPM)) / LOCAL_PPM
-              : scaleByRatio(structMassQ, maxReserveRatioScaled, LOCAL_PPM, 'floor');
-          const carryCreditQ = slotCarryCreditQ[slot];
-          let externalDeltaQ = 0;
-
-          if (isLegacyMode) {
-            const lastSynced = slotLastSyncedEnergy[slot];
-            if (Math.abs(org.energy - lastSynced) > 1e-9) {
-              const clamped = Math.min(1, Math.max(0, org.energy));
-              const desiredReserveQ = applyPpmFloorFast(
-                maxReserveMassQ,
-                fractionToPpm(clamped, 'half-even')
-              );
-              externalDeltaQ = desiredReserveQ - reserveMassQ;
-              reserveMassQ = desiredReserveQ;
-            }
-          }
-
-          const nextAgeTicks = org.ageTicks + 1;
-          const nextCooldown = org.reproductionCooldown > 0 ? org.reproductionCooldown - 1 : 0;
-          let nextStageCode = stageToCode(org.stage);
-          if (nextStageCode === STAGE_EGG && nextAgeTicks >= incubationTicks) {
-            nextStageCode = STAGE_JUVENILE;
-          } else if (nextStageCode === STAGE_JUVENILE && nextAgeTicks >= maturityAge) {
-            nextStageCode = STAGE_ADULT;
-          } else if (nextStageCode === STAGE_ADULT && nextAgeTicks >= elderAgeTicks) {
-            nextStageCode = STAGE_ELDER;
-          }
-
-          const isEgg = nextStageCode === STAGE_EGG;
-          let devPhysicalScale: number;
-          let devNeuralScale: number;
-          let devSenescenceScale: number;
-          if (isEgg) {
-            devPhysicalScale = 0.15;
-            devNeuralScale = 0.15;
-            devSenescenceScale = 1.0;
-          } else {
-            const bioAge = nextAgeTicks / tpy;
-            if (nextStageCode === STAGE_JUVENILE) {
-              const t = juvenileBioSpan > 0 ? Math.min(1, Math.max(0, (bioAge - incubationBio) / juvenileBioSpan)) : 1;
-              devPhysicalScale = hatchScale + (1 - hatchScale) * t;
-              devNeuralScale = 0.45 + 0.55 * t;
-              devSenescenceScale = 1.0;
-            } else if (nextStageCode === STAGE_ELDER) {
-              const elderBioSpan = Math.max(minBioStep, maxBio - elderBio);
-              const t = Math.min(1, Math.max(0, (bioAge - elderBio) / elderBioSpan));
-              devPhysicalScale = 1.0;
-              devNeuralScale = 1.0;
-              devSenescenceScale = 1.0 - 0.18 * t;
-            } else if (bioAge < maturityBio && maturityBio > 0) {
-              const t = Math.max(0, bioAge / maturityBio);
-              devPhysicalScale = hatchScale + (1 - hatchScale) * t;
-              devNeuralScale = 0.45 + 0.55 * t;
-              devSenescenceScale = 1.0;
-            } else {
-              devPhysicalScale = 1.0;
-              devNeuralScale = 1.0;
-              devSenescenceScale = 1.0;
-            }
-          }
-
-          const currentNormEnergy = maxReserveMassQ > 0 ? reserveMassQ / maxReserveMassQ : 0;
-          const condScale =
-            0.45 + 0.55 * Math.min(1, Math.max(0, org.health * 0.65 + currentNormEnergy * 0.35));
-          const modPhys = devPhysicalScale * devSenescenceScale * condScale;
-          const modNeur = devNeuralScale * (0.75 + 0.25 * condScale);
-          const modOther = (0.65 + 0.35 * devPhysicalScale) * (0.85 + 0.15 * condScale);
-
-          const genome = org.genome;
-          const gMat = genome.maternalAlleles;
-          const gPat = genome.paternalAlleles;
-          const gDom = genome.dominance;
-
-          const envTemp = gridTemps[cellIdx];
-          const heatTol =
-            idxHeatTol >= 0
-              ? expressTraitF32(gMat, gPat, gDom, modKinds, idxHeatTol, modPhys, modNeur, modOther)
-              : sc.baseHeatTolerance;
-          const coldTol =
-            idxColdTol >= 0
-              ? expressTraitF32(gMat, gPat, gDom, modKinds, idxColdTol, modPhys, modNeur, modOther)
-              : sc.baseColdTolerance;
-          const adapt =
-            idxAdapt >= 0
-              ? expressTraitF32(gMat, gPat, gDom, modKinds, idxAdapt, modPhys, modNeur, modOther)
-              : sc.baseEnvironmentalAdaptability;
-          const upperLimit = optTemp + halfWidth + heatTol * 7.5 + adapt * 3.5;
-          const lowerLimit = optTemp - halfWidth - coldTol * 8.0 - adapt * 3.5;
-          const thermalStress =
-            envTemp > upperLimit
-              ? (envTemp - upperLimit) / 10
-              : envTemp < lowerLimit
-                ? (lowerLimit - envTemp) / 10
-                : 0;
-
-          let foragePower = 0;
-          let activityLevel = 0;
-          let metabolicDemandQ = 0;
-          const endurance = isEgg
-            ? 1
-            : idxEndurance >= 0
-              ? expressTraitF32(gMat, gPat, gDom, modKinds, idxEndurance, modPhys, modNeur, modOther)
-              : sc.baseEndurance;
-          if (isEgg) {
-            const eggCostEU = eggIncubCost * (maxReserveMassQ / LOCAL_PPM) * 30 + thermalStress * 0.45;
-            metabolicDemandQ = euToQ(Math.max(0, eggCostEU), 'half-even');
-          } else {
-            const strength =
-              idxStrength >= 0
-                ? expressTraitF32(gMat, gPat, gDom, modKinds, idxStrength, modPhys, modNeur, modOther)
-                : sc.baseStrength;
-            const speed =
-              idxSpeed >= 0
-                ? expressTraitF32(gMat, gPat, gDom, modKinds, idxSpeed, modPhys, modNeur, modOther)
-                : sc.baseSpeed;
-            const perception =
-              idxPerception >= 0
-                ? expressTraitF32(gMat, gPat, gDom, modKinds, idxPerception, modPhys, modNeur, modOther)
-                : sc.basePerception;
-            const intelligence =
-              idxIntelligence >= 0
-                ? expressTraitF32(gMat, gPat, gDom, modKinds, idxIntelligence, modPhys, modNeur, modOther)
-                : sc.baseIntelligence;
-            const metEff =
-              idxMetEff >= 0
-                ? expressTraitF32(gMat, gPat, gDom, modKinds, idxMetEff, modPhys, modNeur, modOther)
-                : sc.baseMetabolismEfficiency;
-
-            foragePower = 0.45 + 0.22 * speed + 0.18 * perception + 0.1 * strength + 0.08 * intelligence;
-            const traitDemand = 0.45 + 0.30 * speed + 0.15 * strength + 0.10 * intelligence;
-            const effScale = Math.max(0.45, 0.55 + 0.45 * metEff);
-            activityLevel = Math.max(0, (3.8 * traitDemand) / effScale);
-            metabolicDemandQ = computeTotalMetabolicDemandFast(
-              basalFactor,
-              thermoFactor,
-              activityFactor,
-              structMassQ,
-              reserveMassQ,
-              thermalStress,
-              activityLevel
-            );
-          }
-
-          let metabBurnMassQ = 0;
-          let metabNextCarryQ = 0;
-          if (metabolicDemandQ <= carryCreditQ) {
-            metabNextCarryQ = carryCreditQ - metabolicDemandQ;
-          } else {
-            const netDemandQ = metabolicDemandQ - carryCreditQ;
-            const rem30 = netDemandQ % 30;
-            const neededMassQ = rem30 === 0 ? netDemandQ / 30 : (netDemandQ - rem30) / 30 + 1;
-            metabBurnMassQ = neededMassQ < reserveMassQ ? neededMassQ : reserveMassQ;
-            const burnEnergyQ =
-              metabBurnMassQ <= RESERVE_SAFE_MASS_LIMIT
-                ? metabBurnMassQ * 30
-                : energyOfMass(metabBurnMassQ, RHO_RESERVE);
-            metabNextCarryQ = burnEnergyQ >= netDemandQ ? burnEnergyQ - netDemandQ : 0;
-          }
-
-          const postMetabReserveQ = reserveMassQ - metabBurnMassQ;
-          const headroomMassQ = maxReserveMassQ > postMetabReserveQ ? maxReserveMassQ - postMetabReserveQ : 0;
-          const normAfterMetab = maxReserveMassQ > 0 ? postMetabReserveQ / maxReserveMassQ : 0;
-
-          let reqPlantMassQ = 0;
-          let reqPreyMassQ = 0;
-          let reqCarrionMassQ = 0;
-          let reqDetritusMassQ = 0;
-          let reqLegacyNormalized = 0;
-
-          if (!isEgg && normAfterMetab < 0.96 && headroomMassQ > 0) {
-            const hungerGapNorm = 1 - normAfterMetab;
-            const maxIntake = maxForageIntake * foragePower;
-            const desiredNormGain = hungerGapNorm < maxIntake ? hungerGapNorm : maxIntake;
-            if (desiredNormGain > 0) {
-              reqLegacyNormalized = desiredNormGain;
-              if (hasStrictFoodSources) {
-                const desiredGainQ = applyPpmFloorFast(
-                  maxReserveMassQ,
-                  fractionToPpm(desiredNormGain, 'half-even')
-                );
-                const desiredDepositMassQ = headroomMassQ < desiredGainQ ? headroomMassQ : desiredGainQ;
-                if (desiredDepositMassQ > 0) {
-                  const neededReserveEnergyQ =
-                    desiredDepositMassQ <= RESERVE_SAFE_MASS_LIMIT
-                      ? desiredDepositMassQ * 30
-                      : energyOfMass(desiredDepositMassQ, RHO_RESERVE);
-                  const numProd = neededReserveEnergyQ * LOCAL_PPM;
-                  let neededGrossEnergyQ: number;
-                  if (numProd <= LOCAL_MAX_SAFE_INT) {
-                    const r = numProd % effAbsorptionAssimPpm;
-                    const q = (numProd - r) / effAbsorptionAssimPpm;
-                    neededGrossEnergyQ = r === 0 ? q : q + 1;
-                  } else {
-                    neededGrossEnergyQ = scaleByRatio(
-                      neededReserveEnergyQ,
-                      LOCAL_PPM,
-                      effAbsorptionAssimPpm,
-                      'ceil'
-                    );
-                  }
-                  if (plantPpm > 0) {
-                    reqPlantMassQ = applyPpmFloorFast(massForPlantEnergyCeil(neededGrossEnergyQ), plantPpm);
-                  }
-                  if (preyPpm > 0) {
-                    reqPreyMassQ = applyPpmFloorFast(massForReserveEnergyCeil(neededGrossEnergyQ), preyPpm);
-                  }
-                  if (carrionPpm > 0) {
-                    reqCarrionMassQ = applyPpmFloorFast(massForCarrionEnergyCeil(neededGrossEnergyQ), carrionPpm);
-                  }
-                  if (detritusPpm > 0) {
-                    reqDetritusMassQ = applyPpmFloorFast(massForPlantEnergyCeil(neededGrossEnergyQ), detritusPpm);
-                  }
+              if (preyRemTouched[vCur] === 0) {
+                preyRemTouched[vCur] = 1;
+                if (preyRemTouchedCount >= this.preyRemTouchedList.length) {
+                  const nextT = new Int32Array(this.preyRemTouchedList.length * 2);
+                  nextT.set(this.preyRemTouchedList);
+                  this.preyRemTouchedList = nextT;
                 }
+                this.preyRemTouchedList[preyRemTouchedCount++] = vCur;
+                preyRemStructQ[vCur] = draftStructMassQ[vCur];
+                preyRemReserveQ[vCur] = draftPostMetabResQ[vCur];
+              }
+
+              const remS = preyRemStructQ[vCur];
+              const remR = preyRemReserveQ[vCur];
+              const totalPreyMass = _safeAdd(remS, remR);
+              if (totalPreyMass <= 0) continue;
+
+              const biteMassQ = remReq < totalPreyMass ? remReq : totalPreyMass;
+              if (biteMassQ <= 0) continue;
+              const reserveBite = _scaleByRatio(remR, biteMassQ, totalPreyMass, 'half-even');
+              let clampedResBite = biteMassQ < remR ? biteMassQ : remR;
+              if (reserveBite < clampedResBite) clampedResBite = reserveBite > 0 ? reserveBite : 0;
+              const structBite = biteMassQ - clampedResBite;
+
+              const nextRemS = remS - structBite;
+              preyRemReserveQ[vCur] = remR - clampedResBite;
+              preyRemStructQ[vCur] = nextRemS;
+              remReq -= biteMassQ;
+              draftGrantPreyQ[pCur] += biteMassQ;
+              draftFlags[vCur] |= FLAG_TOUCHED_PRED;
+
+              const candStruct = draftStructMassQ[vCur];
+              const lethal =
+                nextRemS <= 0 ||
+                structBite >= _scaleByRatio(candStruct, 35, 100, 'ceil') ||
+                nextRemS < _scaleByRatio(candStruct, 65, 100, 'floor');
+
+              if (lethal) {
+                draftFlags[vCur] |= FLAG_DIED;
+                draftDeathCause[vCur] = 'predation';
+                draftKillerId[vCur] = predId;
+                draftNextHealth[vCur] = 0;
+              }
+
+              if (predBiteCount >= this.predBiteCap) {
+                this.ensurePredBiteCapacity(predBiteCount + 1);
+              }
+              this.predBitePredDraft[predBiteCount] = pCur;
+              this.predBitePreyDraft[predBiteCount] = vCur;
+              this.predBiteMassQ[predBiteCount] = biteMassQ;
+              predBiteCount++;
+            }
+          }
+        }
+
+        if (extPreySource || conservativePreyProvider) {
+          const avail = extPreySource
+            ? extPreySource.inspect(cellIdx).massQ
+            : conservativePreyProvider!.getAvailablePreyMassQ(cellIdx);
+          if (avail <= 0) continue;
+          let n = 0;
+          for (let pCur = preyCellHead[cellIdx]; pCur !== -1; pCur = preyNextDraft[pCur]) {
+            if (draftReqPreyQ[pCur] > draftGrantPreyQ[pCur]) n++;
+          }
+          if (n === 0) continue;
+          if (n === 1) {
+            for (let pCur = preyCellHead[cellIdx]; pCur !== -1; pCur = preyNextDraft[pCur]) {
+              const remDemand = draftReqPreyQ[pCur] - draftGrantPreyQ[pCur];
+              if (remDemand > 0) {
+                draftGrantPreyQ[pCur] += remDemand < avail ? remDemand : avail;
+                break;
               }
             }
-          }
-
-          if (legacySnapshotAvailable !== null && !isEgg && !legacySnapshotAvailable.has(cellIdx)) {
-            const cy = (cellIdx / gridWidth) | 0;
-            const cx = cellIdx - cy * gridWidth;
-            const env = this.populateEnvContext(cx, cy, cellIdx, targetTick);
-            legacySnapshotAvailable.set(cellIdx, this.foodProvider.getAvailablePrey(env));
-          }
-
-          let growthTargetStructQ = 0;
-          if (!isEgg) {
-            if (devPhysicalScale === 1) {
-              growthTargetStructQ = adultMassQ;
-            } else {
-              const gt = applyPpmFloorFast(adultMassQ, fractionToPpm(devPhysicalScale, 'half-even'));
-              growthTargetStructQ = gt > 1 ? gt : 1;
+          } else {
+            this.ensureResolveScratch(n);
+            const demands = this.resolveScratchDemands;
+            const orgIds = this.resolveScratchOrgIds;
+            const grants = this.resolveScratchGrants;
+            const idxList = this.bgPreyScratchDraftIdx;
+            let j = 0;
+            for (let pCur = preyCellHead[cellIdx]; pCur !== -1; pCur = preyNextDraft[pCur]) {
+              const remDemand = draftReqPreyQ[pCur] - draftGrantPreyQ[pCur];
+              if (remDemand > 0) {
+                demands[j] = remDemand;
+                orgIds[j] = draftOrgId[pCur];
+                grants[j] = 0;
+                idxList[j] = pCur;
+                j++;
+              }
+            }
+            _resolveContention(demands, n, avail, grants, orgIds);
+            for (j = 0; j < n; j++) {
+              draftGrantPreyQ[idxList[j]] += grants[j];
             }
           }
-
-          draftOrg[dIdx] = org;
-          draftPop[dIdx] = pop;
-          draftDeathCause[dIdx] = null;
-          draftSlot[dIdx] = slot;
-          draftCellIndex[dIdx] = cellIdx;
-          draftOrgId[dIdx] = orgId;
-          draftSpeciesIdx[dIdx] = s;
-          draftNextAgeTicks[dIdx] = nextAgeTicks;
-          draftNextStage[dIdx] = nextStageCode;
-          draftNextCooldown[dIdx] = nextCooldown;
-          draftFlags[dIdx] = org.sex === 'female' ? FLAG_FEMALE : 0;
-          draftKillerId[dIdx] = 0;
-          draftOffspringDelta[dIdx] = 0;
-          draftStructMassQ[dIdx] = structMassQ;
-          draftReserveMassQ[dIdx] = reserveMassQ;
-          draftMaxReserveMassQ[dIdx] = maxReserveMassQ;
-          draftCarryCreditQ[dIdx] = carryCreditQ;
-          draftExternalDeltaQ[dIdx] = externalDeltaQ;
-          draftMetabolicDemandQ[dIdx] = metabolicDemandQ;
-          draftHealingDemandQ[dIdx] = 0;
-          draftBurnMassQ[dIdx] = metabBurnMassQ;
-          draftPostMetabResQ[dIdx] = postMetabReserveQ;
-          draftPostMetabCarryQ[dIdx] = metabNextCarryQ;
-          draftReqPlantQ[dIdx] = reqPlantMassQ;
-          draftReqPreyQ[dIdx] = reqPreyMassQ;
-          draftReqCarrionQ[dIdx] = reqCarrionMassQ;
-          draftReqDetritusQ[dIdx] = reqDetritusMassQ;
-          draftReqLegacyNorm[dIdx] = reqLegacyNormalized;
-          draftGrantPlantQ[dIdx] = 0;
-          draftGrantPreyQ[dIdx] = 0;
-          draftGrantCarrionQ[dIdx] = 0;
-          draftGrantDetritusQ[dIdx] = 0;
-          draftNextEnergy[dIdx] = normAfterMetab;
-          draftNextHealth[dIdx] = org.health;
-          draftGrowthTargetStructQ[dIdx] = growthTargetStructQ;
-          draftDevPhys[dIdx] = devPhysicalScale;
-          draftDevNeural[dIdx] = devNeuralScale;
-          draftDevSenesc[dIdx] = devSenescenceScale;
-          draftThermalStress[dIdx] = thermalStress;
-          draftEndurance[dIdx] = endurance;
-        }
-
-        speciesDraftEnd[s] = draftCount;
-      }
-
-      if (!globallySorted && draftCount > 1) {
-        sortInt32IndicesByFloat64Key(draftCanonicalOrder, draftOrgId, 0, draftCount - 1);
-      }
-
-      // =========================================================================
-      // PHASE 2: RESOLVE (Deterministic conflict resolution & biological planning)
-      // =========================================================================
-      this.onPhase?.({ tick: targetTick, phase: 'RESOLVE' });
-
-      const energyGrid = this.energyGrid;
-      const projectedPlantCellMass = this.projectedPlantCellMass;
-      const photoCellIdx = this.photoCellIdx;
-      const photoGainMassQ = this.photoGainMassQ;
-      const photoGainEnergyQ = this.photoGainEnergyQ;
-
-      // 2a. Photosynthesis plan (strict mode only)
-      if (!isLegacyMode && this.plantPhotosynthesisRatePpm > 0) {
-        let remainingAbioticBig = this.ledger.globalAbioticMassQ;
-        const landCells = this.landCellIndices;
-        const landLen = landCells.length;
-        const plantCapQ = this.plantCapacityQ;
-        const photoRatePpm = this.plantPhotosynthesisRatePpm;
-
-        for (let k = 0; k < landLen; k++) {
-          if (remainingAbioticBig <= 0n) break;
-          const cellIndex = landCells[k];
-          const capQ = plantCapQ[cellIndex];
-          if (capQ <= 0) continue;
-          const curQ = energyGrid.getMassQ(POOL_PLANT, cellIndex);
-          if (curQ >= capQ) continue;
-          let gainQ = applyPpmFloorFast(capQ - curQ, photoRatePpm);
-          if (gainQ <= 0) continue;
-          const gainBig = BigInt(gainQ);
-          if (gainBig > remainingAbioticBig) {
-            gainQ = Number(remainingAbioticBig);
-          }
-          if (gainQ <= 0) continue;
-          remainingAbioticBig -= BigInt(gainQ);
-          projectedPlantCellMass[cellIndex] = curQ + gainQ;
-          const pIdx = photoCount++;
-          photoCellIdx[pIdx] = cellIndex;
-          photoGainMassQ[pIdx] = gainQ;
-          photoGainEnergyQ[pIdx] =
-            gainQ <= PLANT_SAFE_MASS_LIMIT ? gainQ * 3 : energyOfMass(gainQ, RHO_PLANT);
         }
       }
+    }
 
-      // 2b. Resolve deterministic per-cell pool contention (`plant`, `carrion`, `detritus`)
-      // Build intrusive per-cell linked lists in REVERSE canonical order so forward head->next walks yield ascending org.id
-      const hasMultiSpecies = sCount > 1;
-      const plantCellHead = this.plantCellHead;
-      const plantDirtyCells = this.plantDirtyCells;
-      const plantNextDraft = this.plantNextDraft;
-      const carrionCellHead = this.carrionCellHead;
-      const carrionDirtyCells = this.carrionDirtyCells;
-      const carrionNextDraft = this.carrionNextDraft;
-      const detritusCellHead = this.detritusCellHead;
-      const detritusDirtyCells = this.detritusDirtyCells;
-      const detritusNextDraft = this.detritusNextDraft;
-      const preyCellHead = this.preyCellHead;
-      const preyDirtyCells = this.preyDirtyCells;
-      const preyNextDraft = this.preyNextDraft;
-      const aliveCellHead = this.aliveCellHead;
-      const aliveDirtyCells = this.aliveDirtyCells;
-      const aliveNextDraft = this.aliveNextDraft;
+    this.curPredBiteCount = predBiteCount;
+    this.curPreyRemTouchedCount = preyRemTouchedCount;
+  }
 
-      for (let ci = draftCount - 1; ci >= 0; ci--) {
-        const dIdx = draftCanonicalOrder[ci];
+  private evaluatePostFeedMortality(
+    speciesCaches: SpeciesRuntimeCache[],
+    isLegacyMode: boolean,
+    legacySnapshotAvailable: Map<number, number> | null,
+    lifecycleRng: SeededRng
+  ): void {
+    const draftCount = this.curDraftCount;
+    const draftCanonicalOrder = this.draftCanonicalOrder;
+    const draftFlags = this.draftFlags;
+    const draftOrg = this.draftOrg;
+    const draftDeathCause = this.draftDeathCause;
+    const draftSpeciesIdx = this.draftSpeciesIdx;
+    const draftMaxReserveMassQ = this.draftMaxReserveMassQ;
+    const draftPostMetabResQ = this.draftPostMetabResQ;
+    const draftGrantPlantQ = this.draftGrantPlantQ;
+    const draftGrantDetritusQ = this.draftGrantDetritusQ;
+    const draftGrantCarrionQ = this.draftGrantCarrionQ;
+    const draftGrantPreyQ = this.draftGrantPreyQ;
+    const draftCellIndex = this.draftCellIndex;
+    const draftReqLegacyNorm = this.draftReqLegacyNorm;
+    const draftNextEnergy = this.draftNextEnergy;
+    const draftNextHealth = this.draftNextHealth;
+    const draftNextStage = this.draftNextStage;
+    const draftNextAgeTicks = this.draftNextAgeTicks;
+    const draftNextCooldown = this.draftNextCooldown;
+    const draftThermalStress = this.draftThermalStress;
+    const draftEndurance = this.draftEndurance;
+    const draftMetabolicDemandQ = this.draftMetabolicDemandQ;
+    const draftHealingDemandQ = this.draftHealingDemandQ;
+    const speciesEligibleCounts = this.stepSpeciesEligibleCounts;
+    const feedScratch = this.feedScratch;
+    const extCarrion = this.externalCarrionSource;
+    const energyGrid = this.energyGrid;
+    const gridFront = this.useDirectEnergyGrid ? energyGrid._getChannelStore().front : null;
+    const carrionMFront = gridFront ? gridFront[2] : null;
+    const carrionEFront = gridFront ? gridFront[3] : null;
+
+    let diedCount = 0;
+
+    for (let ci = 0; ci < draftCount; ci++) {
+      const dIdx = draftCanonicalOrder[ci];
+      if ((draftFlags[dIdx] & FLAG_DIED) !== 0) {
+        draftNextEnergy[dIdx] = 0;
+        diedCount++;
+        continue;
+      }
+
+      const sIdx = draftSpeciesIdx[dIdx];
+      const sc = speciesCaches[sIdx];
+      const pq = sc.pq;
+      const maxReserveQ = draftMaxReserveMassQ[dIdx];
+      const postMetabResQ = draftPostMetabResQ[dIdx];
+      let headroom = maxReserveQ > postMetabResQ ? maxReserveQ - postMetabResQ : 0;
+      let depositedMassQ = 0;
+
+      const absPpm = pq.absorptionPpm;
+      const assimPpm = pq.assimilationPpm;
+      const sdaPpm = pq.sdaPpm;
+
+      const gPlant = draftGrantPlantQ[dIdx];
+      if (gPlant > 0 && headroom > 0) {
+        const ePlant = gPlant <= PLANT_SAFE_MASS_LIMIT ? gPlant * 3 : _energyOfMass(gPlant, _RHO_PLANT);
+        _computeFeedingPlanFast(gPlant, ePlant, absPpm, assimPpm, sdaPpm, headroom, feedScratch);
+        depositedMassQ += feedScratch.depositMassQ;
+        headroom -= feedScratch.depositMassQ;
+      }
+
+      const gDetritus = draftGrantDetritusQ[dIdx];
+      if (gDetritus > 0 && headroom > 0) {
+        const eDet = gDetritus <= PLANT_SAFE_MASS_LIMIT ? gDetritus * 3 : _energyOfMass(gDetritus, _RHO_DETRITUS);
+        _computeFeedingPlanFast(gDetritus, eDet, absPpm, assimPpm, sdaPpm, headroom, feedScratch);
+        depositedMassQ += feedScratch.depositMassQ;
+        headroom -= feedScratch.depositMassQ;
+      }
+
+      const gCarrion = draftGrantCarrionQ[dIdx];
+      if (gCarrion > 0) {
         const cellIdx = draftCellIndex[dIdx];
-        if (hasMultiSpecies) {
-          const prevHead = aliveCellHead[cellIdx];
-          if (prevHead === -1) aliveDirtyCells[aliveDirtyCount++] = cellIdx;
-          aliveNextDraft[dIdx] = prevHead;
-          aliveCellHead[cellIdx] = dIdx;
-        }
-        if (draftReqPlantQ[dIdx] > 0) {
-          const prevHead = plantCellHead[cellIdx];
-          if (prevHead === -1) plantDirtyCells[plantDirtyCount++] = cellIdx;
-          plantNextDraft[dIdx] = prevHead;
-          plantCellHead[cellIdx] = dIdx;
-        }
-        if (draftReqCarrionQ[dIdx] > 0) {
-          const prevHead = carrionCellHead[cellIdx];
-          if (prevHead === -1) carrionDirtyCells[carrionDirtyCount++] = cellIdx;
-          carrionNextDraft[dIdx] = prevHead;
-          carrionCellHead[cellIdx] = dIdx;
-        }
-        if (draftReqDetritusQ[dIdx] > 0) {
-          const prevHead = detritusCellHead[cellIdx];
-          if (prevHead === -1) detritusDirtyCells[detritusDirtyCount++] = cellIdx;
-          detritusNextDraft[dIdx] = prevHead;
-          detritusCellHead[cellIdx] = dIdx;
-        }
-        if (draftReqPreyQ[dIdx] > 0) {
-          const prevHead = preyCellHead[cellIdx];
-          if (prevHead === -1) preyDirtyCells[preyDirtyCount++] = cellIdx;
-          preyNextDraft[dIdx] = prevHead;
-          preyCellHead[cellIdx] = dIdx;
-        }
-      }
-
-      if (plantDirtyCount > 0) {
-        if (plantDirtyCount > 1) {
-          plantDirtyCells.subarray(0, plantDirtyCount).sort();
-        }
-        const extPlant = this.externalPlantSource;
-        for (let ci = 0; ci < plantDirtyCount; ci++) {
-          const cellIdx = plantDirtyCells[ci];
-          const avail = extPlant
-            ? extPlant.inspect(cellIdx).massQ
-            : projectedPlantCellMass[cellIdx] >= 0
-              ? projectedPlantCellMass[cellIdx]
-              : energyGrid.getMassQ(POOL_PLANT, cellIdx);
-          if (avail <= 0) continue;
-          const first = plantCellHead[cellIdx];
-          const second = plantNextDraft[first];
-          if (second === -1) {
-            const req = draftReqPlantQ[first];
-            if (req > 0) {
-              draftGrantPlantQ[first] = req < avail ? req : avail;
-            }
-          } else {
-            let n = 0;
-            for (let cur = first; cur !== -1; cur = plantNextDraft[cur]) n++;
-            this.ensureResolveScratch(n);
-            const demands = this.resolveScratchDemands;
-            const orgIds = this.resolveScratchOrgIds;
-            const grants = this.resolveScratchGrants;
-            const idxList = this.resolveScratchDraftIdx;
-            let j = 0;
-            for (let cur = first; cur !== -1; cur = plantNextDraft[cur]) {
-              demands[j] = draftReqPlantQ[cur];
-              orgIds[j] = draftOrgId[cur];
-              grants[j] = 0;
-              idxList[j] = cur;
-              j++;
-            }
-            resolveContention(demands, n, avail, grants, orgIds);
-            for (j = 0; j < n; j++) {
-              draftGrantPlantQ[idxList[j]] = grants[j];
-            }
-          }
-        }
-      }
-
-      if (carrionDirtyCount > 0) {
-        if (carrionDirtyCount > 1) {
-          carrionDirtyCells.subarray(0, carrionDirtyCount).sort();
-        }
-        const extCarrion = this.externalCarrionSource;
-        for (let ci = 0; ci < carrionDirtyCount; ci++) {
-          const cellIdx = carrionDirtyCells[ci];
-          const avail = extCarrion
-            ? extCarrion.inspect(cellIdx).massQ
-            : energyGrid.getMassQ(POOL_CARRION, cellIdx);
-          if (avail <= 0) continue;
-          const first = carrionCellHead[cellIdx];
-          const second = carrionNextDraft[first];
-          if (second === -1) {
-            const req = draftReqCarrionQ[first];
-            if (req > 0) {
-              draftGrantCarrionQ[first] = req < avail ? req : avail;
-            }
-          } else {
-            let n = 0;
-            for (let cur = first; cur !== -1; cur = carrionNextDraft[cur]) n++;
-            this.ensureResolveScratch(n);
-            const demands = this.resolveScratchDemands;
-            const orgIds = this.resolveScratchOrgIds;
-            const grants = this.resolveScratchGrants;
-            const idxList = this.resolveScratchDraftIdx;
-            let j = 0;
-            for (let cur = first; cur !== -1; cur = carrionNextDraft[cur]) {
-              demands[j] = draftReqCarrionQ[cur];
-              orgIds[j] = draftOrgId[cur];
-              grants[j] = 0;
-              idxList[j] = cur;
-              j++;
-            }
-            resolveContention(demands, n, avail, grants, orgIds);
-            for (j = 0; j < n; j++) {
-              draftGrantCarrionQ[idxList[j]] = grants[j];
-            }
-          }
-        }
-      }
-
-      if (detritusDirtyCount > 0) {
-        if (detritusDirtyCount > 1) {
-          detritusDirtyCells.subarray(0, detritusDirtyCount).sort();
-        }
-        const extDetritus = this.externalDetritusSource;
-        for (let ci = 0; ci < detritusDirtyCount; ci++) {
-          const cellIdx = detritusDirtyCells[ci];
-          const avail = extDetritus
-            ? extDetritus.inspect(cellIdx).massQ
-            : energyGrid.getMassQ(POOL_DETRITUS, cellIdx);
-          if (avail <= 0) continue;
-          const first = detritusCellHead[cellIdx];
-          const second = detritusNextDraft[first];
-          if (second === -1) {
-            const req = draftReqDetritusQ[first];
-            if (req > 0) {
-              draftGrantDetritusQ[first] = req < avail ? req : avail;
-            }
-          } else {
-            let n = 0;
-            for (let cur = first; cur !== -1; cur = detritusNextDraft[cur]) n++;
-            this.ensureResolveScratch(n);
-            const demands = this.resolveScratchDemands;
-            const orgIds = this.resolveScratchOrgIds;
-            const grants = this.resolveScratchGrants;
-            const idxList = this.resolveScratchDraftIdx;
-            let j = 0;
-            for (let cur = first; cur !== -1; cur = detritusNextDraft[cur]) {
-              demands[j] = draftReqDetritusQ[cur];
-              orgIds[j] = draftOrgId[cur];
-              grants[j] = 0;
-              idxList[j] = cur;
-              j++;
-            }
-            resolveContention(demands, n, avail, grants, orgIds);
-            for (j = 0; j < n; j++) {
-              draftGrantDetritusQ[idxList[j]] = grants[j];
-            }
-          }
-        }
-      }
-
-      // 2c. Resolve live prey predation first in multi-species cells, then background prey pool
-      let predBiteCount = 0;
-      const preyRemStructQ = this.preyRemStructQ;
-      const preyRemReserveQ = this.preyRemReserveQ;
-      const preyRemTouched = this.preyRemTouched;
-      const preyMatrix = this.speciesPreyMatrix;
-      const conservativePreyProvider =
-        this.hasConservativePreyProvider && this.foodProvider instanceof DeterministicPreyFoodProvider
-          ? this.foodProvider
-          : null;
-
-      if (preyDirtyCount > 0) {
-        if (preyDirtyCount > 1) {
-          preyDirtyCells.subarray(0, preyDirtyCount).sort();
-        }
-        for (let ci = 0; ci < preyDirtyCount; ci++) {
-          const cellIdx = preyDirtyCells[ci];
-          const firstAlive = hasMultiSpecies ? aliveCellHead[cellIdx] : -1;
-          if (firstAlive !== -1 && aliveNextDraft[firstAlive] !== -1) {
-            for (let pCur = preyCellHead[cellIdx]; pCur !== -1; pCur = preyNextDraft[pCur]) {
-              let remReq = draftReqPreyQ[pCur];
-              if (remReq <= 0) continue;
-              const predSpeciesOffset = draftSpeciesIdx[pCur] * sCount;
-              const predId = draftOrgId[pCur];
-              for (let vCur = firstAlive; vCur !== -1 && remReq > 0; vCur = aliveNextDraft[vCur]) {
-                if ((draftFlags[vCur] & FLAG_DIED) !== 0 || draftNextStage[vCur] === STAGE_EGG) continue;
-                if (preyMatrix[predSpeciesOffset + draftSpeciesIdx[vCur]] === 0) continue;
-
-                if (preyRemTouched[vCur] === 0) {
-                  preyRemTouched[vCur] = 1;
-                  if (preyRemTouchedCount >= this.preyRemTouchedList.length) {
-                    const nextT = new Int32Array(this.preyRemTouchedList.length * 2);
-                    nextT.set(this.preyRemTouchedList);
-                    this.preyRemTouchedList = nextT;
-                  }
-                  this.preyRemTouchedList[preyRemTouchedCount++] = vCur;
-                  preyRemStructQ[vCur] = draftStructMassQ[vCur];
-                  preyRemReserveQ[vCur] = draftPostMetabResQ[vCur];
-                }
-
-                const remS = preyRemStructQ[vCur];
-                const remR = preyRemReserveQ[vCur];
-                const totalPreyMass = safeAdd(remS, remR);
-                if (totalPreyMass <= 0) continue;
-
-                const biteMassQ = remReq < totalPreyMass ? remReq : totalPreyMass;
-                if (biteMassQ <= 0) continue;
-                const reserveBite = scaleByRatio(remR, biteMassQ, totalPreyMass, 'half-even');
-                let clampedResBite = biteMassQ < remR ? biteMassQ : remR;
-                if (reserveBite < clampedResBite) clampedResBite = reserveBite > 0 ? reserveBite : 0;
-                const structBite = biteMassQ - clampedResBite;
-
-                const nextRemS = remS - structBite;
-                preyRemReserveQ[vCur] = remR - clampedResBite;
-                preyRemStructQ[vCur] = nextRemS;
-                remReq -= biteMassQ;
-                draftGrantPreyQ[pCur] += biteMassQ;
-                draftFlags[vCur] |= FLAG_TOUCHED_PRED;
-
-                const candStruct = draftStructMassQ[vCur];
-                const lethal =
-                  nextRemS <= 0 ||
-                  structBite >= scaleByRatio(candStruct, 35, 100, 'ceil') ||
-                  nextRemS < scaleByRatio(candStruct, 65, 100, 'floor');
-
-                if (lethal) {
-                  draftFlags[vCur] |= FLAG_DIED;
-                  draftDeathCause[vCur] = 'predation';
-                  draftKillerId[vCur] = predId;
-                  draftNextHealth[vCur] = 0;
-                }
-
-                if (predBiteCount >= this.predBiteCap) {
-                  this.ensurePredBiteCapacity(predBiteCount + 1);
-                }
-                this.predBitePredDraft[predBiteCount] = pCur;
-                this.predBitePreyDraft[predBiteCount] = vCur;
-                this.predBiteMassQ[predBiteCount] = biteMassQ;
-                predBiteCount++;
-              }
-            }
-          }
-
-          if (this.externalPreySource || conservativePreyProvider) {
-            const avail = this.externalPreySource
-              ? this.externalPreySource.inspect(cellIdx).massQ
-              : conservativePreyProvider!.getAvailablePreyMassQ(cellIdx);
-            if (avail <= 0) continue;
-            let n = 0;
-            for (let pCur = preyCellHead[cellIdx]; pCur !== -1; pCur = preyNextDraft[pCur]) {
-              if (draftReqPreyQ[pCur] > draftGrantPreyQ[pCur]) n++;
-            }
-            if (n === 0) continue;
-            if (n === 1) {
-              for (let pCur = preyCellHead[cellIdx]; pCur !== -1; pCur = preyNextDraft[pCur]) {
-                const remDemand = draftReqPreyQ[pCur] - draftGrantPreyQ[pCur];
-                if (remDemand > 0) {
-                  draftGrantPreyQ[pCur] += remDemand < avail ? remDemand : avail;
-                  break;
-                }
-              }
-            } else {
-              this.ensureResolveScratch(n);
-              const demands = this.resolveScratchDemands;
-              const orgIds = this.resolveScratchOrgIds;
-              const grants = this.resolveScratchGrants;
-              const idxList = this.bgPreyScratchDraftIdx;
-              let j = 0;
-              for (let pCur = preyCellHead[cellIdx]; pCur !== -1; pCur = preyNextDraft[pCur]) {
-                const remDemand = draftReqPreyQ[pCur] - draftGrantPreyQ[pCur];
-                if (remDemand > 0) {
-                  demands[j] = remDemand;
-                  orgIds[j] = draftOrgId[pCur];
-                  grants[j] = 0;
-                  idxList[j] = pCur;
-                  j++;
-                }
-              }
-              resolveContention(demands, n, avail, grants, orgIds);
-              for (j = 0; j < n; j++) {
-                draftGrantPreyQ[idxList[j]] += grants[j];
-              }
-            }
-          }
-        }
-      }
-
-      // 2d. Estimate post-feeding reserve, health, and mortality (in canonical organism.id order)
-      const speciesEligibleCounts = new Int32Array(sCount);
-      const feedScratch = this.feedScratch;
-      const extCarrion = this.externalCarrionSource;
-
-      for (let ci = 0; ci < draftCount; ci++) {
-        const dIdx = draftCanonicalOrder[ci];
-        if ((draftFlags[dIdx] & FLAG_DIED) !== 0) {
-          draftNextEnergy[dIdx] = 0;
-          continue;
-        }
-
-        const sIdx = draftSpeciesIdx[dIdx];
-        const sc = speciesCaches[sIdx];
-        const pq = sc.pq;
-        const maxReserveQ = draftMaxReserveMassQ[dIdx];
-        const postMetabResQ = draftPostMetabResQ[dIdx];
-        let headroom = maxReserveQ > postMetabResQ ? maxReserveQ - postMetabResQ : 0;
-        let depositedMassQ = 0;
-
-        const absPpm = pq.absorptionPpm;
-        const assimPpm = pq.assimilationPpm;
-        const sdaPpm = pq.sdaPpm;
-
-        const gPlant = draftGrantPlantQ[dIdx];
-        if (gPlant > 0 && headroom > 0) {
-          const ePlant = gPlant <= PLANT_SAFE_MASS_LIMIT ? gPlant * 3 : energyOfMass(gPlant, RHO_PLANT);
-          computeFeedingPlanFast(gPlant, ePlant, absPpm, assimPpm, sdaPpm, headroom, feedScratch);
-          depositedMassQ += feedScratch.depositMassQ;
-          headroom -= feedScratch.depositMassQ;
-        }
-
-        const gDetritus = draftGrantDetritusQ[dIdx];
-        if (gDetritus > 0 && headroom > 0) {
-          const eDet = gDetritus <= PLANT_SAFE_MASS_LIMIT ? gDetritus * 3 : energyOfMass(gDetritus, RHO_DETRITUS);
-          computeFeedingPlanFast(gDetritus, eDet, absPpm, assimPpm, sdaPpm, headroom, feedScratch);
-          depositedMassQ += feedScratch.depositMassQ;
-          headroom -= feedScratch.depositMassQ;
-        }
-
-        const gCarrion = draftGrantCarrionQ[dIdx];
-        if (gCarrion > 0) {
-          const cellIdx = draftCellIndex[dIdx];
-          let cm: number;
-          let ce: number;
-          if (extCarrion) {
-            const snap = extCarrion.inspect(cellIdx);
-            cm = snap.massQ;
-            ce = snap.energyQ;
-          } else {
-            cm = energyGrid.getMassQ(POOL_CARRION, cellIdx);
-            ce = energyGrid.getEnergyQ(POOL_CARRION, cellIdx);
-          }
-          const estE = cm > 0 ? scaleByRatio(ce, gCarrion, cm, 'floor') : 0;
-          if (headroom > 0) {
-            computeFeedingPlanFast(gCarrion, estE, absPpm, assimPpm, sdaPpm, headroom, feedScratch);
-            depositedMassQ += feedScratch.depositMassQ;
-            headroom -= feedScratch.depositMassQ;
-          }
-        }
-
-        const gPrey = draftGrantPreyQ[dIdx];
-        if (gPrey > 0) {
-          if (headroom > 0) {
-            const ePrey = gPrey <= RESERVE_SAFE_MASS_LIMIT ? gPrey * 30 : energyOfMass(gPrey, RHO_RESERVE);
-            computeFeedingPlanFast(gPrey, ePrey, absPpm, assimPpm, sdaPpm, headroom, feedScratch);
-            depositedMassQ += feedScratch.depositMassQ;
-            headroom -= feedScratch.depositMassQ;
-          }
-        } else if (isLegacyMode && draftReqLegacyNorm[dIdx] > 0) {
-          const cellIdx = draftCellIndex[dIdx];
-          const availNorm = legacySnapshotAvailable?.get(cellIdx) ?? 0;
-          const reqLegacy = draftReqLegacyNorm[dIdx];
-          const estNormGain = reqLegacy < availNorm ? reqLegacy : availNorm;
-          if (legacySnapshotAvailable && estNormGain > 0) {
-            legacySnapshotAvailable.set(cellIdx, Math.max(0, availNorm - estNormGain));
-          }
-          const clampedGain = estNormGain < 1 ? estNormGain : 1;
-          const estMass = applyPpmFloorFast(maxReserveQ, fractionToPpm(clampedGain, 'floor'));
-          depositedMassQ += headroom < estMass ? headroom : estMass;
-        }
-
-        const postFeedResQ = postMetabResQ + depositedMassQ;
-        // Stash postFeedResQ temporarily in draftGrantDetritusQ? No, reuse draftReserveMassQ? No, needed in COMMIT!
-        // Compute projectedNextEnergy & only store if father mating needs postFeedResQ? Wait: check 2e!
-        // In 2e, fatherMatingDemandQ uses `mateDraft.projectedPostFeedReserveQ`!
-        // Since we don't store a separate array for postFeedResQ, wait: can we store postFeedResQ in draftPostMetabResQ only AFTER 2d?
-        // WAIT: Phase 3 DOES NOT use draftPostMetabResQ when useDirectEntityStore or tx.stagedMassQ! Look at backup lines 2487-2720:
-        // ONLY `else if (this.conservationMode === 'legacy-external-escrow')` line 2687 uses `d.projectedPostMetabReserveQ`!
-        // Wait: in legacy mode we read `stagedResM` or can store `postFeedResQ` in `draftReqLegacyNorm` or check if `isLegacyMode` needs `postMetabResQ`!
-        // Even cleaner: `draftGrantPlantQ` is still used in 3f; what about `draftReqPlantQ`? After 2c, NONE of `draftReqPlantQ`, `draftReqPreyQ`, `draftReqCarrionQ`, `draftReqDetritusQ` are EVER read again when `!this.externalPlantSource`... wait: `externalPlantSource` reads `draftReqPlantQ`!
-        // Wait: `postFeedResQ` is ONLY needed in `2e` for ELIGIBLE MALES (`fatherMatingDemandQ`)!
-        // Wait: for an adult/elder male, postFeedResQ = postMetabResQ + depositedMassQ; AND notice `draftNextEnergy[dIdx]` = postFeedResQ / maxReserveQ, wait exact integer vs float! Let's check exact:
-        // Wait: why overwrite anything when we can reuse `draftCarryCreditQ`? NO, 3e uses `draftCarryCreditQ`!
-        // What about `draftBurnMassQ`? Used in 3e.
-        // Wait: `draftReqCarrionQ`? Used ONLY if `externalCarrionSource`!
-        // Actually why guess when `postFeedResQ` for any eligible organism can just be stored in `draftNextEnergy`? No, `draftNextEnergy` is `norm` float!
-        // Wait: if `maxReserveQ > 0`, `Math.round(draftNextEnergy[dIdx] * maxReserveQ)` is exact for small Q, NOT large Q! Better: check `Math.round` vs exact — actually we have `draftReqLegacyNorm` which is ONLY used in legacy mode! In strict mode `draftReqLegacyNorm` is completely unused after `2d`! No wait, in legacy mode a father ALSO needs `postFeedResQ`!
-        // Let's check: how many arrays are unused after `2d`?
-        // In strict mode & legacy mode, `computeFeedingPlan` isn't needed for `postFeedResQ` if we just add ONE local helper or store `postFeedResQ` into `draftPostMetabResQ` in strict mode, OR wait: why not check backup line 2687?
-        // In legacy mode (backup lines 2686-2689): `const stagedResM = Number(tx.stagedMassQ(AccountKind.ORGANISM_RESERVE, d.slot));` is identical to `d.projectedPostMetabReserveQ` because nothing ran in 3f before 2687! So reading `stagedReserveMass` directly in legacy 3f means `draftPostMetabResQ` is NEVER read after `2d`!!
-        // Let's verify that! Let's check every use of `projectedPostMetabReserveQ` in backup:
-        // 1. Line 2041 (Phase 2c preyRem init)
-        // 2. Line 2135 (Phase 2d headroom)
-        // 3. Line 2186 (Phase 2d postFeedResQ = postMetabResQ + depositedMassQ)
-        // 4. Line 2687 (Phase 3f legacy-external-escrow, where tx ALREADY applied 3d & 3e so staged reserve mass in entityStore IS `postMetabResQ`!)
-        // That means overwriting `draftPostMetabResQ[dIdx] = postFeedResQ` at the end of 2d (once 2d finishes reading `postMetabResQ`) AND reading `stagedReserveMass` in legacy 3f gives 100% exact `postFeedResQ` with ZERO extra arrays!
-        draftPostMetabResQ[dIdx] = postFeedResQ;
-
-        const nextEnergy = maxReserveQ > 0 ? postFeedResQ / maxReserveQ : 0;
-        draftNextEnergy[dIdx] = nextEnergy;
-
-        const org = draftOrg[dIdx];
-        const nextStageCode = draftNextStage[dIdx];
-        const nextAgeTicks = draftNextAgeTicks[dIdx];
-        const tStress = draftThermalStress[dIdx];
-        const endur = draftEndurance[dIdx];
-        const curHealth = org.health;
-
-        let nextHealth: number;
-        let healed = false;
-        if (nextStageCode === STAGE_EGG) {
-          let h = curHealth;
-          if (tStress > 0) {
-            h = Math.max(0, h - tStress * sc.thermalDamagePerTick * 1.15);
-          }
-          if (nextEnergy <= 0) {
-            h = Math.max(0, h - sc.starvationDamagePerTick);
-          }
-          nextHealth = h;
+        let cm: number;
+        let ce: number;
+        if (extCarrion) {
+          const snap = extCarrion.inspect(cellIdx);
+          cm = snap.massQ;
+          ce = snap.energyQ;
+        } else if (carrionMFront !== null) {
+          cm = carrionMFront[cellIdx];
+          ce = carrionEFront![cellIdx];
         } else {
-          let healthDelta = 0;
-          if (tStress > 0) {
-            healthDelta -= tStress * sc.thermalDamagePerTick;
-          }
-          if (nextEnergy <= 0) {
-            const starvationMitigation = Math.max(0.65, 1.15 - 0.15 * endur);
-            healthDelta -= sc.starvationDamagePerTick * starvationMitigation;
-          } else if (tStress === 0 && nextEnergy >= 0.45 && curHealth < 1.0) {
-            healthDelta += sc.healingPerTick * (0.75 + 0.25 * endur);
-            healed = true;
-          }
-          nextHealth = Math.min(1.0, Math.max(0, curHealth + healthDelta));
+          cm = energyGrid.getMassQ(POOL_CARRION, cellIdx);
+          ce = energyGrid.getEnergyQ(POOL_CARRION, cellIdx);
         }
-        draftNextHealth[dIdx] = nextHealth;
-
-        if (healed) {
-          draftFlags[dIdx] |= FLAG_HEALED;
-          const healCostQ = scaleByRatio(draftMetabolicDemandQ[dIdx], 10, 100, 'floor');
-          draftHealingDemandQ[dIdx] = healCostQ > 1 ? healCostQ : 1;
-        }
-
-        let deathCause: DeathCause | null = null;
-        if (nextStageCode === STAGE_EGG) {
-          if (nextHealth <= 0) {
-            deathCause = tStress > 0.25 ? 'thermal-stress' : 'incubation-failure';
-          }
-        } else if (nextHealth <= 0) {
-          if (nextEnergy <= 0 && tStress <= 0.15) deathCause = 'starvation';
-          else if (tStress > 0.15) deathCause = 'thermal-stress';
-          else deathCause = 'starvation';
-        } else if (nextStageCode === STAGE_ELDER) {
-          const genArr = org.phenotype.geneticExpression;
-          const pIdx = sc.idx;
-          const endGen = pIdx.endurance >= 0 ? genArr[pIdx.endurance] : sc.baseEndurance;
-          const metGen =
-            pIdx.metabolismEfficiency >= 0 ? genArr[pIdx.metabolismEfficiency] : sc.baseMetabolismEfficiency;
-          const modifier = 0.8 + 0.14 * endGen + 0.08 * metGen;
-          const maxLife = Math.max(sc.elderLifeFloor, Math.round(sc.maxLifespanTicks * modifier));
-          if (nextAgeTicks >= maxLife) {
-            deathCause = 'old-age';
-          } else {
-            const bioAge = nextAgeTicks / sc.tpy;
-            const maxBio = maxLife / sc.tpy;
-            const elderProgress = (bioAge - sc.elderBio) / Math.max(sc.minBioStep, maxBio - sc.elderBio);
-            const hazard = Math.min(0.35, 0.015 + elderProgress * elderProgress * 0.16);
-            if (lifecycleRng.chance(hazard)) {
-              deathCause = 'old-age';
-            }
-          }
-        }
-
-        if (deathCause !== null) {
-          draftFlags[dIdx] |= FLAG_DIED;
-          draftDeathCause[dIdx] = deathCause;
-          draftNextHealth[dIdx] = 0;
-        } else if (
-          (nextStageCode === STAGE_ADULT || nextStageCode === STAGE_ELDER) &&
-          draftNextCooldown[dIdx] === 0 &&
-          nextEnergy >= sc.minEnergyToReproduce &&
-          nextHealth >= sc.minHealthToReproduce
-        ) {
-          draftFlags[dIdx] |= FLAG_ELIGIBLE;
-          speciesEligibleCounts[sIdx] += 1;
+        const estE = cm > 0 ? _scaleByRatio(ce, gCarrion, cm, 'floor') : 0;
+        if (headroom > 0) {
+          _computeFeedingPlanFast(gCarrion, estE, absPpm, assimPpm, sdaPpm, headroom, feedScratch);
+          depositedMassQ += feedScratch.depositMassQ;
+          headroom -= feedScratch.depositMassQ;
         }
       }
 
-      // 2e. Plan reproduction drafts cleanly (zero live mutation on parents — elderCooldown stays pure!)
-      let reproPlanCount = 0;
-      const trackMut = this.trackMutationEvents;
-      const speciesEggStart = new Int32Array(sCount);
-      const speciesEggCount = new Int32Array(sCount);
+      const gPrey = draftGrantPreyQ[dIdx];
+      if (gPrey > 0) {
+        if (headroom > 0) {
+          const ePrey = gPrey <= RESERVE_SAFE_MASS_LIMIT ? gPrey * 30 : _energyOfMass(gPrey, _RHO_RESERVE);
+          _computeFeedingPlanFast(gPrey, ePrey, absPpm, assimPpm, sdaPpm, headroom, feedScratch);
+          depositedMassQ += feedScratch.depositMassQ;
+          headroom -= feedScratch.depositMassQ;
+        }
+      } else if (isLegacyMode && draftReqLegacyNorm[dIdx] > 0) {
+        const cellIdx = draftCellIndex[dIdx];
+        const availNorm = legacySnapshotAvailable?.get(cellIdx) ?? 0;
+        const reqLegacy = draftReqLegacyNorm[dIdx];
+        const estNormGain = reqLegacy < availNorm ? reqLegacy : availNorm;
+        if (legacySnapshotAvailable && estNormGain > 0) {
+          legacySnapshotAvailable.set(cellIdx, Math.max(0, availNorm - estNormGain));
+        }
+        const clampedGain = estNormGain < 1 ? estNormGain : 1;
+        const estMass = applyPpmFloorFast(maxReserveQ, _fractionToPpmFloorFast(clampedGain));
+        depositedMassQ += headroom < estMass ? headroom : estMass;
+      }
 
-      for (let s = 0; s < sCount; s++) {
-        const pop = popBySpeciesIdx[s];
-        if (!pop || speciesEligibleCounts[s] < 2) continue;
+      const postFeedResQ = postMetabResQ + depositedMassQ;
+      draftPostMetabResQ[dIdx] = postFeedResQ;
 
-        pop.ensureSpatialIndex();
-        const cellHead = pop.getSpatialIndexHead();
-        const cellNext = pop.getSpatialIndexNext();
-        const cellCounts = pop.getCellCountsBuffer();
-        const rawActive = pop.getActiveOrganisms();
-        const activeToDraft =
-          speciesWasCanonical[s] === 1
-            ? this.activeIdxToDraftIdx.subarray(speciesActiveMapOffsets[s])
-            : this.activeIdxToDraftIdx;
-        const unsortedMap = unsortedIdToDraftMaps[s];
+      const nextEnergy = maxReserveQ > 0 ? postFeedResQ / maxReserveQ : 0;
+      draftNextEnergy[dIdx] = nextEnergy;
 
-        const sc = speciesCaches[s];
-        const species = sc.species;
-        const schema = sc.schema;
-        const locusCount = sc.locusCount;
-        const mutPlan = sc.mutationPlan;
-        const eggActualInitNorm = sc.eggActualInitNorm;
-        const femaleProb = sc.femaleProbability;
-        const elderFertMul = sc.elderFertilityMultiplier;
-        const cooldownTicks = sc.cooldownTicks;
-        const elderCooldown = sc.elderCooldown;
-        const clutchMin = sc.clutchSizeMin;
-        const clutchMax = sc.clutchSizeMax;
+      const org = draftOrg[dIdx];
+      const nextStageCode = draftNextStage[dIdx];
+      const nextAgeTicks = draftNextAgeTicks[dIdx];
+      const tStress = draftThermalStress[dIdx];
+      const endur = draftEndurance[dIdx];
+      const curHealth = org.health;
 
-        const dStart = speciesDraftStart[s];
-        const dEnd = speciesDraftEnd[s];
-        speciesEggStart[s] = eggPlanCount;
+      let nextHealth: number;
+      let healed = false;
+      if (nextStageCode === STAGE_EGG) {
+        let h = curHealth;
+        if (tStress > 0) {
+          h = Math.max(0, h - tStress * sc.thermalDamagePerTick * 1.15);
+        }
+        if (nextEnergy <= 0) {
+          h = Math.max(0, h - sc.starvationDamagePerTick);
+        }
+        nextHealth = h;
+      } else {
+        let healthDelta = 0;
+        if (tStress > 0) {
+          healthDelta -= tStress * sc.thermalDamagePerTick;
+        }
+        if (nextEnergy <= 0) {
+          const starvationMitigation = Math.max(0.65, 1.15 - 0.15 * endur);
+          healthDelta -= sc.starvationDamagePerTick * starvationMitigation;
+        } else if (tStress === 0 && nextEnergy >= 0.45 && curHealth < 1.0) {
+          healthDelta += sc.healingPerTick * (0.75 + 0.25 * endur);
+          healed = true;
+        }
+        nextHealth = Math.min(1.0, Math.max(0, curHealth + healthDelta));
+      }
+      draftNextHealth[dIdx] = nextHealth;
 
-        for (let fIdx = dStart; fIdx < dEnd; fIdx++) {
-          const fFlags = draftFlags[fIdx];
-          if ((fFlags & (FLAG_FEMALE | FLAG_ELIGIBLE)) !== (FLAG_FEMALE | FLAG_ELIGIBLE)) continue;
-          if ((fFlags & FLAG_DIED) !== 0) continue;
+      if (healed) {
+        draftFlags[dIdx] |= FLAG_HEALED;
+        const healCostQ = _scaleByRatio(draftMetabolicDemandQ[dIdx], 10, 100, 'floor');
+        draftHealingDemandQ[dIdx] = healCostQ > 1 ? healCostQ : 1;
+      }
 
-          const female = draftOrg[fIdx];
-          const mIdx = this.findMateDraftFast(
-            draftOrgId[fIdx],
-            female.x,
-            female.y,
-            draftCellIndex[fIdx],
-            cellHead,
-            cellNext,
-            rawActive,
-            activeToDraft,
-            unsortedMap
-          );
-          if (mIdx === -1) continue;
-
-          const male = draftOrg[mIdx];
-          const nestCellIdx = this.chooseNestCell(
-            female.x,
-            female.y,
-            draftCellIndex[fIdx],
-            cellCounts,
-            reproductionRng
-          );
-          const nestY = (nestCellIdx / gridWidth) | 0;
-          const nestX = nestCellIdx - nestY * gridWidth;
-
-          const fStage = draftNextStage[fIdx];
-          const mStage = draftNextStage[mIdx];
-
-          if ((fStage === STAGE_ELDER || mStage === STAGE_ELDER) && !reproductionRng.chance(elderFertMul)) {
-            draftFlags[fIdx] &= ~FLAG_ELIGIBLE;
-            if (mStage === STAGE_ELDER) {
-              draftFlags[mIdx] &= ~FLAG_ELIGIBLE;
-            }
-            if (reproPlanCount >= this.rpCap) {
-              this.ensureReproPlanCapacity(reproPlanCount + 1);
-            }
-            const rpIdx = reproPlanCount++;
-            this.rpFemaleDraft[rpIdx] = fIdx;
-            this.rpMaleDraft[rpIdx] = mIdx;
-            this.rpStatus[rpIdx] = 1; // elder-miss
-            this.rpFemaleCd[rpIdx] = fStage === STAGE_ELDER ? elderCooldown : draftNextCooldown[fIdx];
-            this.rpMaleCd[rpIdx] = mStage === STAGE_ELDER ? elderCooldown : draftNextCooldown[mIdx];
-            this.rpFatherMatingDemandQ[rpIdx] = 0;
-            this.rpEggStart[rpIdx] = eggPlanCount;
-            this.rpEggCount[rpIdx] = 0;
-            continue;
+      let deathCause: DeathCause | null = null;
+      if (nextStageCode === STAGE_EGG) {
+        if (nextHealth <= 0) {
+          deathCause = tStress > 0.25 ? 'thermal-stress' : 'incubation-failure';
+        }
+      } else if (nextHealth <= 0) {
+        if (nextEnergy <= 0 && tStress <= 0.15) deathCause = 'starvation';
+        else if (tStress > 0.15) deathCause = 'thermal-stress';
+        else deathCause = 'starvation';
+      } else if (nextStageCode === STAGE_ELDER) {
+        const genArr = org.phenotype.geneticExpression;
+        const pIdx = sc.idx;
+        const endGen = pIdx.endurance >= 0 ? genArr[pIdx.endurance] : sc.baseEndurance;
+        const metGen =
+          pIdx.metabolismEfficiency >= 0 ? genArr[pIdx.metabolismEfficiency] : sc.baseMetabolismEfficiency;
+        const modifier = 0.8 + 0.14 * endGen + 0.08 * metGen;
+        const maxLife = Math.max(sc.elderLifeFloor, Math.round(sc.maxLifespanTicks * modifier));
+        if (nextAgeTicks >= maxLife) {
+          deathCause = 'old-age';
+        } else {
+          const bioAge = nextAgeTicks / sc.tpy;
+          const maxBio = maxLife / sc.tpy;
+          const elderProgress = (bioAge - sc.elderBio) / Math.max(sc.minBioStep, maxBio - sc.elderBio);
+          const hazard = Math.min(0.35, 0.015 + elderProgress * elderProgress * 0.16);
+          if (lifecycleRng.chance(hazard)) {
+            deathCause = 'old-age';
           }
+        }
+      }
 
-          const clutchSize =
-            clutchMin === clutchMax ? clutchMin : reproductionRng.nextInt(clutchMin, clutchMax);
+      if (deathCause !== null) {
+        draftFlags[dIdx] |= FLAG_DIED;
+        draftDeathCause[dIdx] = deathCause;
+        draftNextHealth[dIdx] = 0;
+        diedCount++;
+      } else if (
+        (nextStageCode === STAGE_ADULT || nextStageCode === STAGE_ELDER) &&
+        draftNextCooldown[dIdx] === 0 &&
+        nextEnergy >= sc.minEnergyToReproduce &&
+        nextHealth >= sc.minHealthToReproduce
+      ) {
+        draftFlags[dIdx] |= FLAG_ELIGIBLE;
+        speciesEligibleCounts[sIdx] += 1;
+      }
+    }
 
+    this.curDiedCount = diedCount;
+  }
+
+  private planReproductionPhase(
+    sCount: number,
+    speciesCaches: SpeciesRuntimeCache[],
+    geneticsRng: SeededRng,
+    mutationRng: SeededRng,
+    reproductionRng: SeededRng,
+    targetTick: number,
+    plannedNextId: number
+  ): number {
+    let reproPlanCount = 0;
+    let eggPlanCount = 0;
+    const trackMut = this.trackMutationEvents;
+    const gridWidth = this.grid.width;
+
+    const popBySpeciesIdx = this.stepPopBySpeciesIdx;
+    const speciesEligibleCounts = this.stepSpeciesEligibleCounts;
+    const speciesWasCanonical = this.stepSpeciesWasCanonical;
+    const speciesActiveMapOffsets = this.stepSpeciesActiveMapOffsets;
+    const unsortedIdToDraftMaps = this.stepUnsortedIdToDraftMaps;
+    const speciesDraftStart = this.stepSpeciesDraftStart;
+    const speciesDraftEnd = this.stepSpeciesDraftEnd;
+    const speciesEggStart = this.stepSpeciesEggStart;
+    const speciesEggCount = this.stepSpeciesEggCount;
+
+    const draftFlags = this.draftFlags;
+    const draftOrg = this.draftOrg;
+    const draftOrgId = this.draftOrgId;
+    const draftCellIndex = this.draftCellIndex;
+    const draftNextStage = this.draftNextStage;
+    const draftNextCooldown = this.draftNextCooldown;
+    const draftPostMetabResQ = this.draftPostMetabResQ;
+    const draftMetabolicDemandQ = this.draftMetabolicDemandQ;
+    const mateCellCursor = this.mateCellCursor;
+    const mateCellTouched = this.mateCellTouched;
+
+    for (let s = 0; s < sCount; s++) {
+      const pop = popBySpeciesIdx[s];
+      if (!pop || speciesEligibleCounts[s] < 2) continue;
+
+      pop.ensureSpatialIndex();
+      const cellHead = pop.getSpatialIndexHead();
+      const cellNext = pop.getSpatialIndexNext();
+      const cellCounts = pop.getCellCountsBuffer();
+      const rawActive = pop.getActiveOrganisms();
+      const isCanonical = speciesWasCanonical[s] === 1;
+      const activeToDraft = isCanonical
+        ? this.activeIdxToDraftIdx.subarray(speciesActiveMapOffsets[s])
+        : this.activeIdxToDraftIdx;
+      const unsortedMap = unsortedIdToDraftMaps[s];
+
+      const sc = speciesCaches[s];
+      const species = sc.species;
+      const schema = sc.schema;
+      const locusCount = sc.locusCount;
+      const mutPlan = sc.mutationPlan;
+      const eggActualInitNorm = sc.eggActualInitNorm;
+      const femaleProb = sc.femaleProbability;
+      const elderFertMul = sc.elderFertilityMultiplier;
+      const cooldownTicks = sc.cooldownTicks;
+      const elderCooldown = sc.elderCooldown;
+      const clutchMin = sc.clutchSizeMin;
+      const clutchMax = sc.clutchSizeMax;
+
+      const dStart = speciesDraftStart[s];
+      const dEnd = speciesDraftEnd[s];
+      speciesEggStart[s] = eggPlanCount;
+      this.mateTouchedCount = 0;
+
+      for (let fIdx = dStart; fIdx < dEnd; fIdx++) {
+        const fFlags = draftFlags[fIdx];
+        if ((fFlags & (FLAG_FEMALE | FLAG_ELIGIBLE)) !== (FLAG_FEMALE | FLAG_ELIGIBLE)) continue;
+        if ((fFlags & FLAG_DIED) !== 0) continue;
+
+        const female = draftOrg[fIdx];
+        const mIdx = isCanonical
+          ? this.findMateDraftWithCursor(
+              female.x,
+              female.y,
+              draftCellIndex[fIdx],
+              cellHead,
+              cellNext,
+              rawActive,
+              activeToDraft
+            )
+          : this.findMateDraftFast(
+              draftOrgId[fIdx],
+              female.x,
+              female.y,
+              draftCellIndex[fIdx],
+              cellHead,
+              cellNext,
+              rawActive,
+              activeToDraft,
+              unsortedMap
+            );
+        if (mIdx === -1) continue;
+
+        const male = draftOrg[mIdx];
+        const nestCellIdx = this.chooseNestCell(
+          female.x,
+          female.y,
+          draftCellIndex[fIdx],
+          cellCounts,
+          reproductionRng
+        );
+        const nestY = (nestCellIdx / gridWidth) | 0;
+        const nestX = nestCellIdx - nestY * gridWidth;
+
+        const fStage = draftNextStage[fIdx];
+        const mStage = draftNextStage[mIdx];
+
+        if ((fStage === STAGE_ELDER || mStage === STAGE_ELDER) && !reproductionRng.chance(elderFertMul)) {
           draftFlags[fIdx] &= ~FLAG_ELIGIBLE;
-          draftFlags[mIdx] &= ~FLAG_ELIGIBLE;
-
-          if (clutchSize <= 0) {
-            if (reproPlanCount >= this.rpCap) {
-              this.ensureReproPlanCapacity(reproPlanCount + 1);
-            }
-            const rpIdx = reproPlanCount++;
-            this.rpFemaleDraft[rpIdx] = fIdx;
-            this.rpMaleDraft[rpIdx] = mIdx;
-            this.rpStatus[rpIdx] = 2; // zero-clutch
-            this.rpFemaleCd[rpIdx] = cooldownTicks;
-            this.rpMaleCd[rpIdx] = cooldownTicks;
-            this.rpFatherMatingDemandQ[rpIdx] = 0;
-            this.rpEggStart[rpIdx] = eggPlanCount;
-            this.rpEggCount[rpIdx] = 0;
-            continue;
+          if (mStage === STAGE_ELDER) {
+            draftFlags[mIdx] &= ~FLAG_ELIGIBLE;
           }
-
-          if (eggPlanCount + clutchSize > this.eggCap) {
-            this.ensureEggPlanCapacity(eggPlanCount + clutchSize);
-          }
-
-          const rpEggStartIdx = eggPlanCount;
-          const childGeneration = (female.generation > male.generation ? female.generation : male.generation) + 1;
-          const fDom = female.genome.dominance;
-          const mDom = male.genome.dominance;
-
-          for (let c = 0; c < clutchSize; c++) {
-            const maternalGamete = createHaploidGamete(female.genome, schema, geneticsRng);
-            const paternalGamete = createHaploidGamete(male.genome, schema, geneticsRng);
-            const dominance = new Float32Array(locusCount);
-            for (let l = 0; l < locusCount; l++) {
-              const dA = fDom[l];
-              const dB = mDom[l];
-              dominance[l] = dA === dB ? dA : geneticsRng.chance(0.5) ? dA : dB;
-            }
-            const childGenome = {
-              schemaId: schema.id,
-              maternalAlleles: maternalGamete,
-              paternalAlleles: paternalGamete,
-              dominance,
-            };
-
-            const mutOutcome = mutateGenomeWithPlan(childGenome, mutPlan, mutationRng, trackMut);
-            const sex: Sex = reproductionRng.chance(femaleProb) ? 'female' : 'male';
-            const child = createOrganism({
-              id: plannedNextId++,
-              species,
-              sex,
-              x: nestX,
-              y: nestY,
-              cellIndex: nestCellIdx,
-              birthTick: targetTick,
-              generation: childGeneration,
-              parentAId: female.id,
-              parentBId: male.id,
-              genome: childGenome,
-              stage: 'egg',
-              ageTicks: 0,
-              health: 1.0,
-              energy: eggActualInitNorm,
-              mutationsReceived: mutOutcome.mutationCount,
-              skipInitialPhenotype: true,
-            });
-
-            const epIdx = eggPlanCount++;
-            this.eggOrg[epIdx] = child;
-            this.eggSpeciesIdx[epIdx] = s;
-            this.eggDraftSlot[epIdx] = -1;
-            this.eggIsReused[epIdx] = 0;
-            this.eggProvisioned[epIdx] = 0;
-            this.eggMutationRecords[epIdx] = trackMut ? mutOutcome.records : undefined;
-          }
-
-          const malePostFeedResQ = draftPostMetabResQ[mIdx];
-          const matingEuCost = euToQ(qToMU(malePostFeedResQ) * 5, 'floor');
-          const matingCap = scaleByRatio(draftMetabolicDemandQ[mIdx], 35, 100, 'floor');
-          const fatherMatingDemandQ = Math.max(0, matingEuCost < matingCap ? matingEuCost : matingCap);
-
           if (reproPlanCount >= this.rpCap) {
             this.ensureReproPlanCapacity(reproPlanCount + 1);
           }
           const rpIdx = reproPlanCount++;
           this.rpFemaleDraft[rpIdx] = fIdx;
           this.rpMaleDraft[rpIdx] = mIdx;
-          this.rpStatus[rpIdx] = 0; // ok
+          this.rpStatus[rpIdx] = 1; // elder-miss
+          this.rpFemaleCd[rpIdx] = fStage === STAGE_ELDER ? elderCooldown : draftNextCooldown[fIdx];
+          this.rpMaleCd[rpIdx] = mStage === STAGE_ELDER ? elderCooldown : draftNextCooldown[mIdx];
+          this.rpFatherMatingDemandQ[rpIdx] = 0;
+          this.rpEggStart[rpIdx] = eggPlanCount;
+          this.rpEggCount[rpIdx] = 0;
+          continue;
+        }
+
+        const clutchSize =
+          clutchMin === clutchMax ? clutchMin : reproductionRng.nextInt(clutchMin, clutchMax);
+
+        draftFlags[fIdx] &= ~FLAG_ELIGIBLE;
+        draftFlags[mIdx] &= ~FLAG_ELIGIBLE;
+
+        if (clutchSize <= 0) {
+          if (reproPlanCount >= this.rpCap) {
+            this.ensureReproPlanCapacity(reproPlanCount + 1);
+          }
+          const rpIdx = reproPlanCount++;
+          this.rpFemaleDraft[rpIdx] = fIdx;
+          this.rpMaleDraft[rpIdx] = mIdx;
+          this.rpStatus[rpIdx] = 2; // zero-clutch
           this.rpFemaleCd[rpIdx] = cooldownTicks;
           this.rpMaleCd[rpIdx] = cooldownTicks;
-          this.rpFatherMatingDemandQ[rpIdx] = fatherMatingDemandQ;
-          this.rpEggStart[rpIdx] = rpEggStartIdx;
-          this.rpEggCount[rpIdx] = clutchSize;
+          this.rpFatherMatingDemandQ[rpIdx] = 0;
+          this.rpEggStart[rpIdx] = eggPlanCount;
+          this.rpEggCount[rpIdx] = 0;
+          continue;
         }
 
-        speciesEggCount[s] = eggPlanCount - speciesEggStart[s];
-      }
+        if (eggPlanCount + clutchSize > this.eggCap) {
+          this.ensureEggPlanCapacity(eggPlanCount + clutchSize);
+        }
 
-      // =========================================================================
-      // PHASE 2.5: PRE_ALLOCATE (Between transactions — zero semantic state mutated)
-      // =========================================================================
-      this.onPhase?.({ tick: targetTick, phase: 'PRE_ALLOCATE' });
+        const rpEggStartIdx = eggPlanCount;
+        const childGeneration = (female.generation > male.generation ? female.generation : male.generation) + 1;
+        const fDom = female.genome.dominance;
+        const mDom = male.genome.dominance;
 
-      let freshCursor = this.nextFreshOrganismSlot;
-      let freeAvail = this.freeOrganismSlots.length;
-      if (eggPlanCount > 0) {
-        const slots = this.slotPlanSlots;
-        const reused = this.slotPlanReused;
-        const freeSlots = this.freeOrganismSlots;
-        for (let i = 0; i < eggPlanCount; i++) {
-          if (freeAvail > 0) {
-            freeAvail -= 1;
-            slots[i] = freeSlots[freeAvail];
-            reused[i] = 1;
+        const speciesIdStr = species.id;
+        const schemaIdStr = schema.id;
+        for (let c = 0; c < clutchSize; c++) {
+          const maternalGamete = _createHaploidGamete(female.genome, schema, geneticsRng);
+          const paternalGamete = _createHaploidGamete(male.genome, schema, geneticsRng);
+          const dominance = new Float32Array(locusCount);
+          if (locusCount === 10) {
+            let dA = fDom[0], dB = mDom[0]; dominance[0] = dA === dB ? dA : geneticsRng.chance(0.5) ? dA : dB;
+            dA = fDom[1]; dB = mDom[1]; dominance[1] = dA === dB ? dA : geneticsRng.chance(0.5) ? dA : dB;
+            dA = fDom[2]; dB = mDom[2]; dominance[2] = dA === dB ? dA : geneticsRng.chance(0.5) ? dA : dB;
+            dA = fDom[3]; dB = mDom[3]; dominance[3] = dA === dB ? dA : geneticsRng.chance(0.5) ? dA : dB;
+            dA = fDom[4]; dB = mDom[4]; dominance[4] = dA === dB ? dA : geneticsRng.chance(0.5) ? dA : dB;
+            dA = fDom[5]; dB = mDom[5]; dominance[5] = dA === dB ? dA : geneticsRng.chance(0.5) ? dA : dB;
+            dA = fDom[6]; dB = mDom[6]; dominance[6] = dA === dB ? dA : geneticsRng.chance(0.5) ? dA : dB;
+            dA = fDom[7]; dB = mDom[7]; dominance[7] = dA === dB ? dA : geneticsRng.chance(0.5) ? dA : dB;
+            dA = fDom[8]; dB = mDom[8]; dominance[8] = dA === dB ? dA : geneticsRng.chance(0.5) ? dA : dB;
+            dA = fDom[9]; dB = mDom[9]; dominance[9] = dA === dB ? dA : geneticsRng.chance(0.5) ? dA : dB;
           } else {
-            slots[i] = freshCursor++;
-            reused[i] = 0;
-          }
-          this.eggDraftSlot[i] = slots[i];
-          this.eggIsReused[i] = reused[i];
-        }
-        this.ensureEntityCapacity(freshCursor);
-        slotCarryCreditQ = this.slotCarryCreditQ;
-        slotLastSyncedEnergy = this.slotLastSyncedEnergy;
-
-        for (let s = 0; s < sCount; s++) {
-          const eCnt = speciesEggCount[s];
-          if (eCnt <= 0) continue;
-          const pop = popBySpeciesIdx[s]!;
-          const eStart = speciesEggStart[s];
-          pop.validateBatchRange(this.eggOrg, eStart, eStart + eCnt);
-          pop.reserveAdditionalCapacity(eCnt);
-        }
-      }
-
-      // =========================================================================
-      // PHASE 3: PREPARE (Open EnergyTransaction -> Stage all postings -> tx.prepare())
-      // =========================================================================
-      tx = this.ledger.begin(targetTick);
-
-      // 3a. Legacy external FoodProvider tick regeneration (only in legacy mode)
-      if (isLegacyMode && this.foodProvider.stepTick) {
-        this.foodProvider.stepTick(targetTick);
-      }
-
-      // 3b. Photosynthesis (SUN + ABIOTIC -> CELL_PLANT)
-      for (let i = 0; i < photoCount; i++) {
-        const cIdx = photoCellIdx[i];
-        tx.postMass(PR_PHOTOSYNTHESIS, AK_ABIOTIC, 0, AK_CELL_PLANT, cIdx, photoGainMassQ[i]);
-        tx.postEnergy(PR_PHOTOSYNTHESIS, AK_SUN, 0, AK_CELL_PLANT, cIdx, photoGainEnergyQ[i]);
-      }
-
-      // 3c. Conservative prey regeneration (CELL_PLANT + CELL_DETRITUS -> preyStore slots)
-      if (conservativePreyProvider) {
-        conservativePreyProvider.stepTickConservative(tx, targetTick);
-      }
-
-      // 3d. Reconcile any legacy test-harness edits to `org.energy` before metabolism/feeding
-      if (isLegacyMode) {
-        for (let ci = 0; ci < draftCount; ci++) {
-          const dIdx = draftCanonicalOrder[ci];
-          const extDeltaQ = draftExternalDeltaQ[dIdx];
-          const slot = draftSlot[dIdx];
-          if (extDeltaQ < 0) {
-            const avail = entityStore.reserveMassQ(slot);
-            const drainM = -extDeltaQ < avail ? -extDeltaQ : avail;
-            if (drainM > 0) {
-              tx.postMass(PR_METABOLISM, AK_ORGANISM_RESERVE, slot, AK_ABIOTIC, 0, drainM);
-              tx.postEnergy(
-                PR_METABOLISM,
-                AK_ORGANISM_RESERVE,
-                slot,
-                AK_HEAT,
-                0,
-                drainM <= RESERVE_SAFE_MASS_LIMIT ? drainM * 30 : energyOfMass(drainM, RHO_RESERVE)
-              );
+            for (let l = 0; l < locusCount; l++) {
+              const dA = fDom[l];
+              const dB = mDom[l];
+              dominance[l] = dA === dB ? dA : geneticsRng.chance(0.5) ? dA : dB;
             }
-          } else if (extDeltaQ > 0) {
-            const addM = extDeltaQ;
-            const addE = addM <= RESERVE_SAFE_MASS_LIMIT ? addM * 30 : energyOfMass(addM, RHO_RESERVE);
-            this.reusableExternalDelta.massQ = addM;
-            this.reusableExternalDelta.energyQ = addE;
-            this.ledger.importExternal(LEGACY_FOOD_ESCROW_SLOT, this.reusableExternalProvider);
-            tx.transferBiomass(
-              PostingReason.INGESTION,
-              AccountKind.ESCROW,
-              LEGACY_FOOD_ESCROW_SLOT,
-              AK_ORGANISM_RESERVE,
-              slot,
-              addM,
-              addE
-            );
           }
+          const childGenome = {
+            schemaId: schemaIdStr,
+            maternalAlleles: maternalGamete,
+            paternalAlleles: paternalGamete,
+            dominance,
+          };
+
+          let mutCount: number;
+          let mutRecords: readonly MutationRecord[] | undefined;
+          if (trackMut) {
+            const mutOutcome = _mutateGenomeWithPlan(childGenome, mutPlan, mutationRng, true);
+            mutCount = mutOutcome.mutationCount;
+            mutRecords = mutOutcome.records;
+          } else {
+            mutCount = _mutateGenomeWithPlanCount(childGenome, mutPlan, mutationRng);
+            mutRecords = undefined;
+          }
+          const sex: Sex = reproductionRng.chance(femaleProb) ? 'female' : 'male';
+          const child: Organism = {
+            id: plannedNextId++,
+            speciesId: speciesIdStr,
+            sex,
+            generation: childGeneration,
+            parentAId: female.id,
+            parentBId: male.id,
+            birthTick: targetTick,
+            genome: childGenome,
+            phenotype: {
+              schemaId: schemaIdStr,
+              geneticExpression: new Float32Array(locusCount),
+              expressed: new Float32Array(locusCount),
+            },
+            x: nestX,
+            y: nestY,
+            cellIndex: nestCellIdx,
+            ageTicks: 0,
+            stage: 'egg',
+            health: 1.0,
+            energy: eggActualInitNorm,
+            alive: true,
+            deathTick: null,
+            deathCause: 'none',
+            reproductionCooldown: 0,
+            offspringCount: 0,
+            mutationsReceived: mutCount,
+          };
+
+          const epIdx = eggPlanCount++;
+          this.eggOrg[epIdx] = child;
+          this.eggSpeciesIdx[epIdx] = s;
+          this.eggDraftSlot[epIdx] = -1;
+          this.eggIsReused[epIdx] = 0;
+          this.eggProvisioned[epIdx] = 0;
+          this.eggMutationRecords[epIdx] = mutRecords;
         }
+
+        const malePostFeedResQ = draftPostMetabResQ[mIdx];
+        const matingEuCost = _euToQFloorFast(_qToMU(malePostFeedResQ) * 5);
+        const matingCap = _scaleByRatio(draftMetabolicDemandQ[mIdx], 35, 100, 'floor');
+        const fatherMatingDemandQ = Math.max(0, matingEuCost < matingCap ? matingEuCost : matingCap);
+
+        if (reproPlanCount >= this.rpCap) {
+          this.ensureReproPlanCapacity(reproPlanCount + 1);
+        }
+        const rpIdx = reproPlanCount++;
+        this.rpFemaleDraft[rpIdx] = fIdx;
+        this.rpMaleDraft[rpIdx] = mIdx;
+        this.rpStatus[rpIdx] = 0; // ok
+        this.rpFemaleCd[rpIdx] = cooldownTicks;
+        this.rpMaleCd[rpIdx] = cooldownTicks;
+        this.rpFatherMatingDemandQ[rpIdx] = fatherMatingDemandQ;
+        this.rpEggStart[rpIdx] = rpEggStartIdx;
+        this.rpEggCount[rpIdx] = clutchSize;
       }
 
-      // 3e. Organism baseline & healing metabolism
-      const useDirectEntity = this.useDirectEntityStore;
-      const useDirectGrid = this.useDirectEnergyGrid;
-      const metabScratch = this.metabScratch;
+      const mtc = this.mateTouchedCount;
+      for (let t = 0; t < mtc; t++) {
+        mateCellCursor[mateCellTouched[t]] = -2;
+      }
+      this.mateTouchedCount = 0;
+      speciesEggCount[s] = eggPlanCount - speciesEggStart[s];
+    }
 
+    this.curReproPlanCount = reproPlanCount;
+    this.curEggPlanCount = eggPlanCount;
+    return plannedNextId;
+  }
+
+  private stagePoolForaging(
+    tx: EnergyTransaction,
+    speciesCaches: SpeciesRuntimeCache[],
+    targetTick: number,
+    useDirectEntity: boolean,
+    useDirectGrid: boolean,
+    poolKind: 0 | 1 | 2, // 0=plant, 1=detritus, 2=carrion
+    externalSrc: TransactionalFoodSource | undefined,
+    escrowSlot: number,
+    reqOrGrantArr: Float64Array,
+    entityBack: readonly Float64Array[] | null,
+    gridBack: readonly Float64Array[] | null
+  ): void {
+    const draftCount = this.curDraftCount;
+    const draftCanonicalOrder = this.draftCanonicalOrder;
+    const draftFlags = this.draftFlags;
+    const draftSpeciesIdx = this.draftSpeciesIdx;
+    const draftCellIndex = this.draftCellIndex;
+    const draftSlot = this.draftSlot;
+    const draftStructMassQ = this.draftStructMassQ;
+    const draftMaxReserveMassQ = this.draftMaxReserveMassQ;
+    const feedScratch = this.feedScratch;
+    const entityStore = this.entityStore;
+    const energyGrid = this.energyGrid;
+
+    if (externalSrc) {
+      const draftOrgId = this.draftOrgId;
+      const reqs: CompetitiveConsumerRequest[] = [];
       for (let ci = 0; ci < draftCount; ci++) {
         const dIdx = draftCanonicalOrder[ci];
-        const healQ = draftHealingDemandQ[dIdx];
-        const extDeltaQ = draftExternalDeltaQ[dIdx];
-        const slot = draftSlot[dIdx];
-        if (healQ === 0 && extDeltaQ === 0) {
-          const burnMassQ = draftBurnMassQ[dIdx];
-          if (burnMassQ > 0) {
-            tx.postMass(PR_METABOLISM, AK_ORGANISM_RESERVE, slot, AK_ABIOTIC, 0, burnMassQ);
-            tx.postEnergy(
-              PR_METABOLISM,
-              AK_ORGANISM_RESERVE,
-              slot,
-              AK_HEAT,
-              0,
-              burnMassQ <= RESERVE_SAFE_MASS_LIMIT ? burnMassQ * 30 : energyOfMass(burnMassQ, RHO_RESERVE)
-            );
-          }
-        } else {
-          const stagedResM = useDirectEntity
-            ? entityStore.stagedReserveMassUnsafe(slot)
-            : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, slot));
-          const totalBurnDemandQ = safeAdd(draftMetabolicDemandQ[dIdx], healQ);
-          stageMetabolismFast(tx, slot, stagedResM, totalBurnDemandQ, draftCarryCreditQ[dIdx], metabScratch);
-          draftPostMetabCarryQ[dIdx] = metabScratch.nextCarryCreditQ;
+        const reqM = reqOrGrantArr[dIdx];
+        if (reqM <= 0 || (draftFlags[dIdx] & FLAG_DIED) !== 0) continue;
+        const sc = speciesCaches[draftSpeciesIdx[dIdx]];
+        const cellIdx = draftCellIndex[dIdx];
+        reqs.push({
+          organismId: draftOrgId[dIdx],
+          entitySlot: draftSlot[dIdx],
+          cellIndex: cellIdx,
+          detritusCellIndex: cellIdx,
+          requestedMassQ: reqM,
+          profile: sc.profile,
+          escrowSlot,
+        });
+      }
+      if (reqs.length > 0) {
+        stageCompetitiveTransactionalForaging(
+          this.ledger,
+          tx,
+          externalSrc,
+          entityStore,
+          reqs,
+          targetTick
+        );
+      }
+      return;
+    }
+
+    const esStructBack = entityBack ? entityBack[0] : null;
+    const esResBack = entityBack ? entityBack[2] : null;
+    const plantBack = gridBack ? gridBack[0] : null;
+    const carrionMBack = gridBack ? gridBack[2] : null;
+    const carrionEBack = gridBack ? gridBack[3] : null;
+    const detritusBack = gridBack ? gridBack[4] : null;
+
+    for (let ci = 0; ci < draftCount; ci++) {
+      const dIdx = draftCanonicalOrder[ci];
+      const grantM = reqOrGrantArr[dIdx];
+      if (grantM <= 0 || (draftFlags[dIdx] & FLAG_DIED) !== 0) continue;
+
+      const slot = draftSlot[dIdx];
+      const stagedStructM = esStructBack !== null
+        ? esStructBack[slot]
+        : useDirectEntity
+          ? entityStore.stagedStructMassUnsafe(slot)
+          : Number(tx.stagedMassQ(AK_ORGANISM_STRUCT, slot));
+      const stagedResM = esResBack !== null
+        ? esResBack[slot]
+        : useDirectEntity
+          ? entityStore.stagedReserveMassUnsafe(slot)
+          : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, slot));
+      const pq = speciesCaches[draftSpeciesIdx[dIdx]].pq;
+      let maxResM: number;
+      if (stagedStructM === draftStructMassQ[dIdx]) {
+        maxResM = draftMaxReserveMassQ[dIdx];
+      } else {
+        const prod = stagedStructM * pq.maxReserveRatioScaled;
+        maxResM =
+          prod <= LOCAL_MAX_SAFE_INT
+            ? (prod - (prod % LOCAL_PPM)) / LOCAL_PPM
+            : _scaleByRatio(stagedStructM, pq.maxReserveRatioScaled, LOCAL_PPM, 'floor');
+      }
+      const headroom = maxResM > stagedResM ? maxResM - stagedResM : 0;
+      if (headroom <= 0) continue;
+
+      const cellIdx = draftCellIndex[dIdx];
+      if (poolKind === 0) {
+        const availM = plantBack !== null
+          ? plantBack[cellIdx]
+          : useDirectGrid
+            ? energyGrid.getStagedMassUnsafe(POOL_PLANT, cellIdx)
+            : Number(tx.stagedMassQ(AK_CELL_PLANT, cellIdx));
+        const biteM = grantM < availM ? grantM : availM;
+        if (biteM > 0) {
+          _stageFeedingFast(
+            tx,
+            AK_CELL_PLANT,
+            cellIdx,
+            slot,
+            cellIdx,
+            biteM,
+            biteM <= PLANT_SAFE_MASS_LIMIT ? biteM * 3 : _energyOfMass(biteM, _RHO_PLANT),
+            pq.absorptionPpm,
+            pq.assimilationPpm,
+            pq.sdaPpm,
+            headroom,
+            feedScratch
+          );
+        }
+      } else if (poolKind === 1) {
+        const availM = detritusBack !== null
+          ? detritusBack[cellIdx]
+          : useDirectGrid
+            ? energyGrid.getStagedMassUnsafe(POOL_DETRITUS, cellIdx)
+            : Number(tx.stagedMassQ(AK_CELL_DETRITUS, cellIdx));
+        const biteM = grantM < availM ? grantM : availM;
+        if (biteM > 0) {
+          _stageFeedingFast(
+            tx,
+            AK_CELL_DETRITUS,
+            cellIdx,
+            slot,
+            cellIdx,
+            biteM,
+            biteM <= PLANT_SAFE_MASS_LIMIT ? biteM * 3 : _energyOfMass(biteM, _RHO_DETRITUS),
+            pq.absorptionPpm,
+            pq.assimilationPpm,
+            pq.sdaPpm,
+            headroom,
+            feedScratch
+          );
+        }
+      } else {
+        const carrionM = carrionMBack !== null
+          ? carrionMBack[cellIdx]
+          : useDirectGrid
+            ? energyGrid.getStagedMassUnsafe(POOL_CARRION, cellIdx)
+            : Number(tx.stagedMassQ(AK_CELL_CARRION, cellIdx));
+        if (carrionM > 0) {
+          const carrionE = carrionEBack !== null
+            ? carrionEBack[cellIdx]
+            : useDirectGrid
+              ? energyGrid.getStagedEnergyUnsafe(POOL_CARRION, cellIdx)
+              : Number(tx.stagedEnergyQ(AK_CELL_CARRION, cellIdx));
+          _stageCarrionScavengeFast(
+            tx,
+            cellIdx,
+            carrionM,
+            carrionE,
+            slot,
+            cellIdx,
+            grantM,
+            pq.absorptionPpm,
+            pq.assimilationPpm,
+            pq.sdaPpm,
+            headroom,
+            feedScratch
+          );
         }
       }
+    }
+  }
 
-      // 3f. Foraging: external TransactionalFoodSources OR internal GridPool / EntityPrey / LegacyProvider
-      const stagePoolForaging = (
-        poolKind: 0 | 1 | 2, // 0=plant, 1=detritus, 2=carrion
-        externalSrc: TransactionalFoodSource | undefined,
-        escrowSlot: number,
-        reqOrGrantArr: Float64Array
-      ) => {
-        if (externalSrc) {
-          const reqs: CompetitiveConsumerRequest[] = [];
-          for (let ci = 0; ci < draftCount; ci++) {
-            const dIdx = draftCanonicalOrder[ci];
-            const reqM = reqOrGrantArr[dIdx];
-            if (reqM <= 0 || (draftFlags[dIdx] & FLAG_DIED) !== 0) continue;
-            const sc = speciesCaches[draftSpeciesIdx[dIdx]];
-            const cellIdx = draftCellIndex[dIdx];
-            reqs.push({
-              organismId: draftOrgId[dIdx],
-              entitySlot: draftSlot[dIdx],
-              cellIndex: cellIdx,
-              detritusCellIndex: cellIdx,
-              requestedMassQ: reqM,
-              profile: sc.profile,
-              escrowSlot,
-            });
+  private runPrepareStages(
+    tx: EnergyTransaction,
+    targetTick: number,
+    speciesCaches: SpeciesRuntimeCache[],
+    isLegacyMode: boolean,
+    hasAnyExternalSource: boolean,
+    conservativePreyProvider: DeterministicPreyFoodProvider | null
+  ): void {
+    const draftCount = this.curDraftCount;
+    const draftCanonicalOrder = this.draftCanonicalOrder;
+    const draftSlot = this.draftSlot;
+    const draftFlags = this.draftFlags;
+    const draftCellIndex = this.draftCellIndex;
+    const draftSpeciesIdx = this.draftSpeciesIdx;
+    const draftStructMassQ = this.draftStructMassQ;
+    const draftMaxReserveMassQ = this.draftMaxReserveMassQ;
+    const draftCarryCreditQ = this.draftCarryCreditQ;
+    const draftExternalDeltaQ = this.draftExternalDeltaQ;
+    const draftMetabolicDemandQ = this.draftMetabolicDemandQ;
+    const draftHealingDemandQ = this.draftHealingDemandQ;
+    const draftBurnMassQ = this.draftBurnMassQ;
+    const draftPostMetabCarryQ = this.draftPostMetabCarryQ;
+    const draftNextCooldown = this.draftNextCooldown;
+    const draftOffspringDelta = this.draftOffspringDelta;
+    const draftGrowthTargetStructQ = this.draftGrowthTargetStructQ;
+    const draftNextStage = this.draftNextStage;
+
+    const entityStore = this.entityStore;
+    const energyGrid = this.energyGrid;
+    const useDirectEntity = this.useDirectEntityStore;
+    const useDirectGrid = this.useDirectEnergyGrid;
+    const entityBack = useDirectEntity ? entityStore._getChannelStore().back : null;
+    const gridBack = useDirectGrid ? energyGrid._getChannelStore().back : null;
+    const esStructBack = entityBack ? entityBack[0] : null;
+    const esResBack = entityBack ? entityBack[2] : null;
+    const gridWidth = this.grid.width;
+
+    // 3a. Legacy external FoodProvider tick regeneration (only in legacy mode)
+    if (isLegacyMode && this.foodProvider.stepTick) {
+      this.foodProvider.stepTick(targetTick);
+    }
+
+    // 3b. Photosynthesis (SUN + ABIOTIC -> CELL_PLANT)
+    const photoCount = this.curPhotoCount;
+    if (photoCount > 0) {
+      const photoCellIdx = this.photoCellIdx;
+      const photoGainMassQ = this.photoGainMassQ;
+      const photoGainEnergyQ = this.photoGainEnergyQ;
+      for (let i = 0; i < photoCount; i++) {
+        tx.postPhotosynthesisPairFast(
+          PR_PHOTOSYNTHESIS,
+          AK_CELL_PLANT,
+          photoCellIdx[i],
+          photoGainMassQ[i],
+          photoGainEnergyQ[i]
+        );
+      }
+    }
+
+    // 3c. Conservative prey regeneration (CELL_PLANT + CELL_DETRITUS -> preyStore slots)
+    if (conservativePreyProvider) {
+      conservativePreyProvider.stepTickConservative(tx, targetTick);
+    }
+
+    // 3d. Reconcile any legacy test-harness edits to `org.energy` before metabolism/feeding
+    if (isLegacyMode) {
+      const esResFront = entityStore._getChannelStore().front[2];
+      for (let ci = 0; ci < draftCount; ci++) {
+        const dIdx = draftCanonicalOrder[ci];
+        const extDeltaQ = draftExternalDeltaQ[dIdx];
+        const slot = draftSlot[dIdx];
+        if (extDeltaQ < 0) {
+          const avail = useDirectEntity ? esResFront[slot] : entityStore.reserveMassQ(slot);
+          const drainM = -extDeltaQ < avail ? -extDeltaQ : avail;
+          if (drainM > 0) {
+            const drainE =
+              drainM <= RESERVE_SAFE_MASS_LIMIT ? drainM * 30 : _energyOfMass(drainM, _RHO_RESERVE);
+            tx.postConsumePairFast(PR_METABOLISM, AK_ORGANISM_RESERVE, slot, drainM, drainE);
           }
-          if (reqs.length > 0) {
-            stageCompetitiveTransactionalForaging(
-              this.ledger,
-              tx!,
-              externalSrc,
-              entityStore,
-              reqs,
-              targetTick
-            );
-          }
-          return;
+        } else if (extDeltaQ > 0) {
+          const addM = extDeltaQ;
+          const addE = addM <= RESERVE_SAFE_MASS_LIMIT ? addM * 30 : _energyOfMass(addM, _RHO_RESERVE);
+          this.reusableExternalDelta.massQ = addM;
+          this.reusableExternalDelta.energyQ = addE;
+          this.ledger.importExternal(LEGACY_FOOD_ESCROW_SLOT, this.reusableExternalProvider);
+          tx.transferBiomass(
+            PostingReason.INGESTION,
+            AccountKind.ESCROW,
+            LEGACY_FOOD_ESCROW_SLOT,
+            AK_ORGANISM_RESERVE,
+            slot,
+            addM,
+            addE
+          );
         }
+      }
+    }
 
-        for (let ci = 0; ci < draftCount; ci++) {
-          const dIdx = draftCanonicalOrder[ci];
-          const grantM = reqOrGrantArr[dIdx];
-          if (grantM <= 0 || (draftFlags[dIdx] & FLAG_DIED) !== 0) continue;
-
-          const slot = draftSlot[dIdx];
-          const stagedStructM = useDirectEntity
-            ? entityStore.stagedStructMassUnsafe(slot)
-            : Number(tx!.stagedMassQ(AK_ORGANISM_STRUCT, slot));
-          const stagedResM = useDirectEntity
+    // 3e. Organism baseline & healing metabolism
+    const metabScratch = this.metabScratch;
+    for (let ci = 0; ci < draftCount; ci++) {
+      const dIdx = draftCanonicalOrder[ci];
+      const healQ = draftHealingDemandQ[dIdx];
+      const extDeltaQ = draftExternalDeltaQ[dIdx];
+      const slot = draftSlot[dIdx];
+      if (healQ === 0 && extDeltaQ === 0) {
+        const burnMassQ = draftBurnMassQ[dIdx];
+        if (burnMassQ > 0) {
+          const burnEnergyQ =
+            burnMassQ <= RESERVE_SAFE_MASS_LIMIT
+              ? burnMassQ * 30
+              : _energyOfMass(burnMassQ, _RHO_RESERVE);
+          tx.postConsumePairFast(PR_METABOLISM, AK_ORGANISM_RESERVE, slot, burnMassQ, burnEnergyQ);
+        }
+      } else {
+        const stagedResM = esResBack !== null
+          ? esResBack[slot]
+          : useDirectEntity
             ? entityStore.stagedReserveMassUnsafe(slot)
-            : Number(tx!.stagedMassQ(AK_ORGANISM_RESERVE, slot));
-          const pq = speciesCaches[draftSpeciesIdx[dIdx]].pq;
-          let maxResM: number;
-          if (stagedStructM === draftStructMassQ[dIdx]) {
-            maxResM = draftMaxReserveMassQ[dIdx];
-          } else {
-            const prod = stagedStructM * pq.maxReserveRatioScaled;
-            maxResM =
-              prod <= LOCAL_MAX_SAFE_INT
-                ? (prod - (prod % LOCAL_PPM)) / LOCAL_PPM
-                : scaleByRatio(stagedStructM, pq.maxReserveRatioScaled, LOCAL_PPM, 'floor');
-          }
-          const headroom = maxResM > stagedResM ? maxResM - stagedResM : 0;
-          if (headroom <= 0) continue;
+            : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, slot));
+        const totalBurnDemandQ = _safeAdd(draftMetabolicDemandQ[dIdx], healQ);
+        _stageMetabolismFast(tx, slot, stagedResM, totalBurnDemandQ, draftCarryCreditQ[dIdx], metabScratch);
+        draftPostMetabCarryQ[dIdx] = metabScratch.nextCarryCreditQ;
+      }
+    }
 
-          const cellIdx = draftCellIndex[dIdx];
-          if (poolKind === 0) {
-            const availM = useDirectGrid
-              ? energyGrid.getStagedMassUnsafe(POOL_PLANT, cellIdx)
-              : Number(tx!.stagedMassQ(AK_CELL_PLANT, cellIdx));
-            const biteM = grantM < availM ? grantM : availM;
-            if (biteM > 0) {
-              stageFeedingFast(
-                tx!,
-                AK_CELL_PLANT,
-                cellIdx,
-                slot,
-                cellIdx,
-                biteM,
-                biteM <= PLANT_SAFE_MASS_LIMIT ? biteM * 3 : energyOfMass(biteM, RHO_PLANT),
-                pq.absorptionPpm,
-                pq.assimilationPpm,
-                pq.sdaPpm,
-                headroom,
-                feedScratch
-              );
-            }
-          } else if (poolKind === 1) {
-            const availM = useDirectGrid
-              ? energyGrid.getStagedMassUnsafe(POOL_DETRITUS, cellIdx)
-              : Number(tx!.stagedMassQ(AK_CELL_DETRITUS, cellIdx));
-            const biteM = grantM < availM ? grantM : availM;
-            if (biteM > 0) {
-              stageFeedingFast(
-                tx!,
-                AK_CELL_DETRITUS,
-                cellIdx,
-                slot,
-                cellIdx,
-                biteM,
-                biteM <= PLANT_SAFE_MASS_LIMIT ? biteM * 3 : energyOfMass(biteM, RHO_DETRITUS),
-                pq.absorptionPpm,
-                pq.assimilationPpm,
-                pq.sdaPpm,
-                headroom,
-                feedScratch
-              );
-            }
-          } else {
-            const carrionM = useDirectGrid
-              ? energyGrid.getStagedMassUnsafe(POOL_CARRION, cellIdx)
-              : Number(tx!.stagedMassQ(AK_CELL_CARRION, cellIdx));
-            if (carrionM > 0) {
-              const carrionE = useDirectGrid
-                ? energyGrid.getStagedEnergyUnsafe(POOL_CARRION, cellIdx)
-                : Number(tx!.stagedEnergyQ(AK_CELL_CARRION, cellIdx));
-              stageCarrionScavengeFast(
-                tx!,
-                cellIdx,
-                carrionM,
-                carrionE,
-                slot,
-                cellIdx,
-                grantM,
-                pq.absorptionPpm,
-                pq.assimilationPpm,
-                pq.sdaPpm,
-                headroom,
-                feedScratch
-              );
-            }
-          }
-        }
-      };
-
-      stagePoolForaging(
+    // 3f. Foraging: only iterate pools that actually have requests/grants
+    if (this.externalPlantSource || this.curPlantDirtyCount > 0) {
+      this.stagePoolForaging(
+        tx,
+        speciesCaches,
+        targetTick,
+        useDirectEntity,
+        useDirectGrid,
         0,
         this.externalPlantSource,
         EXTERNAL_PLANT_ESCROW_SLOT,
-        this.externalPlantSource ? draftReqPlantQ : draftGrantPlantQ
+        this.externalPlantSource ? this.draftReqPlantQ : this.draftGrantPlantQ,
+        entityBack,
+        gridBack
       );
-      stagePoolForaging(
+    }
+    if (this.externalDetritusSource || this.curDetritusDirtyCount > 0) {
+      this.stagePoolForaging(
+        tx,
+        speciesCaches,
+        targetTick,
+        useDirectEntity,
+        useDirectGrid,
         1,
         this.externalDetritusSource,
         EXTERNAL_DETRITUS_ESCROW_SLOT,
-        this.externalDetritusSource ? draftReqDetritusQ : draftGrantDetritusQ
+        this.externalDetritusSource ? this.draftReqDetritusQ : this.draftGrantDetritusQ,
+        entityBack,
+        gridBack
       );
-      stagePoolForaging(
+    }
+    if (this.externalCarrionSource || this.curCarrionDirtyCount > 0) {
+      this.stagePoolForaging(
+        tx,
+        speciesCaches,
+        targetTick,
+        useDirectEntity,
+        useDirectGrid,
         2,
         this.externalCarrionSource,
         EXTERNAL_CARRION_ESCROW_SLOT,
-        this.externalCarrionSource ? draftReqCarrionQ : draftGrantCarrionQ
+        this.externalCarrionSource ? this.draftReqCarrionQ : this.draftGrantCarrionQ,
+        entityBack,
+        gridBack
       );
+    }
 
-      // Live prey predation bites
+    const feedScratch = this.feedScratch;
+    const predBiteCount = this.curPredBiteCount;
+    if (predBiteCount > 0) {
       const predBitePredDraft = this.predBitePredDraft;
       const predBitePreyDraft = this.predBitePreyDraft;
       const predBiteMassQ = this.predBiteMassQ;
@@ -3700,12 +4071,16 @@ export class BiologySimulation {
         const predSlot = draftSlot[predIdx];
         const preySlot = draftSlot[preyIdx];
 
-        const predStructM = useDirectEntity
-          ? entityStore.stagedStructMassUnsafe(predSlot)
-          : Number(tx.stagedMassQ(AK_ORGANISM_STRUCT, predSlot));
-        const predResM = useDirectEntity
-          ? entityStore.stagedReserveMassUnsafe(predSlot)
-          : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, predSlot));
+        const predStructM = esStructBack !== null
+          ? esStructBack[predSlot]
+          : useDirectEntity
+            ? entityStore.stagedStructMassUnsafe(predSlot)
+            : Number(tx.stagedMassQ(AK_ORGANISM_STRUCT, predSlot));
+        const predResM = esResBack !== null
+          ? esResBack[predSlot]
+          : useDirectEntity
+            ? entityStore.stagedReserveMassUnsafe(predSlot)
+            : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, predSlot));
         const pq = speciesCaches[draftSpeciesIdx[predIdx]].pq;
         let maxPredResM: number;
         if (predStructM === draftStructMassQ[predIdx]) {
@@ -3715,21 +4090,25 @@ export class BiologySimulation {
           maxPredResM =
             prod <= LOCAL_MAX_SAFE_INT
               ? (prod - (prod % LOCAL_PPM)) / LOCAL_PPM
-              : scaleByRatio(predStructM, pq.maxReserveRatioScaled, LOCAL_PPM, 'floor');
+              : _scaleByRatio(predStructM, pq.maxReserveRatioScaled, LOCAL_PPM, 'floor');
         }
         const headroom = maxPredResM - predResM;
         if (headroom <= 0) continue;
 
-        const preyStructM = useDirectEntity
-          ? entityStore.stagedStructMassUnsafe(preySlot)
-          : Number(tx.stagedMassQ(AK_ORGANISM_STRUCT, preySlot));
-        const preyResM = useDirectEntity
-          ? entityStore.stagedReserveMassUnsafe(preySlot)
-          : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, preySlot));
-        const preyTotalM = safeAdd(preyStructM, preyResM);
+        const preyStructM = esStructBack !== null
+          ? esStructBack[preySlot]
+          : useDirectEntity
+            ? entityStore.stagedStructMassUnsafe(preySlot)
+            : Number(tx.stagedMassQ(AK_ORGANISM_STRUCT, preySlot));
+        const preyResM = esResBack !== null
+          ? esResBack[preySlot]
+          : useDirectEntity
+            ? entityStore.stagedReserveMassUnsafe(preySlot)
+            : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, preySlot));
+        const preyTotalM = _safeAdd(preyStructM, preyResM);
         const biteM = predBiteMassQ[i] < preyTotalM ? predBiteMassQ[i] : preyTotalM;
         if (biteM > 0) {
-          stagePreyPredationFast(
+          _stagePreyPredationFast(
             tx,
             preySlot,
             preyStructM,
@@ -3745,129 +4124,145 @@ export class BiologySimulation {
           );
         }
       }
+    }
 
-      // Background prey pool or legacy FoodProvider foraging
-      if (this.externalPreySource) {
-        const extPrey = this.externalPreySource;
-        const reqs: CompetitiveConsumerRequest[] = [];
-        for (let ci = 0; ci < draftCount; ci++) {
-          const dIdx = draftCanonicalOrder[ci];
-          const reqM = draftReqPreyQ[dIdx];
-          if (reqM <= 0 || (draftFlags[dIdx] & FLAG_DIED) !== 0) continue;
-          const cellIdx = draftCellIndex[dIdx];
-          reqs.push({
-            organismId: draftOrgId[dIdx],
-            entitySlot: draftSlot[dIdx],
-            cellIndex: cellIdx,
-            detritusCellIndex: cellIdx,
-            requestedMassQ: reqM,
-            profile: speciesCaches[draftSpeciesIdx[dIdx]].profile,
-            escrowSlot: EXTERNAL_PREY_ESCROW_SLOT,
-          });
-        }
-        if (reqs.length > 0) {
-          stageCompetitiveTransactionalForaging(this.ledger, tx, extPrey, entityStore, reqs, targetTick);
-        }
-      } else if (conservativePreyProvider) {
-        for (let ci = 0; ci < draftCount; ci++) {
-          const dIdx = draftCanonicalOrder[ci];
-          const grantPreyM = draftGrantPreyQ[dIdx];
-          if ((draftFlags[dIdx] & FLAG_DIED) !== 0 || grantPreyM <= 0) continue;
+    // Background prey pool or legacy FoodProvider foraging
+    if (this.externalPreySource) {
+      const extPrey = this.externalPreySource;
+      const draftReqPreyQ = this.draftReqPreyQ;
+      const draftOrgId = this.draftOrgId;
+      const reqs: CompetitiveConsumerRequest[] = [];
+      for (let ci = 0; ci < draftCount; ci++) {
+        const dIdx = draftCanonicalOrder[ci];
+        const reqM = draftReqPreyQ[dIdx];
+        if (reqM <= 0 || (draftFlags[dIdx] & FLAG_DIED) !== 0) continue;
+        const cellIdx = draftCellIndex[dIdx];
+        reqs.push({
+          organismId: draftOrgId[dIdx],
+          entitySlot: draftSlot[dIdx],
+          cellIndex: cellIdx,
+          detritusCellIndex: cellIdx,
+          requestedMassQ: reqM,
+          profile: speciesCaches[draftSpeciesIdx[dIdx]].profile,
+          escrowSlot: EXTERNAL_PREY_ESCROW_SLOT,
+        });
+      }
+      if (reqs.length > 0) {
+        stageCompetitiveTransactionalForaging(this.ledger, tx, extPrey, entityStore, reqs, targetTick);
+      }
+    } else if (conservativePreyProvider && this.curPreyDirtyCount > 0) {
+      const draftGrantPreyQ = this.draftGrantPreyQ;
+      for (let ci = 0; ci < draftCount; ci++) {
+        const dIdx = draftCanonicalOrder[ci];
+        const grantPreyM = draftGrantPreyQ[dIdx];
+        if ((draftFlags[dIdx] & FLAG_DIED) !== 0 || grantPreyM <= 0) continue;
 
-          const predSlot = draftSlot[dIdx];
-          const predStructM = useDirectEntity
+        const predSlot = draftSlot[dIdx];
+        const predStructM = esStructBack !== null
+          ? esStructBack[predSlot]
+          : useDirectEntity
             ? entityStore.stagedStructMassUnsafe(predSlot)
             : Number(tx.stagedMassQ(AK_ORGANISM_STRUCT, predSlot));
-          const predResM = useDirectEntity
+        const predResM = esResBack !== null
+          ? esResBack[predSlot]
+          : useDirectEntity
             ? entityStore.stagedReserveMassUnsafe(predSlot)
             : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, predSlot));
-          const pq = speciesCaches[draftSpeciesIdx[dIdx]].pq;
-          let maxPredResM: number;
-          if (predStructM === draftStructMassQ[dIdx]) {
-            maxPredResM = draftMaxReserveMassQ[dIdx];
-          } else {
-            const prod = predStructM * pq.maxReserveRatioScaled;
-            maxPredResM =
-              prod <= LOCAL_MAX_SAFE_INT
-                ? (prod - (prod % LOCAL_PPM)) / LOCAL_PPM
-                : scaleByRatio(predStructM, pq.maxReserveRatioScaled, LOCAL_PPM, 'floor');
-          }
-          const headroom = maxPredResM - predResM;
-          if (headroom <= 0) continue;
+        const pq = speciesCaches[draftSpeciesIdx[dIdx]].pq;
+        let maxPredResM: number;
+        if (predStructM === draftStructMassQ[dIdx]) {
+          maxPredResM = draftMaxReserveMassQ[dIdx];
+        } else {
+          const prod = predStructM * pq.maxReserveRatioScaled;
+          maxPredResM =
+            prod <= LOCAL_MAX_SAFE_INT
+              ? (prod - (prod % LOCAL_PPM)) / LOCAL_PPM
+              : _scaleByRatio(predStructM, pq.maxReserveRatioScaled, LOCAL_PPM, 'floor');
+        }
+        const headroom = maxPredResM - predResM;
+        if (headroom <= 0) continue;
 
-          const cellIdx = draftCellIndex[dIdx];
-          const preySlot = cellIdx; // conservative preySlotOffset === 0
-          const preyStructM = useDirectEntity
+        const cellIdx = draftCellIndex[dIdx];
+        const preySlot = cellIdx; // conservative preySlotOffset === 0
+        const preyStructM = esStructBack !== null
+          ? esStructBack[preySlot]
+          : useDirectEntity
             ? entityStore.stagedStructMassUnsafe(preySlot)
             : Number(tx.stagedMassQ(AK_ORGANISM_STRUCT, preySlot));
-          const preyResM = useDirectEntity
+        const preyResM = esResBack !== null
+          ? esResBack[preySlot]
+          : useDirectEntity
             ? entityStore.stagedReserveMassUnsafe(preySlot)
             : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, preySlot));
-          const preyTotalM = safeAdd(preyStructM, preyResM);
-          const biteM = grantPreyM < preyTotalM ? grantPreyM : preyTotalM;
-          if (biteM > 0) {
-            stagePreyPredationFast(
-              tx,
-              preySlot,
-              preyStructM,
-              preyResM,
-              predSlot,
-              cellIdx,
-              biteM,
-              pq.absorptionPpm,
-              pq.assimilationPpm,
-              pq.sdaPpm,
-              headroom,
-              feedScratch
+        const preyTotalM = _safeAdd(preyStructM, preyResM);
+        const biteM = grantPreyM < preyTotalM ? grantPreyM : preyTotalM;
+        if (biteM > 0) {
+          _stagePreyPredationFast(
+            tx,
+            preySlot,
+            preyStructM,
+            preyResM,
+            predSlot,
+            cellIdx,
+            biteM,
+            pq.absorptionPpm,
+            pq.assimilationPpm,
+            pq.sdaPpm,
+            headroom,
+            feedScratch
+          );
+        }
+      }
+    } else if (isLegacyMode) {
+      const draftReqLegacyNorm = this.draftReqLegacyNorm;
+      for (let ci = 0; ci < draftCount; ci++) {
+        const dIdx = draftCanonicalOrder[ci];
+        const reqNorm = draftReqLegacyNorm[dIdx];
+        if ((draftFlags[dIdx] & FLAG_DIED) !== 0 || reqNorm <= 0) continue;
+
+        const slot = draftSlot[dIdx];
+        const stagedResM = esResBack !== null
+          ? esResBack[slot]
+          : useDirectEntity
+            ? entityStore.stagedReserveMassUnsafe(slot)
+            : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, slot));
+        const maxResM = draftMaxReserveMassQ[dIdx];
+        const headroom = maxResM > stagedResM ? maxResM - stagedResM : 0;
+        if (headroom <= 0) continue;
+
+        const cellIdx = draftCellIndex[dIdx];
+        const cy = (cellIdx / gridWidth) | 0;
+        const cx = cellIdx - cy * gridWidth;
+        const env = this.populateEnvContext(cx, cy, cellIdx, targetTick);
+        const gainedNorm = this.foodProvider.consumePrey(env, reqNorm);
+        if (gainedNorm > 0) {
+          const clampedGain = gainedNorm < 1 ? gainedNorm : 1;
+          const rawMass = applyPpmFloorFast(maxResM, _fractionToPpmFloorFast(clampedGain));
+          const depositM = headroom < rawMass ? headroom : rawMass;
+          if (depositM > 0) {
+            const depositE =
+              depositM <= RESERVE_SAFE_MASS_LIMIT
+                ? depositM * 30
+                : _energyOfMass(depositM, _RHO_RESERVE);
+            this.reusableExternalDelta.massQ = depositM;
+            this.reusableExternalDelta.energyQ = depositE;
+            this.ledger.importExternal(LEGACY_FOOD_ESCROW_SLOT, this.reusableExternalProvider);
+            tx.transferBiomass(
+              PostingReason.INGESTION,
+              AccountKind.ESCROW,
+              LEGACY_FOOD_ESCROW_SLOT,
+              AK_ORGANISM_RESERVE,
+              slot,
+              depositM,
+              depositE
             );
           }
         }
-      } else if (isLegacyMode) {
-        for (let ci = 0; ci < draftCount; ci++) {
-          const dIdx = draftCanonicalOrder[ci];
-          const reqNorm = draftReqLegacyNorm[dIdx];
-          if ((draftFlags[dIdx] & FLAG_DIED) !== 0 || reqNorm <= 0) continue;
-
-          const slot = draftSlot[dIdx];
-          const stagedResM = useDirectEntity
-            ? entityStore.stagedReserveMassUnsafe(slot)
-            : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, slot));
-          const maxResM = draftMaxReserveMassQ[dIdx];
-          const headroom = maxResM > stagedResM ? maxResM - stagedResM : 0;
-          if (headroom <= 0) continue;
-
-          const cellIdx = draftCellIndex[dIdx];
-          const cy = (cellIdx / gridWidth) | 0;
-          const cx = cellIdx - cy * gridWidth;
-          const env = this.populateEnvContext(cx, cy, cellIdx, targetTick);
-          const gainedNorm = this.foodProvider.consumePrey(env, reqNorm);
-          if (gainedNorm > 0) {
-            const clampedGain = gainedNorm < 1 ? gainedNorm : 1;
-            const rawMass = applyPpmFloorFast(maxResM, fractionToPpm(clampedGain, 'floor'));
-            const depositM = headroom < rawMass ? headroom : rawMass;
-            if (depositM > 0) {
-              const depositE =
-                depositM <= RESERVE_SAFE_MASS_LIMIT
-                  ? depositM * 30
-                  : energyOfMass(depositM, RHO_RESERVE);
-              this.reusableExternalDelta.massQ = depositM;
-              this.reusableExternalDelta.energyQ = depositE;
-              this.ledger.importExternal(LEGACY_FOOD_ESCROW_SLOT, this.reusableExternalProvider);
-              tx.transferBiomass(
-                PostingReason.INGESTION,
-                AccountKind.ESCROW,
-                LEGACY_FOOD_ESCROW_SLOT,
-                AK_ORGANISM_RESERVE,
-                slot,
-                depositM,
-                depositE
-              );
-            }
-          }
-        }
       }
+    }
 
-      // 3g. Somatic Growth
+    // 3g. Somatic Growth
+    if (draftCount > 0) {
       for (let ci = 0; ci < draftCount; ci++) {
         const dIdx = draftCanonicalOrder[ci];
         if ((draftFlags[dIdx] & FLAG_DIED) !== 0 || draftNextStage[dIdx] === STAGE_EGG) continue;
@@ -3877,17 +4272,21 @@ export class BiologySimulation {
         }
 
         const slot = draftSlot[dIdx];
-        const stagedStructM = useDirectEntity
-          ? entityStore.stagedStructMassUnsafe(slot)
-          : Number(tx.stagedMassQ(AK_ORGANISM_STRUCT, slot));
+        const stagedStructM = esStructBack !== null
+          ? esStructBack[slot]
+          : useDirectEntity
+            ? entityStore.stagedStructMassUnsafe(slot)
+            : Number(tx.stagedMassQ(AK_ORGANISM_STRUCT, slot));
         if (stagedStructM >= targetStructQ) continue;
-        const stagedResM = useDirectEntity
-          ? entityStore.stagedReserveMassUnsafe(slot)
-          : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, slot));
+        const stagedResM = esResBack !== null
+          ? esResBack[slot]
+          : useDirectEntity
+            ? entityStore.stagedReserveMassUnsafe(slot)
+            : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, slot));
         if (stagedResM > 0) {
           const availAbiotic = tx.stagedAbioticMassQFast();
           const pq = speciesCaches[draftSpeciesIdx[dIdx]].pq;
-          stageSomaticGrowthFast(
+          _stageSomaticGrowthFast(
             tx,
             slot,
             stagedStructM,
@@ -3899,8 +4298,11 @@ export class BiologySimulation {
           );
         }
       }
+    }
 
-      // 3h. Reproduction provisioning
+    // 3h. Reproduction provisioning
+    const reproPlanCount = this.curReproPlanCount;
+    if (reproPlanCount > 0) {
       const rpFemaleDraft = this.rpFemaleDraft;
       const rpMaleDraft = this.rpMaleDraft;
       const rpStatus = this.rpStatus;
@@ -3936,11 +4338,13 @@ export class BiologySimulation {
         let provisionedCount = 0;
 
         for (let epIdx = eStart; epIdx < eEnd; epIdx++) {
-          const motherResM = useDirectEntity
-            ? entityStore.stagedReserveMassUnsafe(fSlot)
-            : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, fSlot));
+          const motherResM = esResBack !== null
+            ? esResBack[fSlot]
+            : useDirectEntity
+              ? entityStore.stagedReserveMassUnsafe(fSlot)
+              : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, fSlot));
           const availAbiotic = tx.stagedAbioticMassQFast();
-          const ok = stageReproductionProvisioningFast(
+          const ok = _stageReproductionProvisioningFast(
             tx,
             fSlot,
             eggDraftSlot[epIdx],
@@ -3965,275 +4369,574 @@ export class BiologySimulation {
           const fMatingQ = rpFatherMatingDemandQ[i];
           if (fMatingQ > 0) {
             const mSlot = draftSlot[mIdx];
-            const maleResM = useDirectEntity
-              ? entityStore.stagedReserveMassUnsafe(mSlot)
-              : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, mSlot));
-            stageMetabolismFast(tx, mSlot, maleResM, fMatingQ, draftPostMetabCarryQ[mIdx], metabScratch);
+            const maleResM = esResBack !== null
+              ? esResBack[mSlot]
+              : useDirectEntity
+                ? entityStore.stagedReserveMassUnsafe(mSlot)
+                : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, mSlot));
+            _stageMetabolismFast(tx, mSlot, maleResM, fMatingQ, draftPostMetabCarryQ[mIdx], metabScratch);
             draftPostMetabCarryQ[mIdx] = metabScratch.nextCarryCreditQ;
           }
         }
       }
+    }
 
-      // 3i. Stage deaths (`stageDeathToCarrionFast` moves remaining STRUCT + RESERVE -> CELL_CARRION)
-      const newlyDiedCellFlags = this.newlyDiedCellFlags;
-      const newlyDiedCellList = this.newlyDiedCellList;
+    // 3i. Stage deaths (`stageDeathToCarrionFast` moves remaining STRUCT + RESERVE -> CELL_CARRION)
+    let newlyDiedCellCount = 0;
+    const newlyDiedCellFlags = this.newlyDiedCellFlags;
+    const newlyDiedCellList = this.newlyDiedCellList;
+    if (this.curDiedCount > 0) {
       for (let ci = 0; ci < draftCount; ci++) {
         const dIdx = draftCanonicalOrder[ci];
         if ((draftFlags[dIdx] & FLAG_DIED) === 0) continue;
         const slot = draftSlot[dIdx];
-        const remStructM = useDirectEntity
-          ? entityStore.stagedStructMassUnsafe(slot)
-          : Number(tx.stagedMassQ(AK_ORGANISM_STRUCT, slot));
-        const remResM = useDirectEntity
-          ? entityStore.stagedReserveMassUnsafe(slot)
-          : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, slot));
+        const remStructM = esStructBack !== null
+          ? esStructBack[slot]
+          : useDirectEntity
+            ? entityStore.stagedStructMassUnsafe(slot)
+            : Number(tx.stagedMassQ(AK_ORGANISM_STRUCT, slot));
+        const remResM = esResBack !== null
+          ? esResBack[slot]
+          : useDirectEntity
+            ? entityStore.stagedReserveMassUnsafe(slot)
+            : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, slot));
         if (remStructM > 0 || remResM > 0) {
           const cIdx = draftCellIndex[dIdx];
-          stageDeathToCarrionFast(tx, slot, cIdx, remStructM, remResM);
+          _stageDeathToCarrionFast(tx, slot, cIdx, remStructM, remResM);
           if (newlyDiedCellFlags[cIdx] === 0) {
             newlyDiedCellFlags[cIdx] = 1;
             newlyDiedCellList[newlyDiedCellCount++] = cIdx;
           }
         }
       }
+    }
+    this.curNewlyDiedCellCount = newlyDiedCellCount;
 
-      // 3j. Decomposition (`CELL_CARRION` & `CELL_DETRITUS` -> `ABIOTIC` + `HEAT`), runs even at 0 alive organisms
-      const carrionRatePpm = this.carrionDecompositionRatePpm;
-      const detritusRatePpm = this.detritusDecompositionRatePpm;
-      if (carrionRatePpm > 0 || detritusRatePpm > 0) {
-        const cellCount = this.grid.cellCount;
-        const canSkipEmptyCarrion = isLegacyMode && newlyDiedCellCount === 0;
-        const canSkipEmptyDetritus = isLegacyMode && !hasAnyExternalSource;
+    // 3j. Decomposition (`CELL_CARRION` & `CELL_DETRITUS` -> `ABIOTIC` + `HEAT`), runs even at 0 alive organisms
+    const carrionRatePpm = this.carrionDecompositionRatePpm;
+    const detritusRatePpm = this.detritusDecompositionRatePpm;
+    if (carrionRatePpm > 0 || detritusRatePpm > 0) {
+      const cellCount = this.grid.cellCount;
+      const canSkipEmptyCarrion = isLegacyMode && newlyDiedCellCount === 0;
+      const canSkipEmptyDetritus = isLegacyMode && !hasAnyExternalSource;
 
-        if (!canSkipEmptyCarrion || !canSkipEmptyDetritus) {
-          if (useDirectGrid) {
+      if (!canSkipEmptyCarrion || !canSkipEmptyDetritus) {
+        if (gridBack !== null) {
+          const carrionMBack = gridBack[2];
+          const carrionEBack = gridBack[3];
+          const detritusBack = gridBack[4];
+          const doCarrion = carrionRatePpm > 0;
+          const doDetritus = detritusRatePpm > 0 && !canSkipEmptyDetritus;
+          if (doCarrion && doDetritus) {
             for (let c = 0; c < cellCount; c++) {
-              if (carrionRatePpm > 0) {
-                const cm = energyGrid.getStagedMassUnsafe(POOL_CARRION, c);
-                if (cm > 0) {
-                  stageCarrionDecompositionFast(
-                    tx,
-                    c,
-                    cm,
-                    energyGrid.getStagedEnergyUnsafe(POOL_CARRION, c),
-                    carrionRatePpm
-                  );
-                }
+              const cm = carrionMBack[c];
+              if (cm > 0) {
+                _stageCarrionDecompositionFast(tx, c, cm, carrionEBack[c], carrionRatePpm);
               }
-              if (detritusRatePpm > 0 && !canSkipEmptyDetritus) {
-                const dm = energyGrid.getStagedMassUnsafe(POOL_DETRITUS, c);
-                if (dm > 0) {
-                  stageDetritusDecompositionFast(tx, c, dm, detritusRatePpm);
-                }
+              const dm = detritusBack[c];
+              if (dm > 0) {
+                _stageDetritusDecompositionFast(tx, c, dm, detritusRatePpm);
               }
             }
           } else {
             for (let c = 0; c < cellCount; c++) {
-              if (carrionRatePpm > 0) {
-                if (energyGrid.getMassQ(POOL_CARRION, c) > 0 || newlyDiedCellFlags[c] !== 0) {
-                  const cm = Number(tx.stagedMassQ(AK_CELL_CARRION, c));
-                  if (cm > 0) {
-                    const ce = Number(tx.stagedEnergyQ(AK_CELL_CARRION, c));
-                    stageCarrionDecompositionFast(tx, c, cm, ce, carrionRatePpm);
-                  }
+              if (doCarrion) {
+                const cm = carrionMBack[c];
+                if (cm > 0) {
+                  _stageCarrionDecompositionFast(tx, c, cm, carrionEBack[c], carrionRatePpm);
                 }
               }
-              if (detritusRatePpm > 0 && !canSkipEmptyDetritus) {
-                if (energyGrid.getMassQ(POOL_DETRITUS, c) > 0 || !isLegacyMode) {
-                  const dm = Number(tx.stagedMassQ(AK_CELL_DETRITUS, c));
-                  if (dm > 0) {
-                    stageDetritusDecompositionFast(tx, c, dm, detritusRatePpm);
-                  }
+              if (doDetritus) {
+                const dm = detritusBack[c];
+                if (dm > 0) {
+                  _stageDetritusDecompositionFast(tx, c, dm, detritusRatePpm);
+                }
+              }
+            }
+          }
+        } else {
+          for (let c = 0; c < cellCount; c++) {
+            if (carrionRatePpm > 0) {
+              if (energyGrid.getMassQ(POOL_CARRION, c) > 0 || newlyDiedCellFlags[c] !== 0) {
+                const cm = Number(tx.stagedMassQ(AK_CELL_CARRION, c));
+                if (cm > 0) {
+                  const ce = Number(tx.stagedEnergyQ(AK_CELL_CARRION, c));
+                  _stageCarrionDecompositionFast(tx, c, cm, ce, carrionRatePpm);
+                }
+              }
+            }
+            if (detritusRatePpm > 0 && !canSkipEmptyDetritus) {
+              if (energyGrid.getMassQ(POOL_DETRITUS, c) > 0 || !isLegacyMode) {
+                const dm = Number(tx.stagedMassQ(AK_CELL_DETRITUS, c));
+                if (dm > 0) {
+                  _stageDetritusDecompositionFast(tx, c, dm, detritusRatePpm);
                 }
               }
             }
           }
         }
       }
+    }
+  }
 
-      this.onPhase?.({ tick: targetTick, phase: 'PREPARE', tx });
-      tx.prepare();
+  private runCommitAndPostCommit(
+    tx: EnergyTransaction,
+    targetTick: number,
+    plannedNextId: number,
+    sCount: number,
+    speciesList: readonly SpeciesDefinition[],
+    speciesCaches: SpeciesRuntimeCache[],
+    computeStatsForTick: boolean,
+    pushToHistory: boolean
+  ): BiologyTickSummary {
+    const draftCount = this.curDraftCount;
+    const eggPlanCount = this.curEggPlanCount;
+    const entityStore = this.entityStore;
+    const organismIdToSlot = this.organismIdToSlot;
+    const slotCarryCreditQ = this.slotCarryCreditQ;
+    const slotLastSyncedEnergy = this.slotLastSyncedEnergy;
+    const slotMaxReserveMassQ = this.slotMaxReserveMassQ;
+    const draftOrg = this.draftOrg;
+    const draftPop = this.draftPop;
+    const draftDeathCause = this.draftDeathCause;
+    const draftSlot = this.draftSlot;
+    const draftSpeciesIdx = this.draftSpeciesIdx;
+    const draftNextAgeTicks = this.draftNextAgeTicks;
+    const draftNextStage = this.draftNextStage;
+    const draftNextCooldown = this.draftNextCooldown;
+    const draftFlags = this.draftFlags;
+    const draftKillerId = this.draftKillerId;
+    const draftOffspringDelta = this.draftOffspringDelta;
+    const draftStructMassQ = this.draftStructMassQ;
+    const draftMaxReserveMassQ = this.draftMaxReserveMassQ;
+    const draftPostMetabCarryQ = this.draftPostMetabCarryQ;
+    const draftNextHealth = this.draftNextHealth;
+    const draftDevPhys = this.draftDevPhys;
+    const draftDevNeural = this.draftDevNeural;
+    const draftDevSenesc = this.draftDevSenesc;
+    const phenCtx = this.reusablePhenContext;
+    const touchedPops = this.stepTouchedPops;
+    const popBySpeciesIdx = this.stepPopBySpeciesIdx;
 
-      // =========================================================================
-      // PHASE 4: COMMIT (Non-throwing atomic publication)
-      // =========================================================================
-      this.onPhase?.({ tick: targetTick, phase: 'COMMIT', tx });
-      tx.commit();
-      tx = null; // Transaction committed — errors after here belong to POST_COMMIT and NEVER abort
+    this.onPhase?.({ tick: targetTick, phase: 'COMMIT', tx });
+    tx.commit();
 
-      this.tickCount = targetTick;
-      this.nextId = plannedNextId;
+    this.tickCount = targetTick;
+    this.nextId = plannedNextId;
 
-      const committedDeathEvents: OrganismDeathEvent[] = [];
-      for (let i = 0; i < touchedPops.length; i++) {
-        touchedPops[i].beginTick();
-      }
+    const committedDeathEvents = this.stepCommittedDeathEvents;
+    committedDeathEvents.length = 0;
+    for (let i = 0; i < touchedPops.length; i++) {
+      touchedPops[i].beginTick();
+    }
 
-      // Iterate in gather order (0..draftCount-1) to preserve committedDeathEvents emission order
-      for (let dIdx = 0; dIdx < draftCount; dIdx++) {
-        const org = draftOrg[dIdx];
-        const pop = draftPop[dIdx];
-        if ((draftFlags[dIdx] & FLAG_DIED) !== 0) {
-          const killerVal = draftKillerId[dIdx];
-          processOrganismDeath(
+    const useDirectEntity = this.useDirectEntityStore;
+    const esFront = useDirectEntity ? entityStore._getChannelStore().front : null;
+    const esStructFront = esFront ? esFront[0] : null;
+    const esResFront = esFront ? esFront[2] : null;
+
+    const hasDeathListeners = this.deathListeners.size > 0;
+    // Iterate in gather order (0..draftCount-1) to preserve committedDeathEvents emission order
+    for (let dIdx = 0; dIdx < draftCount; dIdx++) {
+      const org = draftOrg[dIdx];
+      const pop = draftPop[dIdx];
+      if ((draftFlags[dIdx] & FLAG_DIED) !== 0) {
+        const killerVal = draftKillerId[dIdx];
+        const cause = draftDeathCause[dIdx] ?? 'starvation';
+        if (hasDeathListeners) {
+          _processOrganismDeath(
             org,
             targetTick,
-            draftDeathCause[dIdx] ?? 'starvation',
+            cause,
             killerVal > 0 ? killerVal : null,
             (event) => {
               pop.recordDeath(event.cause);
               committedDeathEvents.push(event);
             }
           );
-          this.pendingCompactPops.add(pop);
-          continue;
+        } else if (org.alive) {
+          org.alive = false;
+          org.stage = 'dead';
+          org.health = 0;
+          org.deathTick = targetTick;
+          org.deathCause = cause;
+          pop.recordDeath(cause);
         }
-
-        org.ageTicks = draftNextAgeTicks[dIdx];
-        org.stage = STAGE_NAMES[draftNextStage[dIdx]];
-        org.reproductionCooldown = draftNextCooldown[dIdx];
-        const nextHealth = draftNextHealth[dIdx];
-        org.health = nextHealth;
-        const offDelta = draftOffspringDelta[dIdx];
-        if (offDelta > 0) {
-          org.offspringCount += offDelta;
-        }
-
-        const slot = draftSlot[dIdx];
-        const sc = speciesCaches[draftSpeciesIdx[dIdx]];
-        const pq = sc.pq;
-        const newStructQ = entityStore.structMassQ(slot);
-        const newReserveQ = entityStore.reserveMassQ(slot);
-        let newMaxResQ: number;
-        if (newStructQ === draftStructMassQ[dIdx]) {
-          newMaxResQ = draftMaxReserveMassQ[dIdx];
-        } else {
-          const ratioProd = newStructQ * pq.maxReserveRatioScaled;
-          newMaxResQ =
-            ratioProd <= LOCAL_MAX_SAFE_INT
-              ? (ratioProd - (ratioProd % LOCAL_PPM)) / LOCAL_PPM
-              : scaleByRatio(newStructQ, pq.maxReserveRatioScaled, LOCAL_PPM, 'floor');
-        }
-        const rawNorm = newMaxResQ > 0 ? newReserveQ / newMaxResQ : 0;
-        const newNormEnergy = rawNorm < 1 ? rawNorm : 1;
-
-        org.energy = newNormEnergy;
-        slotCarryCreditQ[slot] = draftPostMetabCarryQ[dIdx];
-        this.slotMaxReserveMassQ[slot] = newMaxResQ;
-        slotLastSyncedEnergy[slot] = newNormEnergy;
-
-        phenCtx.physicalMaturityScale = draftDevPhys[dIdx];
-        phenCtx.neuralMaturityScale = draftDevNeural[dIdx];
-        phenCtx.senescencePhysicalScale = draftDevSenesc[dIdx];
-        phenCtx.conditionScale =
-          0.45 + 0.55 * Math.min(1, Math.max(0, nextHealth * 0.65 + newNormEnergy * 0.35));
-        computePhenotype(org.genome, sc.schema, phenCtx, org.phenotype);
+        this.pendingCompactPops.add(pop);
+        continue;
       }
 
-      if (eggPlanCount > 0) {
-        const eggOrg = this.eggOrg;
-        const eggSpeciesIdx = this.eggSpeciesIdx;
-        const eggDraftSlot = this.eggDraftSlot;
-        const eggIsReused = this.eggIsReused;
-        const eggProvisioned = this.eggProvisioned;
+      org.ageTicks = draftNextAgeTicks[dIdx];
+      org.stage = STAGE_NAMES[draftNextStage[dIdx]];
+      org.reproductionCooldown = draftNextCooldown[dIdx];
+      const nextHealth = draftNextHealth[dIdx];
+      org.health = nextHealth;
+      const offDelta = draftOffspringDelta[dIdx];
+      if (offDelta > 0) {
+        org.offspringCount += offDelta;
+      }
 
-        let committedReused = 0;
-        let committedFresh = 0;
-        for (let i = 0; i < eggPlanCount; i++) {
-          if (eggProvisioned[i] === 0) continue;
+      const slot = draftSlot[dIdx];
+      const sc = speciesCaches[draftSpeciesIdx[dIdx]];
+      const pq = sc.pq;
+      const newStructQ = esStructFront !== null ? esStructFront[slot] : entityStore.structMassQ(slot);
+      const newReserveQ = esResFront !== null ? esResFront[slot] : entityStore.reserveMassQ(slot);
+      let newMaxResQ: number;
+      if (newStructQ === draftStructMassQ[dIdx]) {
+        newMaxResQ = draftMaxReserveMassQ[dIdx];
+      } else {
+        const ratioProd = newStructQ * pq.maxReserveRatioScaled;
+        newMaxResQ =
+          ratioProd <= LOCAL_MAX_SAFE_INT
+            ? (ratioProd - (ratioProd % LOCAL_PPM)) / LOCAL_PPM
+            : _scaleByRatio(newStructQ, pq.maxReserveRatioScaled, LOCAL_PPM, 'floor');
+      }
+      const rawNorm = newMaxResQ > 0 ? newReserveQ / newMaxResQ : 0;
+      const newNormEnergy = rawNorm < 1 ? rawNorm : 1;
 
-          if (eggIsReused[i] !== 0) {
-            committedReused += 1;
-          } else {
-            committedFresh += 1;
-          }
+      org.energy = newNormEnergy;
+      slotCarryCreditQ[slot] = draftPostMetabCarryQ[dIdx];
+      slotMaxReserveMassQ[slot] = newMaxResQ;
+      slotLastSyncedEnergy[slot] = newNormEnergy;
 
-          const sIdx = eggSpeciesIdx[i];
-          const sc = speciesCaches[sIdx];
-          const egg = eggOrg[i];
-          const slot = eggDraftSlot[i];
-          organismIdToSlot.set(egg.id, slot);
-          slotCarryCreditQ[slot] = 0;
-          this.slotMaxReserveMassQ[slot] = sc.eggMaxReserveMassQ;
-          const actualResQ = entityStore.reserveMassQ(slot);
-          const rawEggNorm = sc.eggMaxReserveMassQ > 0 ? actualResQ / sc.eggMaxReserveMassQ : 0;
-          const normEggE = rawEggNorm < 1 ? rawEggNorm : 1;
-          egg.energy = normEggE;
-          slotLastSyncedEnergy[slot] = normEggE;
-          refreshOrganismPhenotype(egg, sc.species);
+      phenCtx.physicalMaturityScale = draftDevPhys[dIdx];
+      phenCtx.neuralMaturityScale = draftDevNeural[dIdx];
+      phenCtx.senescencePhysicalScale = draftDevSenesc[dIdx];
+      phenCtx.conditionScale =
+        0.45 + 0.55 * Math.min(1, Math.max(0, nextHealth * 0.65 + newNormEnergy * 0.35));
+      _computePhenotype(org.genome, sc.schema, phenCtx, org.phenotype);
+    }
+
+    if (eggPlanCount > 0) {
+      const eggOrg = this.eggOrg;
+      const eggSpeciesIdx = this.eggSpeciesIdx;
+      const eggDraftSlot = this.eggDraftSlot;
+      const eggIsReused = this.eggIsReused;
+      const eggProvisioned = this.eggProvisioned;
+
+      let plannedReused = 0;
+      let plannedFresh = 0;
+      let committedEggs = 0;
+      for (let i = 0; i < eggPlanCount; i++) {
+        if (eggIsReused[i] !== 0) {
+          plannedReused += 1;
+        } else {
+          plannedFresh += 1;
         }
+        if (eggProvisioned[i] === 0) continue;
 
-        this.freeOrganismSlots.length -= committedReused;
-        this.nextFreshOrganismSlot += committedFresh;
+        committedEggs += 1;
+        const sIdx = eggSpeciesIdx[i];
+        const sc = speciesCaches[sIdx];
+        const egg = eggOrg[i];
+        const slot = eggDraftSlot[i];
+        organismIdToSlot.set(egg.id, slot);
+        slotCarryCreditQ[slot] = 0;
+        slotMaxReserveMassQ[slot] = sc.eggMaxReserveMassQ;
+        const actualResQ = esResFront !== null ? esResFront[slot] : entityStore.reserveMassQ(slot);
+        const rawEggNorm = sc.eggMaxReserveMassQ > 0 ? actualResQ / sc.eggMaxReserveMassQ : 0;
+        const normEggE = rawEggNorm < 1 ? rawEggNorm : 1;
+        egg.energy = normEggE;
+        slotLastSyncedEnergy[slot] = normEggE;
+        phenCtx.physicalMaturityScale = 0.15;
+        phenCtx.neuralMaturityScale = 0.15;
+        phenCtx.senescencePhysicalScale = 1.0;
+        phenCtx.conditionScale =
+          0.45 + 0.55 * Math.min(1, Math.max(0, egg.health * 0.65 + normEggE * 0.35));
+        _computePhenotype(egg.genome, sc.schema, phenCtx, egg.phenotype);
+      }
 
+      this.freeOrganismSlots.length -= plannedReused;
+      this.nextFreshOrganismSlot += plannedFresh;
+      if (committedEggs < eggPlanCount) {
+        for (let i = 0; i < eggPlanCount; i++) {
+          if (eggProvisioned[i] === 0) {
+            this.freeOrganismSlots.push(eggDraftSlot[i]);
+          }
+        }
+      }
+
+      const speciesEggCount = this.stepSpeciesEggCount;
+      const speciesEggStart = this.stepSpeciesEggStart;
+      for (let s = 0; s < sCount; s++) {
+        const eCnt = speciesEggCount[s];
+        if (eCnt <= 0) continue;
+        const eStart = speciesEggStart[s];
+        popBySpeciesIdx[s]!.addPrevalidatedRange(
+          eggOrg,
+          eStart,
+          eStart + eCnt,
+          eggProvisioned,
+          'birth'
+        );
+      }
+    }
+
+    // =========================================================================
+    // PHASE 5: POST_COMMIT (Listeners, Diagnostics, Compaction — never rolls back physics)
+    // =========================================================================
+    this.isPostCommit = true;
+    try {
+      for (let i = 0; i < committedDeathEvents.length; i++) {
+        this.dispatchDeathEvent(committedDeathEvents[i]);
+      }
+
+      if (this.trackMutationEvents && eggPlanCount > 0) {
+        for (let i = 0; i < eggPlanCount; i++) {
+          if (this.eggProvisioned[i] === 0) continue;
+          const records = this.eggMutationRecords[i];
+          if (!records || records.length === 0) continue;
+          const egg = this.eggOrg[i];
+          const sc = speciesCaches[this.eggSpeciesIdx[i]];
+          this.trackedMutations.push({
+            tick: targetTick,
+            speciesId: sc.species.id,
+            organismId: egg.id,
+            records: records as MutationRecord[],
+          });
+        }
+      }
+
+      const statsBySpecies: Record<string, PopulationStats> = {};
+      if (computeStatsForTick) {
+        for (let s = 0; s < sCount; s++) {
+          const pop = popBySpeciesIdx[s];
+          if (!pop) continue;
+          statsBySpecies[speciesList[s].id] = pop.computeStats(targetTick);
+        }
+      }
+
+      const summary: BiologyTickSummary = {
+        tick: targetTick,
+        statsBySpecies,
+      };
+      if (pushToHistory) {
+        this.history.push(summary);
+        if (this.history.length > this.maxHistoryEntries) {
+          this.history.shift();
+        }
+      }
+      this.onPhase?.({ tick: targetTick, phase: 'POST_COMMIT' });
+      return summary;
+    } finally {
+      committedDeathEvents.length = 0;
+      for (const pop of this.pendingCompactPops) {
+        pop.compactDead((deadOrg) => this.releaseOrganismSlot(deadOrg.id));
+        pop.rebuildSpatialIndex();
+      }
+      this.pendingCompactPops.clear();
+      this.isPostCommit = false;
+    }
+  }
+
+  /**
+   * Executes one deterministic biological tick across the atomic transactional pipeline:
+   *   GATHER -> RESOLVE -> PREPARE -> COMMIT / ABORT -> POST_COMMIT
+   */
+  private stepInternal(computeStatsForTick: boolean, pushToHistory: boolean): BiologyTickSummary {
+    const rngSnapshot = this.streams.snapshotStates();
+    const targetTick = this.tickCount + 1;
+    let plannedNextId = this.nextId;
+
+    const lifecycleRng = this.streams.get('biology:lifecycle');
+    const geneticsRng = this.streams.get('biology:genetics');
+    const mutationRng = this.streams.get('biology:mutation');
+    const reproductionRng = this.streams.get('biology:reproduction');
+    const speciesList = this.speciesRegistry.list();
+    const sCount = speciesList.length;
+    const speciesCaches = this.ensureSpeciesCaches(speciesList);
+
+    let tx: EnergyTransaction | null = null;
+    const isLegacyMode = this.conservationMode === 'legacy-external-escrow';
+    const hasAnyExternalSource = Boolean(
+      this.externalPlantSource ||
+        this.externalPreySource ||
+        this.externalCarrionSource ||
+        this.externalDetritusSource
+    );
+    const hasStrictFoodSources = !isLegacyMode || hasAnyExternalSource;
+    const legacySnapshotAvailable = isLegacyMode ? new Map<number, number>() : null;
+
+    this.curDraftCount = 0;
+    this.curEggPlanCount = 0;
+    this.curReproPlanCount = 0;
+    this.curPredBiteCount = 0;
+    this.curPlantDirtyCount = 0;
+    this.curCarrionDirtyCount = 0;
+    this.curDetritusDirtyCount = 0;
+    this.curPreyDirtyCount = 0;
+    this.curAliveDirtyCount = 0;
+    this.curPhotoCount = 0;
+    this.curPreyRemTouchedCount = 0;
+    this.curNewlyDiedCellCount = 0;
+    this.curDiedCount = 0;
+    this.curGloballySorted = true;
+    this.curPrevGlobalId = -1;
+
+    try {
+      // =========================================================================
+      // PHASE 1: GATHER (Pure inspection & draft preparation — zero live mutation)
+      // =========================================================================
+      this.onPhase?.({ tick: targetTick, phase: 'GATHER' });
+
+      this.ensureStepSpeciesCapacity(sCount);
+      const popBySpeciesIdx = this.stepPopBySpeciesIdx;
+      const touchedPops = this.stepTouchedPops;
+
+      let totalUpperOrgs = 0;
+      for (let s = 0; s < sCount; s++) {
+        const pop = this.populations.get(speciesList[s].id);
+        if (pop) {
+          popBySpeciesIdx[s] = pop;
+          touchedPops.push(pop);
+          totalUpperOrgs += pop.size;
+        }
+      }
+      this.ensureDraftCapacity(totalUpperOrgs);
+      if (totalUpperOrgs > 0) {
+        this.draftDeathCause.fill(null, 0, totalUpperOrgs);
+        this.draftKillerId.fill(0, 0, totalUpperOrgs);
+        this.draftOffspringDelta.fill(0, 0, totalUpperOrgs);
+        this.draftHealingDemandQ.fill(0, 0, totalUpperOrgs);
+        this.draftGrantPlantQ.fill(0, 0, totalUpperOrgs);
+        this.draftGrantPreyQ.fill(0, 0, totalUpperOrgs);
+        this.draftGrantCarrionQ.fill(0, 0, totalUpperOrgs);
+        this.draftGrantDetritusQ.fill(0, 0, totalUpperOrgs);
+      }
+      if (this.activeIdxToDraftIdx.length < totalUpperOrgs) {
+        let nextCap = Math.max(256, this.activeIdxToDraftIdx.length);
+        while (nextCap < totalUpperOrgs) nextCap *= 2;
+        this.activeIdxToDraftIdx = new Int32Array(nextCap);
+      }
+
+      const esFront = this.useDirectEntityStore ? this.entityStore._getChannelStore().front : null;
+      const entityStructFront = esFront ? esFront[0] : null;
+      const entityReserveFront = esFront ? esFront[2] : null;
+      const activeMapOffsetRef = { value: 0 };
+
+      for (let s = 0; s < sCount; s++) {
+        const pop = popBySpeciesIdx[s];
+        if (!pop) continue;
+        this.gatherSingleSpeciesDrafts(
+          s,
+          pop,
+          speciesCaches[s],
+          isLegacyMode,
+          hasStrictFoodSources,
+          legacySnapshotAvailable,
+          targetTick,
+          entityStructFront,
+          entityReserveFront,
+          activeMapOffsetRef
+        );
+      }
+
+      if (!this.curGloballySorted && this.curDraftCount > 1) {
+        sortInt32IndicesByFloat64Key(this.draftCanonicalOrder, this.draftOrgId, 0, this.curDraftCount - 1);
+      }
+
+      // =========================================================================
+      // PHASE 2: RESOLVE (Deterministic conflict resolution & biological planning)
+      // =========================================================================
+      this.onPhase?.({ tick: targetTick, phase: 'RESOLVE' });
+
+      if (!isLegacyMode) {
+        this.runPhotosynthesisPlan();
+      }
+
+      const conservativePreyProvider =
+        this.hasConservativePreyProvider && this.foodProvider instanceof DeterministicPreyFoodProvider
+          ? this.foodProvider
+          : null;
+
+      this.resolveResourceContentionPhase(sCount, conservativePreyProvider);
+
+      this.evaluatePostFeedMortality(
+        speciesCaches,
+        isLegacyMode,
+        legacySnapshotAvailable,
+        lifecycleRng
+      );
+
+      plannedNextId = this.planReproductionPhase(
+        sCount,
+        speciesCaches,
+        geneticsRng,
+        mutationRng,
+        reproductionRng,
+        targetTick,
+        plannedNextId
+      );
+
+      // =========================================================================
+      // PHASE 2.5: PRE_ALLOCATE (Between transactions — zero semantic state mutated)
+      // =========================================================================
+      this.onPhase?.({ tick: targetTick, phase: 'PRE_ALLOCATE' });
+
+      const eggPlanCount = this.curEggPlanCount;
+      let freshCursor = this.nextFreshOrganismSlot;
+      let freeAvail = this.freeOrganismSlots.length;
+      if (eggPlanCount > 0) {
+        const slots = this.slotPlanSlots;
+        const reused = this.slotPlanReused;
+        const freeSlots = this.freeOrganismSlots;
+        for (let i = 0; i < eggPlanCount; i++) {
+          if (freeAvail > 0) {
+            freeAvail -= 1;
+            slots[i] = freeSlots[freeAvail];
+            reused[i] = 1;
+          } else {
+            slots[i] = freshCursor++;
+            reused[i] = 0;
+          }
+          this.eggDraftSlot[i] = slots[i];
+          this.eggIsReused[i] = reused[i];
+        }
+        this.ensureEntityCapacity(freshCursor);
+
+        const speciesEggCount = this.stepSpeciesEggCount;
+        const speciesEggStart = this.stepSpeciesEggStart;
         for (let s = 0; s < sCount; s++) {
           const eCnt = speciesEggCount[s];
           if (eCnt <= 0) continue;
+          const pop = popBySpeciesIdx[s]!;
           const eStart = speciesEggStart[s];
-          popBySpeciesIdx[s]!.addPrevalidatedRange(
-            eggOrg,
-            eStart,
-            eStart + eCnt,
-            eggProvisioned,
-            'birth'
-          );
+          pop.validateBatchRange(this.eggOrg, eStart, eStart + eCnt);
+          pop.reserveAdditionalCapacity(eCnt);
         }
       }
 
       // =========================================================================
-      // PHASE 5: POST_COMMIT (Listeners, Diagnostics, Compaction — never rolls back physics)
+      // PHASE 3: PREPARE (Open EnergyTransaction -> Stage all postings -> tx.prepare())
       // =========================================================================
-      this.isPostCommit = true;
-      try {
-        for (let i = 0; i < committedDeathEvents.length; i++) {
-          this.dispatchDeathEvent(committedDeathEvents[i]);
-        }
+      tx = this.ledger.begin(targetTick);
+      this.runPrepareStages(
+        tx,
+        targetTick,
+        speciesCaches,
+        isLegacyMode,
+        hasAnyExternalSource,
+        conservativePreyProvider
+      );
 
-        if (trackMut && eggPlanCount > 0) {
-          for (let i = 0; i < eggPlanCount; i++) {
-            if (this.eggProvisioned[i] === 0) continue;
-            const records = this.eggMutationRecords[i];
-            if (!records || records.length === 0) continue;
-            const egg = this.eggOrg[i];
-            const sc = speciesCaches[this.eggSpeciesIdx[i]];
-            this.trackedMutations.push({
-              tick: targetTick,
-              speciesId: sc.species.id,
-              organismId: egg.id,
-              records: records as MutationRecord[],
-            });
-          }
-        }
+      this.onPhase?.({ tick: targetTick, phase: 'PREPARE', tx });
+      tx.prepare();
 
-        const statsBySpecies: Record<string, PopulationStats> = {};
-        if (computeStatsForTick) {
-          for (let s = 0; s < sCount; s++) {
-            const pop = popBySpeciesIdx[s];
-            if (!pop) continue;
-            statsBySpecies[speciesList[s].id] = pop.computeStats(targetTick);
-          }
-        }
-
-        const summary: BiologyTickSummary = {
-          tick: targetTick,
-          statsBySpecies,
-        };
-        if (pushToHistory) {
-          this.history.push(summary);
-          if (this.history.length > this.maxHistoryEntries) {
-            this.history.shift();
-          }
-        }
-        this.onPhase?.({ tick: targetTick, phase: 'POST_COMMIT' });
-        return summary;
-      } finally {
-        for (const pop of this.pendingCompactPops) {
-          pop.compactDead((deadOrg) => this.releaseOrganismSlot(deadOrg.id));
-          pop.rebuildSpatialIndex();
-        }
-        this.pendingCompactPops.clear();
-        this.isPostCommit = false;
-      }
+      // =========================================================================
+      // PHASE 4 & 5: COMMIT -> POST_COMMIT
+      // =========================================================================
+      const activeTx = tx;
+      tx = null; // Once committed, errors inside POST_COMMIT never abort
+      return this.runCommitAndPostCommit(
+        activeTx,
+        targetTick,
+        plannedNextId,
+        sCount,
+        speciesList,
+        speciesCaches,
+        computeStatsForTick,
+        pushToHistory
+      );
     } catch (err) {
       // ABORT: roll back staged ledger/stores and restore RNG state cleanly
       if (tx && (tx.state === 'ACTIVE' || tx.state === 'PREPARED')) {
@@ -4243,39 +4946,67 @@ export class BiologySimulation {
       throw err;
     } finally {
       // Reset per-tick sparse dirty cell heads & clear GC object references
+      const plantDirtyCount = this.curPlantDirtyCount;
       for (let i = 0; i < plantDirtyCount; i++) {
         this.plantCellHead[this.plantDirtyCells[i]] = -1;
       }
+      const carrionDirtyCount = this.curCarrionDirtyCount;
       for (let i = 0; i < carrionDirtyCount; i++) {
         this.carrionCellHead[this.carrionDirtyCells[i]] = -1;
       }
+      const detritusDirtyCount = this.curDetritusDirtyCount;
       for (let i = 0; i < detritusDirtyCount; i++) {
         this.detritusCellHead[this.detritusDirtyCells[i]] = -1;
       }
+      const preyDirtyCount = this.curPreyDirtyCount;
       for (let i = 0; i < preyDirtyCount; i++) {
         this.preyCellHead[this.preyDirtyCells[i]] = -1;
       }
+      const aliveDirtyCount = this.curAliveDirtyCount;
       for (let i = 0; i < aliveDirtyCount; i++) {
         this.aliveCellHead[this.aliveDirtyCells[i]] = -1;
       }
+      const photoCount = this.curPhotoCount;
       for (let i = 0; i < photoCount; i++) {
         this.projectedPlantCellMass[this.photoCellIdx[i]] = -1;
       }
+      const preyRemTouchedCount = this.curPreyRemTouchedCount;
       for (let i = 0; i < preyRemTouchedCount; i++) {
         this.preyRemTouched[this.preyRemTouchedList[i]] = 0;
       }
+      const newlyDiedCellCount = this.curNewlyDiedCellCount;
       for (let i = 0; i < newlyDiedCellCount; i++) {
         this.newlyDiedCellFlags[this.newlyDiedCellList[i]] = 0;
       }
+      const mtc = this.mateTouchedCount;
+      for (let i = 0; i < mtc; i++) {
+        this.mateCellCursor[this.mateCellTouched[i]] = -2;
+      }
+      this.mateTouchedCount = 0;
+      const draftCount = this.curDraftCount;
       for (let i = 0; i < draftCount; i++) {
         this.draftOrg[i] = undefined as unknown as Organism;
         this.draftPop[i] = undefined as unknown as PopulationManager;
         this.draftDeathCause[i] = null;
       }
+      const eggPlanCount = this.curEggPlanCount;
       for (let i = 0; i < eggPlanCount; i++) {
         this.eggOrg[i] = undefined as unknown as Organism;
         this.eggMutationRecords[i] = undefined;
       }
+      this.curDraftCount = 0;
+      this.curEggPlanCount = 0;
+      this.curReproPlanCount = 0;
+      this.curPredBiteCount = 0;
+      this.curPlantDirtyCount = 0;
+      this.curCarrionDirtyCount = 0;
+      this.curDetritusDirtyCount = 0;
+      this.curPreyDirtyCount = 0;
+      this.curAliveDirtyCount = 0;
+      this.curPhotoCount = 0;
+      this.curPreyRemTouchedCount = 0;
+      this.curNewlyDiedCellCount = 0;
+      this.curDiedCount = 0;
     }
   }
 

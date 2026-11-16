@@ -409,10 +409,10 @@ export class WorldEnergyGrid extends StagedStore {
 
   /** Verifies Revision 3 densities on dirty cells: PLANT=3, DETRITUS=3, CARRION=5/30 mix. */
   validateStagedStoichiometry(): void {
-    const n = this.store.dirtyCount;
+    const n = this.store.dirtyCountValue;
     if (n === 0) return;
-    const dirty = this.store.dirtyListBuffer();
-    const bufs = this.store.backBuffers();
+    const dirty = this.store.dirtyList;
+    const bufs = this.store.back;
     const pmArr = bufs[0];
     const peArr = bufs[1];
     const cmArr = bufs[2];
@@ -541,6 +541,11 @@ export class WorldEnergyGrid extends StagedStore {
 
   abortStaged(): void {
     this.store.abort();
+  }
+
+  /** @internal Exposes underlying channel store for direct validated transaction staging. */
+  _getChannelStore(): StagedChannelStore {
+    return this.store;
   }
 
   typedArrayBytes(): number {

@@ -229,6 +229,64 @@ export function euToQ(eu: number, mode: RoundingMode = 'half-even'): EnergyQ {
   return numberToQuanta(eu, EU_QUANTA_PER_UNIT, mode);
 }
 
+/** @internal Fast-path for finite eu -> half-even quanta, falling back cleanly for boundaries/errors. */
+export function euToQHalfEvenFast(eu: number): EnergyQ {
+  if (eu > 0 && eu <= 1000) {
+    const prod = eu * 1_000_000;
+    const base = Math.floor(prod);
+    const frac = prod - base;
+    if (frac < 0.4999) return base;
+    if (frac > 0.5001) return base + 1;
+  } else if (eu === 0) {
+    return 0;
+  }
+  return numberToQuanta(eu, EU_QUANTA_PER_UNIT, 'half-even');
+}
+
+/** @internal Fast-path for finite eu -> floor quanta, falling back cleanly for boundaries/errors. */
+export function euToQFloorFast(eu: number): EnergyQ {
+  if (eu > 0 && eu <= 1000) {
+    const prod = eu * 1_000_000;
+    const base = Math.floor(prod);
+    const frac = prod - base;
+    if (frac > 1e-4 && frac < 0.9999) return base;
+  } else if (eu === 0) {
+    return 0;
+  }
+  return numberToQuanta(eu, EU_QUANTA_PER_UNIT, 'floor');
+}
+
+/** @internal Fast-path for finite fraction in [0, 1] -> half-even ppm, falling back cleanly for boundaries/errors. */
+export function fractionToPpmHalfEvenFast(fraction: number): number {
+  if (fraction > 0 && fraction < 1) {
+    const prod = fraction * 1_000_000;
+    const base = Math.floor(prod);
+    const frac = prod - base;
+    if (frac < 0.4999) return base;
+    if (frac > 0.5001) return base + 1;
+  } else if (fraction === 0) {
+    return 0;
+  } else if (fraction === 1) {
+    return 1_000_000;
+  }
+  return fractionToPpm(fraction, 'half-even');
+}
+
+/** @internal Fast-path for finite fraction in [0, 1] -> floor ppm, falling back cleanly for boundaries/errors. */
+export function fractionToPpmFloorFast(fraction: number): number {
+  if (fraction > 0 && fraction < 1) {
+    const prod = fraction * 1_000_000;
+    const base = Math.floor(prod);
+    const frac = prod - base;
+    if (frac > 1e-4 && frac < 0.9999) return base;
+  } else if (fraction === 0) {
+    return 0;
+  } else if (fraction === 1) {
+    return 1_000_000;
+  }
+  return fractionToPpm(fraction, 'floor');
+}
+
 /** Lossy display conversion quanta -> MU (never feed the result back into accounting). */
 export function qToMU(q: MassQ): number {
   return assertQuanta(q, 'massQ') / MU_QUANTA_PER_UNIT;
@@ -850,11 +908,18 @@ export class ExactAccumulators {
     return hi > vHi || (hi === vHi && this.lo[i] >= v - vHi * LIMB);
   }
 
-  /** Subtracts a non-negative safe integer; throws when the result would be negative. */
-  sub(i: number, v: number): void {
-    if (!this.gte(i, v)) {
-      throw new UnitsError(`Accumulator underflow: cannot subtract ${v}`);
+  /** @internal Unchecked gte when caller already validated index `i` and non-negative safe integer `v`. */
+  gteFast(i: number, v: number): boolean {
+    if (v < LIMB) {
+      return this.hi[i] > 0 || this.lo[i] >= v;
     }
+    const vHi = Math.floor(v / LIMB);
+    const hi = this.hi[i];
+    return hi > vHi || (hi === vHi && this.lo[i] >= v - vHi * LIMB);
+  }
+
+  /** @internal Unchecked sub when caller already verified `gteFast(i, v)`. */
+  subFast(i: number, v: number): void {
     const vHi = v < LIMB ? 0 : Math.floor(v / LIMB);
     let lo = this.lo[i] - (vHi === 0 ? v : v - vHi * LIMB);
     let hi = this.hi[i] - vHi;
@@ -864,6 +929,14 @@ export class ExactAccumulators {
     }
     this.hi[i] = hi;
     this.lo[i] = lo;
+  }
+
+  /** Subtracts a non-negative safe integer; throws when the result would be negative. */
+  sub(i: number, v: number): void {
+    if (!this.gte(i, v)) {
+      throw new UnitsError(`Accumulator underflow: cannot subtract ${v}`);
+    }
+    this.subFast(i, v);
   }
 
   /** `this[i] += other[j]` */
@@ -1142,9 +1215,15 @@ export function resolveContention(
     if (!needsBigFallback) {
       const leftover = available - granted;
       if (leftover > 0 && rcCount > 0) {
+        if (leftover >= rcCount) {
+          for (let k = 0; k < rcCount; k++) {
+            grants[_rcIdx[k]] += 1;
+            granted += 1;
+          }
+          return granted;
+        }
         if (rcCount > 1) sortRcRange(0, rcCount - 1);
-        const toGive = leftover < rcCount ? leftover : rcCount;
-        for (let k = 0; k < toGive; k++) {
+        for (let k = 0; k < leftover; k++) {
           grants[_rcIdx[k]] += 1;
           granted += 1;
         }

@@ -19,6 +19,7 @@ import {
   assertQuanta,
   energyOfMass,
   euToQ,
+  euToQHalfEvenFast,
   fractionToPpm,
   massForEnergy,
   muToQ,
@@ -38,6 +39,17 @@ const LOCAL_PPM = PPM;
 const PLANT_SAFE_MASS_LIMIT = 3_002_399_751_580_330; // floor(MAX_SAFE_INT / 3)
 const STRUCT_SAFE_MASS_LIMIT = 1_801_439_850_948_198; // floor(MAX_SAFE_INT / 5)
 const RESERVE_SAFE_MASS_LIMIT = 300_239_975_158_033; // floor(MAX_SAFE_INT / 30)
+
+const _detPow075 = detPow075;
+const _divCeilBig = divCeilBig;
+const _applyPpm = applyPpm;
+const _energyOfMass = energyOfMass;
+const _euToQHalfEvenFast = euToQHalfEvenFast;
+const _scaleByRatio = scaleByRatio;
+const _splitCarrionMassInto = splitCarrionMassInto;
+const _RHO_DETRITUS = RHO_DETRITUS;
+const _RHO_RESERVE = RHO_RESERVE;
+const _RHO_STRUCT = RHO_STRUCT;
 
 const AK_ABIOTIC = AccountKind.ABIOTIC;
 const AK_HEAT = AccountKind.HEAT;
@@ -1094,19 +1106,19 @@ function applyPpmFloorFast(q: number, ppm: number): number {
   if (p <= LOCAL_MAX_SAFE_INT) {
     return (p - (p % LOCAL_PPM)) / LOCAL_PPM;
   }
-  return applyPpm(q, ppm, 'floor');
+  return _applyPpm(q, ppm, 'floor');
 }
 
 function energyOfStructFast(m: number): number {
-  return m <= STRUCT_SAFE_MASS_LIMIT ? m * 5 : energyOfMass(m, RHO_STRUCT);
+  return m <= STRUCT_SAFE_MASS_LIMIT ? m * 5 : _energyOfMass(m, _RHO_STRUCT);
 }
 
 function energyOfReserveFast(m: number): number {
-  return m <= RESERVE_SAFE_MASS_LIMIT ? m * 30 : energyOfMass(m, RHO_RESERVE);
+  return m <= RESERVE_SAFE_MASS_LIMIT ? m * 30 : _energyOfMass(m, _RHO_RESERVE);
 }
 
 function energyOfDetritusFast(m: number): number {
-  return m <= PLANT_SAFE_MASS_LIMIT ? m * 3 : energyOfMass(m, RHO_DETRITUS);
+  return m <= PLANT_SAFE_MASS_LIMIT ? m * 3 : _energyOfMass(m, _RHO_DETRITUS);
 }
 
 function neededReserveForStructGainFast(structGainMassQ: number, growthEffPpm: number): number {
@@ -1121,8 +1133,8 @@ function neededReserveForStructGainFast(structGainMassQ: number, growthEffPpm: n
     const base30 = (neededReserveEnergyQ - r30) / 30;
     return r30 === 0 ? base30 : base30 + 1;
   }
-  const neededReserveEnergyQ = divCeilBig(BigInt(structEnergyQ) * BigInt(LOCAL_PPM), BigInt(growthEffPpm));
-  return Number(divCeilBig(neededReserveEnergyQ, 30n));
+  const neededReserveEnergyQ = _divCeilBig(BigInt(structEnergyQ) * BigInt(LOCAL_PPM), BigInt(growthEffPpm));
+  return Number(_divCeilBig(neededReserveEnergyQ, 30n));
 }
 
 export function computeTotalMetabolicDemandFast(
@@ -1136,13 +1148,13 @@ export function computeTotalMetabolicDemandFast(
 ): EnergyQ {
   const totalMassQ = structMassQ + reserveMassQ;
   const totalMassMU = totalMassQ / 1_000_000;
-  const kleiberScale = totalMassMU > 0 ? detPow075(totalMassMU) : 0;
+  const kleiberScale = totalMassMU > 0 ? _detPow075(totalMassMU) : 0;
 
-  const basalDemandQ = euToQ(basalFactor * kleiberScale, 'half-even');
+  const basalDemandQ = _euToQHalfEvenFast(basalFactor * kleiberScale);
   const thermoDemandQ =
-    thermalStress > 0 ? euToQ(thermoFactor * thermalStress * kleiberScale, 'half-even') : 0;
+    thermalStress > 0 ? _euToQHalfEvenFast(thermoFactor * thermalStress * kleiberScale) : 0;
   const actDemandQ =
-    activityLevel > 0 ? euToQ(activityFactor * activityLevel * totalMassMU, 'half-even') : 0;
+    activityLevel > 0 ? _euToQHalfEvenFast(activityFactor * activityLevel * totalMassMU) : 0;
 
   return basalDemandQ + thermoDemandQ + actDemandQ;
 }
@@ -1179,10 +1191,7 @@ export function stageMetabolismFast(
   }
 
   if (burnMassQ > 0) {
-    tx.postMass(PR_METABOLISM, AK_ORGANISM_RESERVE, organismSlot, AK_ABIOTIC, 0, burnMassQ);
-  }
-  if (burnEnergyQ > 0) {
-    tx.postEnergy(PR_METABOLISM, AK_ORGANISM_RESERVE, organismSlot, AK_HEAT, 0, burnEnergyQ);
+    tx.postConsumePairFast(PR_METABOLISM, AK_ORGANISM_RESERVE, organismSlot, burnMassQ, burnEnergyQ);
   }
 }
 
@@ -1257,34 +1266,18 @@ export function stageFeedingFast(
   );
   if (foodMassQ === 0 && foodEnergyQ === 0) return;
 
-  if (out.depositMassQ > 0 || out.depositEnergyQ > 0) {
-    tx.transferBiomass(
-      PR_INGESTION,
-      srcKind,
-      srcId,
-      AK_ORGANISM_RESERVE,
-      eaterSlot,
-      out.depositMassQ,
-      out.depositEnergyQ
-    );
-  }
-  if ((out.egestaMassQ > 0 || out.egestaEnergyQ > 0) && !(srcKind === AK_CELL_DETRITUS && srcId === detritusCellIndex)) {
-    tx.transferBiomass(
-      PR_EGESTION,
-      srcKind,
-      srcId,
-      AK_CELL_DETRITUS,
-      detritusCellIndex,
-      out.egestaMassQ,
-      out.egestaEnergyQ
-    );
-  }
-  if (out.abioticMassQ > 0) {
-    tx.postMass(PR_SDA, srcKind, srcId, AK_ABIOTIC, 0, out.abioticMassQ);
-  }
-  if (out.heatQ > 0) {
-    tx.postEnergy(PR_SDA, srcKind, srcId, AK_HEAT, 0, out.heatQ);
-  }
+  tx.postFeedingFast(
+    srcKind,
+    srcId,
+    eaterSlot,
+    detritusCellIndex,
+    out.depositMassQ,
+    out.depositEnergyQ,
+    out.egestaMassQ,
+    out.egestaEnergyQ,
+    out.abioticMassQ,
+    out.heatQ
+  );
 }
 
 export function planCarrionConsumptionFast(
@@ -1293,7 +1286,25 @@ export function planCarrionConsumptionFast(
   biteMassQ: number,
   out: MutableCarrionBiteOut
 ): void {
-  splitCarrionMassInto(carrionMassQ, carrionEnergyQ, _carrionScratch);
+  let cStructMassQ: number;
+  let cReserveMassQ: number;
+  if (carrionMassQ <= RESERVE_SAFE_MASS_LIMIT) {
+    const minE = carrionMassQ * 5;
+    const maxE = carrionMassQ * 30;
+    const diff = carrionEnergyQ - minE;
+    if (carrionEnergyQ >= minE && carrionEnergyQ <= maxE && diff % 25 === 0) {
+      cReserveMassQ = diff / 25;
+      cStructMassQ = carrionMassQ - cReserveMassQ;
+    } else {
+      _splitCarrionMassInto(carrionMassQ, carrionEnergyQ, _carrionScratch);
+      cStructMassQ = _carrionScratch.structMassQ;
+      cReserveMassQ = _carrionScratch.reserveMassQ;
+    }
+  } else {
+    _splitCarrionMassInto(carrionMassQ, carrionEnergyQ, _carrionScratch);
+    cStructMassQ = _carrionScratch.structMassQ;
+    cReserveMassQ = _carrionScratch.reserveMassQ;
+  }
   if (biteMassQ > carrionMassQ) {
     throw new Error(`Cannot consume ${biteMassQ} qMU from carrion holding ${carrionMassQ} qMU`);
   }
@@ -1306,9 +1317,9 @@ export function planCarrionConsumptionFast(
     out.totalEnergyQ = 0;
     return;
   }
-  let takeReserve = scaleByRatio(_carrionScratch.reserveMassQ, biteMassQ, carrionMassQ, 'half-even');
-  const minReserve = biteMassQ > _carrionScratch.structMassQ ? biteMassQ - _carrionScratch.structMassQ : 0;
-  const maxReserve = biteMassQ < _carrionScratch.reserveMassQ ? biteMassQ : _carrionScratch.reserveMassQ;
+  let takeReserve = _scaleByRatio(cReserveMassQ, biteMassQ, carrionMassQ, 'half-even');
+  const minReserve = biteMassQ > cStructMassQ ? biteMassQ - cStructMassQ : 0;
+  const maxReserve = biteMassQ < cReserveMassQ ? biteMassQ : cReserveMassQ;
   if (takeReserve < minReserve) takeReserve = minReserve;
   if (takeReserve > maxReserve) takeReserve = maxReserve;
   const takeStruct = biteMassQ - takeReserve;
@@ -1527,21 +1538,15 @@ export function stageSomaticGrowthFast(
   const abioticInMassQ = structGainMassQ > burnReserveMassQ ? structGainMassQ - burnReserveMassQ : 0;
   const abioticOutMassQ = burnReserveMassQ > structGainMassQ ? burnReserveMassQ - structGainMassQ : 0;
 
-  tx.postEnergy(PR_GROWTH, AK_ORGANISM_RESERVE, organismSlot, AK_ORGANISM_STRUCT, organismSlot, structGainEnergyQ);
-  if (heatQ > 0) {
-    tx.postEnergy(PR_GROWTH, AK_ORGANISM_RESERVE, organismSlot, AK_HEAT, 0, heatQ);
-  }
-
   const directReserveToStruct = burnReserveMassQ < structGainMassQ ? burnReserveMassQ : structGainMassQ;
-  if (directReserveToStruct > 0) {
-    tx.postMass(PR_GROWTH, AK_ORGANISM_RESERVE, organismSlot, AK_ORGANISM_STRUCT, organismSlot, directReserveToStruct);
-  }
-  if (abioticInMassQ > 0) {
-    tx.postMass(PR_GROWTH, AK_ABIOTIC, 0, AK_ORGANISM_STRUCT, organismSlot, abioticInMassQ);
-  }
-  if (abioticOutMassQ > 0) {
-    tx.postMass(PR_GROWTH, AK_ORGANISM_RESERVE, organismSlot, AK_ABIOTIC, 0, abioticOutMassQ);
-  }
+  tx.postSomaticGrowthFast(
+    organismSlot,
+    structGainEnergyQ,
+    heatQ,
+    directReserveToStruct,
+    abioticInMassQ,
+    abioticOutMassQ
+  );
 
   return structGainMassQ;
 }
@@ -1581,10 +1586,10 @@ export function stageReproductionProvisioningFast(
   } else {
     const structReserveCostEnergyQ =
       childStructEnergyQ > 0
-        ? divCeilBig(BigInt(childStructEnergyQ) * BigInt(LOCAL_PPM), BigInt(reproEffPpm))
+        ? _divCeilBig(BigInt(childStructEnergyQ) * BigInt(LOCAL_PPM), BigInt(reproEffPpm))
         : 0n;
     const totalReserveEnergyNeededQ = structReserveCostEnergyQ + BigInt(childReserveEnergyQ);
-    burnReserveMassQ = Number(divCeilBig(totalReserveEnergyNeededQ, 30n));
+    burnReserveMassQ = Number(_divCeilBig(totalReserveEnergyNeededQ, 30n));
   }
 
   if (burnReserveMassQ > motherReserveMassQ) {
@@ -1610,30 +1615,19 @@ export function stageReproductionProvisioningFast(
   const burnReserveEnergyQ = energyOfReserveFast(burnReserveMassQ);
   const heatQ = burnReserveEnergyQ - childStructEnergyQ - childReserveEnergyQ;
 
-  if (childStructEnergyQ > 0) {
-    tx.postEnergy(PR_REPRODUCTION, AK_ORGANISM_RESERVE, motherSlot, AK_ORGANISM_STRUCT, childSlot, childStructEnergyQ);
-  }
-  if (childReserveEnergyQ > 0) {
-    tx.postEnergy(PR_REPRODUCTION, AK_ORGANISM_RESERVE, motherSlot, AK_ORGANISM_RESERVE, childSlot, childReserveEnergyQ);
-  }
-  if (heatQ > 0) {
-    tx.postEnergy(PR_REPRODUCTION, AK_ORGANISM_RESERVE, motherSlot, AK_HEAT, 0, heatQ);
-  }
-
-  if (desiredOffspringReserveMassQ > 0) {
-    tx.postMass(PR_REPRODUCTION, AK_ORGANISM_RESERVE, motherSlot, AK_ORGANISM_RESERVE, childSlot, desiredOffspringReserveMassQ);
-  }
   const directReserveToStruct =
     remainingBurnAfterYolk < desiredOffspringStructMassQ ? remainingBurnAfterYolk : desiredOffspringStructMassQ;
-  if (directReserveToStruct > 0) {
-    tx.postMass(PR_REPRODUCTION, AK_ORGANISM_RESERVE, motherSlot, AK_ORGANISM_STRUCT, childSlot, directReserveToStruct);
-  }
-  if (abioticInMassQ > 0) {
-    tx.postMass(PR_REPRODUCTION, AK_ABIOTIC, 0, AK_ORGANISM_STRUCT, childSlot, abioticInMassQ);
-  }
-  if (abioticOutMassQ > 0) {
-    tx.postMass(PR_REPRODUCTION, AK_ORGANISM_RESERVE, motherSlot, AK_ABIOTIC, 0, abioticOutMassQ);
-  }
+  tx.postReproductionProvisioningFast(
+    motherSlot,
+    childSlot,
+    childStructEnergyQ,
+    childReserveEnergyQ,
+    heatQ,
+    desiredOffspringReserveMassQ,
+    directReserveToStruct,
+    abioticInMassQ,
+    abioticOutMassQ
+  );
 
   out.provisioned = true;
   out.childStructMassQ = desiredOffspringStructMassQ;
@@ -1655,26 +1649,14 @@ export function stageDeathToCarrionFast(
   structMassQ: MassQ,
   reserveMassQ: MassQ
 ): void {
-  if (structMassQ > 0) {
-    tx.transferBiomass(
-      PR_DEATH,
-      AK_ORGANISM_STRUCT,
+  if (structMassQ > 0 || reserveMassQ > 0) {
+    tx.postDeathToCarrionFast(
       organismSlot,
-      AK_CELL_CARRION,
       cellIndex,
       structMassQ,
-      energyOfStructFast(structMassQ)
-    );
-  }
-  if (reserveMassQ > 0) {
-    tx.transferBiomass(
-      PR_DEATH,
-      AK_ORGANISM_RESERVE,
-      organismSlot,
-      AK_CELL_CARRION,
-      cellIndex,
+      structMassQ > 0 ? energyOfStructFast(structMassQ) : 0,
       reserveMassQ,
-      energyOfReserveFast(reserveMassQ)
+      reserveMassQ > 0 ? energyOfReserveFast(reserveMassQ) : 0
     );
   }
 }
@@ -1686,16 +1668,38 @@ export function stageCarrionDecompositionFast(
   energyQ: number,
   ratePpm: number
 ): void {
-  splitCarrionMassInto(massQ, energyQ, _carrionScratch);
-  const structMassQ = applyPpmFloorFast(_carrionScratch.structMassQ, ratePpm);
-  const reserveMassQ = applyPpmFloorFast(_carrionScratch.reserveMassQ, ratePpm);
+  let cStructMassQ: number;
+  let cReserveMassQ: number;
+  if (massQ <= RESERVE_SAFE_MASS_LIMIT) {
+    const minE = massQ * 5;
+    const maxE = massQ * 30;
+    const diff = energyQ - minE;
+    if (energyQ >= minE && energyQ <= maxE && diff % 25 === 0) {
+      cReserveMassQ = diff / 25;
+      cStructMassQ = massQ - cReserveMassQ;
+    } else {
+      _splitCarrionMassInto(massQ, energyQ, _carrionScratch);
+      cStructMassQ = _carrionScratch.structMassQ;
+      cReserveMassQ = _carrionScratch.reserveMassQ;
+    }
+  } else {
+    _splitCarrionMassInto(massQ, energyQ, _carrionScratch);
+    cStructMassQ = _carrionScratch.structMassQ;
+    cReserveMassQ = _carrionScratch.reserveMassQ;
+  }
+  const structMassQ = applyPpmFloorFast(cStructMassQ, ratePpm);
+  const reserveMassQ = applyPpmFloorFast(cReserveMassQ, ratePpm);
   const totalMassQ = structMassQ + reserveMassQ;
   const totalEnergyQ = energyOfStructFast(structMassQ) + energyOfReserveFast(reserveMassQ);
-  if (totalMassQ > 0) {
-    tx.postMass(PR_DECOMPOSITION, AK_CELL_CARRION, cellIndex, AK_ABIOTIC, 0, totalMassQ);
-  }
-  if (totalEnergyQ > 0) {
-    tx.postEnergy(PR_DECOMPOSITION, AK_CELL_CARRION, cellIndex, AK_HEAT, 0, totalEnergyQ);
+  if (totalMassQ > 0 && totalEnergyQ > 0) {
+    tx.postConsumePairFast(PR_DECOMPOSITION, AK_CELL_CARRION, cellIndex, totalMassQ, totalEnergyQ);
+  } else {
+    if (totalMassQ > 0) {
+      tx.postMass(PR_DECOMPOSITION, AK_CELL_CARRION, cellIndex, AK_ABIOTIC, 0, totalMassQ);
+    }
+    if (totalEnergyQ > 0) {
+      tx.postEnergy(PR_DECOMPOSITION, AK_CELL_CARRION, cellIndex, AK_HEAT, 0, totalEnergyQ);
+    }
   }
 }
 
@@ -1706,11 +1710,8 @@ export function stageDetritusDecompositionFast(
   ratePpm: number
 ): void {
   const decomposedMassQ = applyPpmFloorFast(massQ, ratePpm);
-  const decomposedEnergyQ = energyOfDetritusFast(decomposedMassQ);
   if (decomposedMassQ > 0) {
-    tx.postMass(PR_DECOMPOSITION, AK_CELL_DETRITUS, cellIndex, AK_ABIOTIC, 0, decomposedMassQ);
-  }
-  if (decomposedEnergyQ > 0) {
-    tx.postEnergy(PR_DECOMPOSITION, AK_CELL_DETRITUS, cellIndex, AK_HEAT, 0, decomposedEnergyQ);
+    const decomposedEnergyQ = energyOfDetritusFast(decomposedMassQ);
+    tx.postConsumePairFast(PR_DECOMPOSITION, AK_CELL_DETRITUS, cellIndex, decomposedMassQ, decomposedEnergyQ);
   }
 }
