@@ -9,4 +9,7 @@ export * from './foodProvider';
 export * from './lifecycle';
 export * from './reproduction';
 export * from './population';
+export * from './spatialProfile';
+export * from './spatialNavigation';
+export * from './spatialBehavior';
 export * from './biologySimulation';

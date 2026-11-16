@@ -365,6 +365,14 @@ export class PopulationManager {
     this.spatialIndexBuilt = true;
   }
 
+  /**
+   * Marks the intrusive spatial index stale after organisms changed `cellIndex` (movement).
+   * The next spatial query rebuilds it lazily in O(cells + N).
+   */
+  invalidateSpatialIndex(): void {
+    this.spatialIndexBuilt = false;
+  }
+
   ensureSpatialIndex(): void {
     if (!this.spatialIndexBuilt) {
       this.rebuildSpatialIndex();

@@ -75,6 +75,14 @@ import {
   validateSpeciesDefinition,
 } from './species';
 import {
+  OrganismSpatialState,
+  SpatialBehaviorConfig,
+  SpatialBehaviorSystem,
+  SpatialTickView,
+  Subpopulation,
+  computeSubpopulations,
+} from './spatialBehavior';
+import {
   CompetitiveConsumerRequest,
   NonConservingFoodProviderError,
   TransactionalFoodSource,
@@ -252,6 +260,12 @@ export interface BiologySimulationConfig {
     readonly carrion?: TransactionalFoodSource;
     readonly detritus?: TransactionalFoodSource;
   };
+  /**
+   * Capacity scale of the built-in conservative background prey pool (default: 3.5).
+   * `0` removes background prey entirely, so prey-eating species depend on live prey and carrion.
+   * Only applies when the simulation creates its own strict-mode prey provider.
+   */
+  readonly backgroundPreyCapacityScale?: number;
   /** Per-tick photosynthetic replenishment rate of cell plant deficit in [0, 1] (default: 0.28). */
   readonly plantPhotosynthesisRate?: number;
   /** Carrying capacity scale for primary plant production (default: 1.0). */
@@ -280,6 +294,13 @@ export interface BiologySimulationConfig {
   readonly mutationConfigOverride?: MutationConfig;
   /** Optional wrapX for local egg nesting neighbor search (default: false) */
   readonly wrapX?: boolean;
+  /**
+   * Enables autonomous spatial behavior (perception, movement, pursuit, flight, hydration and
+   * migration) inside the atomic tick. `true` uses defaults. Requires strict conservation, the
+   * built-in grid pools and the finite map (`wrapX` must stay false). Default: disabled, which
+   * keeps every pre-existing code path bit-identical.
+   */
+  readonly spatial?: SpatialBehaviorConfig | boolean;
 }
 
 export interface SpawnFounderOptions {
@@ -603,6 +624,11 @@ function sortOrScanDirtyCells(
   }
 }
 
+function hasAnyExternalFoodSource(config: BiologySimulationConfig): boolean {
+  const src = config.transactionalFoodSources;
+  return Boolean(src && (src.plant || src.prey || src.carrion || src.detritus));
+}
+
 /**
  * Main deterministic coordinator for biological simulation (Phase 2.2.1b P3).
  *
@@ -630,6 +656,7 @@ export class BiologySimulation {
   private readonly externalCarrionSource?: TransactionalFoodSource;
   private readonly externalDetritusSource?: TransactionalFoodSource;
   private readonly hasConservativePreyProvider: boolean;
+  private readonly backgroundPreyCapacityScale: number;
 
   private readonly plantPhotosynthesisRatePpm: number;
   private readonly carrionDecompositionRatePpm: number;
@@ -656,6 +683,14 @@ export class BiologySimulation {
   private readonly trackMutationEvents: boolean;
   private readonly mutationConfigOverride?: MutationConfig;
   private readonly wrapX: boolean;
+  /** Autonomous spatial behavior system, or `null` when spatial behavior is disabled. */
+  public readonly spatial: SpatialBehaviorSystem | null;
+  private readonly spatialView: SpatialTickView | null;
+  private spatialFallbackPlant: Float64Array | null = null;
+  private spatialFallbackCarrion: Float64Array | null = null;
+  private spatialFallbackDetritus: Float64Array | null = null;
+  private spatialFallbackPreyStruct: Float64Array | null = null;
+  private spatialFallbackPreyReserve: Float64Array | null = null;
 
   // Transactional entity slot management
   private readonly organismSlotBase: number;
@@ -942,6 +977,12 @@ export class BiologySimulation {
       }
     }
 
+    const bgPreyScale = config.backgroundPreyCapacityScale ?? DEFAULT_CONSERVATIVE_PREY_CAPACITY_SCALE;
+    if (!Number.isFinite(bgPreyScale) || bgPreyScale < 0) {
+      throw new RangeError(`backgroundPreyCapacityScale must be finite and >= 0, received: ${bgPreyScale}`);
+    }
+    this.backgroundPreyCapacityScale = bgPreyScale;
+
     // Validate decomposition & photosynthesis rates
     const photoRate = config.plantPhotosynthesisRate ?? 0.28;
     const plantCapScale = config.plantCarryingCapacityScale ?? 1.0;
@@ -1049,7 +1090,7 @@ export class BiologySimulation {
     } else if (this.conservationMode === 'strict') {
       const conservativeFood = new DeterministicPreyFoodProvider(config.grid, {
         seed,
-        capacityScale: DEFAULT_CONSERVATIVE_PREY_CAPACITY_SCALE,
+        capacityScale: bgPreyScale,
         regenerationRate: 0.5,
         conservative: {
           ledger: this.ledger,
@@ -1158,6 +1199,63 @@ export class BiologySimulation {
     this.mateCellCursor = new Int32Array(cc);
     this.mateCellCursor.fill(-2);
     this.mateCellTouched = new Uint32Array(cc);
+
+    // Optional autonomous spatial behavior (isolated in spatialBehavior.ts / spatialNavigation.ts)
+    const spatialCfg = config.spatial;
+    if (spatialCfg !== undefined && spatialCfg !== false) {
+      if (this.conservationMode !== 'strict') {
+        throw new RangeError(
+          'Spatial behavior requires strict conservation mode (movement energy is paid through the EnergyLedger)'
+        );
+      }
+      if (hasAnyExternalFoodSource(config)) {
+        throw new RangeError(
+          'Spatial behavior requires the built-in grid resource pools; external transactionalFoodSources are not supported'
+        );
+      }
+      if (this.wrapX) {
+        throw new RangeError(
+          'Spatial behavior uses the approved finite geography: wrapX must be false (no crossing between map edges)'
+        );
+      }
+      this.spatial = new SpatialBehaviorSystem(config.grid, seed, spatialCfg === true ? {} : spatialCfg);
+      this.spatial.ensureCapacity(this.entityStore.capacity);
+      const emptyF64 = new Float64Array(0);
+      this.spatialView = {
+        tick: 0,
+        draftCount: 0,
+        order: this.draftCanonicalOrder,
+        org: this.draftOrg,
+        orgId: this.draftOrgId,
+        slot: this.draftSlot,
+        cell: this.draftCellIndex,
+        speciesIdx: this.draftSpeciesIdx,
+        flags: this.draftFlags,
+        nextStage: this.draftNextStage,
+        nextEnergy: this.draftNextEnergy,
+        nextHealth: this.draftNextHealth,
+        structMassQ: this.draftStructMassQ,
+        reserveMassQ: this.draftPostMetabResQ,
+        reqPlantQ: this.draftReqPlantQ,
+        reqPreyQ: this.draftReqPreyQ,
+        reqCarrionQ: this.draftReqCarrionQ,
+        reqDetritusQ: this.draftReqDetritusQ,
+        grantPlantQ: this.draftGrantPlantQ,
+        grantPreyQ: this.draftGrantPreyQ,
+        grantCarrionQ: this.draftGrantCarrionQ,
+        grantDetritusQ: this.draftGrantDetritusQ,
+        speciesCount: 0,
+        preyMatrix: this.speciesPreyMatrix,
+        plantMass: emptyF64,
+        carrionMass: emptyF64,
+        detritusMass: emptyF64,
+        bgPreyStruct: null,
+        bgPreyReserve: null,
+      };
+    } else {
+      this.spatial = null;
+      this.spatialView = null;
+    }
   }
 
   private tryRegisterStoreIfUnregistered(store: WorldEnergyGrid | EntityEnergyStore): void {
@@ -1207,8 +1305,7 @@ export class BiologySimulation {
           const { x, y } = this.grid.fromIndex(idx);
           const biome = this.grid.getBiome(x, y) ?? 'savanna';
           const preyCapMU =
-            DeterministicPreyFoodProvider.getBiomeBasePrey(biome) *
-            DEFAULT_CONSERVATIVE_PREY_CAPACITY_SCALE;
+            DeterministicPreyFoodProvider.getBiomeBasePrey(biome) * this.backgroundPreyCapacityScale;
           const preySeedQ = preyCapMU > 0 ? muToQ(preyCapMU, 'half-even') : 0;
           if (preySeedQ > 0) {
             tx.transferBiomass(
@@ -1331,6 +1428,9 @@ export class BiologySimulation {
     this.slotCarryCreditQ = growFloat(this.slotCarryCreditQ);
     this.slotMaxReserveMassQ = growFloat(this.slotMaxReserveMassQ);
     this.slotLastSyncedEnergy = growFloat(this.slotLastSyncedEnergy);
+    if (this.spatial !== null) {
+      this.spatial.ensureCapacity(nextCap);
+    }
   }
 
   private planSlotAllocations(count: number): {
@@ -1373,6 +1473,9 @@ export class BiologySimulation {
     this.slotCarryCreditQ[slot] = 0;
     this.slotMaxReserveMassQ[slot] = 0;
     this.slotLastSyncedEnergy[slot] = 0;
+    if (this.spatial !== null) {
+      this.spatial.releaseSlot(slot);
+    }
     this.freeOrganismSlots.push(slot);
   }
 
@@ -1432,6 +1535,7 @@ export class BiologySimulation {
     const preferredIndices: number[] = [];
     const center = options.center;
     const radius = center?.radius ?? Math.max(this.grid.width, this.grid.height);
+    const spatialSpeciesIdx = this.spatial !== null ? this.resolveSpatialSpeciesIndex(species) : -1;
 
     for (let y = 0; y < this.grid.height; y++) {
       for (let x = 0; x < this.grid.width; x++) {
@@ -1442,7 +1546,10 @@ export class BiologySimulation {
         }
         const terrain = this.grid.getTerrain(x, y)!;
         const biome = this.grid.getBiome(x, y)!;
-        if (terrain === 'deep-water' || terrain === 'shallow-water') continue;
+        if (this.spatial !== null) {
+          // Spatial mode: habitable means passable for the species' own locomotion (land or water)
+          if (!this.spatial.isHabitableCell(spatialSpeciesIdx, y * this.grid.width + x)) continue;
+        } else if (terrain === 'deep-water' || terrain === 'shallow-water') continue;
         if (options.filterCell && !options.filterCell(x, y, terrain, biome)) continue;
         const idx = this.grid.toIndex(x, y);
         candidateIndices.push(idx);
@@ -1535,6 +1642,9 @@ export class BiologySimulation {
         this.slotCarryCreditQ[slot] = 0;
         this.slotMaxReserveMassQ[slot] = m.maxReserveMassQ;
         this.slotLastSyncedEnergy[slot] = org.energy;
+        if (this.spatial !== null) {
+          this.spatial.initSlot(slot, org.id, org.cellIndex);
+        }
       }
       pop.addOrganismsBatch(spawned, 'introduced');
       return spawned;
@@ -1558,10 +1668,16 @@ export class BiologySimulation {
       throw new RangeError(`Spawn coordinates out of bounds: (${opts.x}, ${opts.y})`);
     }
     const terrain = this.grid.getTerrain(opts.x, opts.y);
-    if (terrain === 'deep-water' || terrain === 'shallow-water') {
+    const species = this.speciesRegistry.get(opts.speciesId);
+    if (this.spatial !== null) {
+      if (!this.spatial.isHabitableCell(this.resolveSpatialSpeciesIndex(species), cellIndex)) {
+        throw new RangeError(
+          `Cannot spawn "${opts.speciesId}" on terrain "${terrain}" impassable for its locomotion (${opts.x}, ${opts.y})`
+        );
+      }
+    } else if (terrain === 'deep-water' || terrain === 'shallow-water') {
       throw new RangeError(`Cannot spawn land organism on water terrain (${opts.x}, ${opts.y})`);
     }
-    const species = this.speciesRegistry.get(opts.speciesId);
     const pop = this.getOrCreatePopulation(opts.speciesId);
     const nextIdBefore = this.nextId;
 
@@ -1626,6 +1742,9 @@ export class BiologySimulation {
       this.slotCarryCreditQ[slot] = 0;
       this.slotMaxReserveMassQ[slot] = m.maxReserveMassQ;
       this.slotLastSyncedEnergy[slot] = org.energy;
+      if (this.spatial !== null) {
+        this.spatial.initSlot(slot, org.id, org.cellIndex);
+      }
       pop.addOrganism(org, 'introduced');
       return org;
     } catch (err) {
@@ -1653,7 +1772,8 @@ export class BiologySimulation {
     parentY: number,
     parentCellIdx: number,
     cellCounts: Uint32Array,
-    rng: SeededRng
+    rng: SeededRng,
+    speciesIdx: number
   ): number {
     const localCount = cellCounts[parentCellIdx];
     if (localCount < 4) {
@@ -1678,7 +1798,9 @@ export class BiologySimulation {
       }
       const nIdx = ny * width + nx;
       if (nIdx === parentCellIdx) continue;
-      if (terrainCode[nIdx] <= 1) continue; // deep-water=0, shallow-water=1
+      if (this.spatial !== null) {
+        if (!this.spatial.isHabitableCell(speciesIdx, nIdx)) continue;
+      } else if (terrainCode[nIdx] <= 1) continue; // deep-water=0, shallow-water=1
       const load = cellCounts[nIdx];
       if (load < bestLoad || (load === bestLoad && rng.chance(0.35))) {
         bestLoad = load;
@@ -2182,7 +2304,21 @@ export class BiologySimulation {
 
     this.speciesCacheList = list;
     this.speciesPreyMatrix = preyMatrix;
+    if (this.spatial !== null) {
+      this.spatial.configureSpecies(list, preyMatrix);
+    }
     return list;
+  }
+
+  /** Index of `species` in the registry order used by the spatial system (spatial mode only). */
+  private resolveSpatialSpeciesIndex(species: SpeciesDefinition): number {
+    const list = this.speciesRegistry.list();
+    this.ensureSpeciesCaches(list);
+    const idx = list.indexOf(species);
+    if (idx < 0) {
+      throw new RangeError(`Species "${species.id}" is not registered`);
+    }
+    return idx;
   }
 
   private ensureDraftCapacity(needed: number): void {
@@ -3098,8 +3234,14 @@ export class BiologySimulation {
     );
 
     // 2c. Live prey predation & background prey pool
-    let predBiteCount = 0;
-    let preyRemTouchedCount = 0;
+    // Spatial mode: a bite requires a capture attempt that actually lands (pursuit, strike range,
+    // probabilistic outcome), so co-located prey is no longer consumed automatically.
+    const spatialActive = this.spatial !== null;
+    if (spatialActive && hasMultiSpecies && preyDirtyCount > 0) {
+      this.resolveSpatialLivePredation();
+    }
+    let predBiteCount = this.curPredBiteCount;
+    let preyRemTouchedCount = this.curPreyRemTouchedCount;
     const preyRemStructQ = this.preyRemStructQ;
     const preyRemReserveQ = this.preyRemReserveQ;
     const preyRemTouched = this.preyRemTouched;
@@ -3110,7 +3252,7 @@ export class BiologySimulation {
       sortOrScanDirtyCells(preyDirtyCount, this.grid.cellCount, preyCellHead, preyDirtyCells);
       for (let ci = 0; ci < preyDirtyCount; ci++) {
         const cellIdx = preyDirtyCells[ci];
-        const firstAlive = hasMultiSpecies ? aliveCellHead[cellIdx] : -1;
+        const firstAlive = hasMultiSpecies && !spatialActive ? aliveCellHead[cellIdx] : -1;
         if (firstAlive !== -1 && aliveNextDraft[firstAlive] !== -1) {
           for (let pCur = preyCellHead[cellIdx]; pCur !== -1; pCur = preyNextDraft[pCur]) {
             let remReq = draftReqPreyQ[pCur];
@@ -3224,6 +3366,98 @@ export class BiologySimulation {
     this.curPreyRemTouchedCount = preyRemTouchedCount;
   }
 
+  /**
+   * Spatial-mode live predation: each hungry predator gets at most one capture attempt per tick,
+   * decided by `SpatialBehaviorSystem.attemptCapture` (pursued target within strike range, or
+   * opportunistic prey in the same cell). Only a successful attempt produces a bite; the bite
+   * arithmetic and lethality rule are identical to the non-spatial in-cell loop.
+   */
+  private resolveSpatialLivePredation(): void {
+    const spatial = this.spatial!;
+    const draftCount = this.curDraftCount;
+    const draftCanonicalOrder = this.draftCanonicalOrder;
+    const draftFlags = this.draftFlags;
+    const draftNextStage = this.draftNextStage;
+    const draftOrgId = this.draftOrgId;
+    const draftDeathCause = this.draftDeathCause;
+    const draftKillerId = this.draftKillerId;
+    const draftNextHealth = this.draftNextHealth;
+    const draftStructMassQ = this.draftStructMassQ;
+    const draftPostMetabResQ = this.draftPostMetabResQ;
+    const draftReqPreyQ = this.draftReqPreyQ;
+    const draftGrantPreyQ = this.draftGrantPreyQ;
+    const preyRemStructQ = this.preyRemStructQ;
+    const preyRemReserveQ = this.preyRemReserveQ;
+    const preyRemTouched = this.preyRemTouched;
+
+    let predBiteCount = this.curPredBiteCount;
+    let preyRemTouchedCount = this.curPreyRemTouchedCount;
+
+    for (let ci = 0; ci < draftCount; ci++) {
+      const pCur = draftCanonicalOrder[ci];
+      const remReq = draftReqPreyQ[pCur] - draftGrantPreyQ[pCur];
+      if (remReq <= 0) continue;
+      if ((draftFlags[pCur] & FLAG_DIED) !== 0 || draftNextStage[pCur] === STAGE_EGG) continue;
+
+      const vCur = spatial.attemptCapture(pCur);
+      if (vCur === -1) continue;
+
+      if (preyRemTouched[vCur] === 0) {
+        preyRemTouched[vCur] = 1;
+        if (preyRemTouchedCount >= this.preyRemTouchedList.length) {
+          const nextT = new Int32Array(this.preyRemTouchedList.length * 2);
+          nextT.set(this.preyRemTouchedList);
+          this.preyRemTouchedList = nextT;
+        }
+        this.preyRemTouchedList[preyRemTouchedCount++] = vCur;
+        preyRemStructQ[vCur] = draftStructMassQ[vCur];
+        preyRemReserveQ[vCur] = draftPostMetabResQ[vCur];
+      }
+
+      const remS = preyRemStructQ[vCur];
+      const remR = preyRemReserveQ[vCur];
+      const totalPreyMass = _safeAdd(remS, remR);
+      if (totalPreyMass <= 0) continue;
+
+      const biteMassQ = remReq < totalPreyMass ? remReq : totalPreyMass;
+      if (biteMassQ <= 0) continue;
+      const reserveBite = _scaleByRatio(remR, biteMassQ, totalPreyMass, 'half-even');
+      let clampedResBite = biteMassQ < remR ? biteMassQ : remR;
+      if (reserveBite < clampedResBite) clampedResBite = reserveBite > 0 ? reserveBite : 0;
+      const structBite = biteMassQ - clampedResBite;
+
+      const nextRemS = remS - structBite;
+      preyRemReserveQ[vCur] = remR - clampedResBite;
+      preyRemStructQ[vCur] = nextRemS;
+      draftGrantPreyQ[pCur] += biteMassQ;
+      draftFlags[vCur] |= FLAG_TOUCHED_PRED;
+
+      const candStruct = draftStructMassQ[vCur];
+      const lethal =
+        nextRemS <= 0 ||
+        structBite >= _scaleByRatio(candStruct, 35, 100, 'ceil') ||
+        nextRemS < _scaleByRatio(candStruct, 65, 100, 'floor');
+
+      if (lethal) {
+        draftFlags[vCur] |= FLAG_DIED;
+        draftDeathCause[vCur] = 'predation';
+        draftKillerId[vCur] = draftOrgId[pCur];
+        draftNextHealth[vCur] = 0;
+      }
+
+      if (predBiteCount >= this.predBiteCap) {
+        this.ensurePredBiteCapacity(predBiteCount + 1);
+      }
+      this.predBitePredDraft[predBiteCount] = pCur;
+      this.predBitePreyDraft[predBiteCount] = vCur;
+      this.predBiteMassQ[predBiteCount] = biteMassQ;
+      predBiteCount++;
+    }
+
+    this.curPredBiteCount = predBiteCount;
+    this.curPreyRemTouchedCount = preyRemTouchedCount;
+  }
+
   private evaluatePostFeedMortality(
     speciesCaches: SpeciesRuntimeCache[],
     isLegacyMode: boolean,
@@ -3260,6 +3494,8 @@ export class BiologySimulation {
     const gridFront = this.useDirectEnergyGrid ? energyGrid._getChannelStore().front : null;
     const carrionMFront = gridFront ? gridFront[2] : null;
     const carrionEFront = gridFront ? gridFront[3] : null;
+    const spatial = this.spatial;
+    const draftSlot = this.draftSlot;
 
     let diedCount = 0;
 
@@ -3359,6 +3595,7 @@ export class BiologySimulation {
 
       let nextHealth: number;
       let healed = false;
+      let dehydrationDamage = 0;
       if (nextStageCode === STAGE_EGG) {
         let h = curHealth;
         if (tStress > 0) {
@@ -3369,6 +3606,8 @@ export class BiologySimulation {
         }
         nextHealth = h;
       } else {
+        // Spatial mode only: a fully dehydrated organism loses health and cannot heal
+        dehydrationDamage = spatial !== null ? spatial.dehydrationDamage(draftSlot[dIdx]) : 0;
         let healthDelta = 0;
         if (tStress > 0) {
           healthDelta -= tStress * sc.thermalDamagePerTick;
@@ -3376,9 +3615,12 @@ export class BiologySimulation {
         if (nextEnergy <= 0) {
           const starvationMitigation = Math.max(0.65, 1.15 - 0.15 * endur);
           healthDelta -= sc.starvationDamagePerTick * starvationMitigation;
-        } else if (tStress === 0 && nextEnergy >= 0.45 && curHealth < 1.0) {
+        } else if (tStress === 0 && nextEnergy >= 0.45 && curHealth < 1.0 && dehydrationDamage === 0) {
           healthDelta += sc.healingPerTick * (0.75 + 0.25 * endur);
           healed = true;
+        }
+        if (dehydrationDamage > 0) {
+          healthDelta -= dehydrationDamage;
         }
         nextHealth = Math.min(1.0, Math.max(0, curHealth + healthDelta));
       }
@@ -3398,6 +3640,7 @@ export class BiologySimulation {
       } else if (nextHealth <= 0) {
         if (nextEnergy <= 0 && tStress <= 0.15) deathCause = 'starvation';
         else if (tStress > 0.15) deathCause = 'thermal-stress';
+        else if (dehydrationDamage > 0) deathCause = 'dehydration';
         else deathCause = 'starvation';
       } else if (nextStageCode === STAGE_ELDER) {
         const genArr = org.phenotype.geneticExpression;
@@ -3542,7 +3785,8 @@ export class BiologySimulation {
           female.y,
           draftCellIndex[fIdx],
           cellCounts,
-          reproductionRng
+          reproductionRng,
+          s
         );
         const nestY = (nestCellIdx / gridWidth) | 0;
         const nestX = nestCellIdx - nestY * gridWidth;
@@ -4261,6 +4505,26 @@ export class BiologySimulation {
       }
     }
 
+    // 3f'. Spatial mode: locomotion, sprint and capture-attempt energy (ORGANISM_RESERVE -> HEAT),
+    // paid through the same metabolism posting as every other activity cost
+    if (this.spatial !== null) {
+      const spatial = this.spatial;
+      for (let ci = 0; ci < draftCount; ci++) {
+        const dIdx = draftCanonicalOrder[ci];
+        if ((draftFlags[dIdx] & FLAG_DIED) !== 0) continue;
+        const slot = draftSlot[dIdx];
+        const moveDemandQ = spatial.stagedDemandQ(slot);
+        if (moveDemandQ <= 0) continue;
+        const stagedResM = esResBack !== null
+          ? esResBack[slot]
+          : useDirectEntity
+            ? entityStore.stagedReserveMassUnsafe(slot)
+            : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, slot));
+        _stageMetabolismFast(tx, slot, stagedResM, moveDemandQ, draftPostMetabCarryQ[dIdx], metabScratch);
+        draftPostMetabCarryQ[dIdx] = metabScratch.nextCarryCreditQ;
+      }
+    }
+
     // 3g. Somatic Growth
     if (draftCount > 0) {
       for (let ci = 0; ci < draftCount; ci++) {
@@ -4638,6 +4902,9 @@ export class BiologySimulation {
         const normEggE = rawEggNorm < 1 ? rawEggNorm : 1;
         egg.energy = normEggE;
         slotLastSyncedEnergy[slot] = normEggE;
+        if (this.spatial !== null) {
+          this.spatial.initSlot(slot, egg.id, egg.cellIndex);
+        }
         phenCtx.physicalMaturityScale = 0.15;
         phenCtx.neuralMaturityScale = 0.15;
         phenCtx.senescencePhysicalScale = 1.0;
@@ -4669,6 +4936,17 @@ export class BiologySimulation {
           eggProvisioned,
           'birth'
         );
+      }
+    }
+
+    // Spatial mode: the energy transaction is durable, so the staged movement plan becomes current
+    // (positions, behavior state, memory). Pure typed-array copies; cannot throw.
+    if (this.spatial !== null) {
+      const movedCount = this.spatial.commitTick();
+      if (movedCount > 0) {
+        for (let i = 0; i < touchedPops.length; i++) {
+          touchedPops[i].invalidateSpatialIndex();
+        }
       }
     }
 
@@ -4835,6 +5113,10 @@ export class BiologySimulation {
         sortInt32IndicesByFloat64Key(this.draftCanonicalOrder, this.draftOrgId, 0, this.curDraftCount - 1);
       }
 
+      if (this.spatial !== null) {
+        this.spatial.beginTick(this.prepareSpatialView(targetTick, sCount));
+      }
+
       // =========================================================================
       // PHASE 2: RESOLVE (Deterministic conflict resolution & biological planning)
       // =========================================================================
@@ -4867,6 +5149,12 @@ export class BiologySimulation {
         targetTick,
         plannedNextId
       );
+
+      // Spatial mode: every surviving organism perceives its surroundings, chooses an activity and
+      // plans this tick's movement. Results are STAGED; nothing is applied before COMMIT.
+      if (this.spatial !== null) {
+        this.spatial.planTick();
+      }
 
       // =========================================================================
       // PHASE 2.5: PRE_ALLOCATE (Between transactions — zero semantic state mutated)
@@ -4945,6 +5233,11 @@ export class BiologySimulation {
       this.streams.restoreStates(rngSnapshot);
       throw err;
     } finally {
+      // Spatial mode: drop every staged decision/movement (after COMMIT they are already applied;
+      // after ABORT this is what guarantees coordinates and behavior state stay untouched)
+      if (this.spatial !== null) {
+        this.spatial.endTick();
+      }
       // Reset per-tick sparse dirty cell heads & clear GC object references
       const plantDirtyCount = this.curPlantDirtyCount;
       for (let i = 0; i < plantDirtyCount; i++) {
@@ -5008,6 +5301,113 @@ export class BiologySimulation {
       this.curNewlyDiedCellCount = 0;
       this.curDiedCount = 0;
     }
+  }
+
+  /**
+   * Points the spatial system's read-only view at this tick's draft buffers and committed
+   * resource pools (front buffers). Allocation-free on the direct-store fast path.
+   */
+  private prepareSpatialView(targetTick: number, sCount: number): SpatialTickView {
+    const view = this.spatialView!;
+    view.tick = targetTick;
+    view.draftCount = this.curDraftCount;
+    view.order = this.draftCanonicalOrder;
+    view.org = this.draftOrg;
+    view.orgId = this.draftOrgId;
+    view.slot = this.draftSlot;
+    view.cell = this.draftCellIndex;
+    view.speciesIdx = this.draftSpeciesIdx;
+    view.flags = this.draftFlags;
+    view.nextStage = this.draftNextStage;
+    view.nextEnergy = this.draftNextEnergy;
+    view.nextHealth = this.draftNextHealth;
+    view.structMassQ = this.draftStructMassQ;
+    view.reserveMassQ = this.draftPostMetabResQ;
+    view.reqPlantQ = this.draftReqPlantQ;
+    view.reqPreyQ = this.draftReqPreyQ;
+    view.reqCarrionQ = this.draftReqCarrionQ;
+    view.reqDetritusQ = this.draftReqDetritusQ;
+    view.grantPlantQ = this.draftGrantPlantQ;
+    view.grantPreyQ = this.draftGrantPreyQ;
+    view.grantCarrionQ = this.draftGrantCarrionQ;
+    view.grantDetritusQ = this.draftGrantDetritusQ;
+    view.speciesCount = sCount;
+    view.preyMatrix = this.speciesPreyMatrix;
+
+    const cc = this.grid.cellCount;
+    if (this.useDirectEnergyGrid) {
+      const front = this.energyGrid._getChannelStore().front;
+      view.plantMass = front[0];
+      view.carrionMass = front[2];
+      view.detritusMass = front[4];
+    } else {
+      const plant = (this.spatialFallbackPlant ??= new Float64Array(cc));
+      const carrion = (this.spatialFallbackCarrion ??= new Float64Array(cc));
+      const detritus = (this.spatialFallbackDetritus ??= new Float64Array(cc));
+      const energyGrid = this.energyGrid;
+      for (let c = 0; c < cc; c++) {
+        plant[c] = energyGrid.getMassQ(POOL_PLANT, c);
+        carrion[c] = energyGrid.getMassQ(POOL_CARRION, c);
+        detritus[c] = energyGrid.getMassQ(POOL_DETRITUS, c);
+      }
+      view.plantMass = plant;
+      view.carrionMass = carrion;
+      view.detritusMass = detritus;
+    }
+
+    const conservativePrey =
+      this.hasConservativePreyProvider && this.foodProvider instanceof DeterministicPreyFoodProvider
+        ? this.foodProvider
+        : null;
+    if (conservativePrey === null) {
+      view.bgPreyStruct = null;
+      view.bgPreyReserve = null;
+    } else if (this.useDirectEntityStore) {
+      // Conservative prey pools occupy entity slots [0, cellCount) (preySlotOffset === 0)
+      const esFront = this.entityStore._getChannelStore().front;
+      view.bgPreyStruct = esFront[0];
+      view.bgPreyReserve = esFront[2];
+    } else {
+      const struct = (this.spatialFallbackPreyStruct ??= new Float64Array(cc));
+      const reserve = (this.spatialFallbackPreyReserve ??= new Float64Array(cc));
+      const entityStore = this.entityStore;
+      for (let c = 0; c < cc; c++) {
+        struct[c] = entityStore.structMassQ(c);
+        reserve[c] = entityStore.reserveMassQ(c);
+      }
+      view.bgPreyStruct = struct;
+      view.bgPreyReserve = reserve;
+    }
+    return view;
+  }
+
+  /** Inspection snapshot of an organism's spatial state (`undefined` when spatial mode is off). */
+  getOrganismSpatialState(organismId: number): OrganismSpatialState | undefined {
+    if (this.spatial === null) return undefined;
+    const slot = this.organismIdToSlot.get(organismId);
+    return slot === undefined ? undefined : this.spatial.describeSlot(slot);
+  }
+
+  /**
+   * Spatially separated groups of a species: occupied cells closer than `linkDistance` (Chebyshev)
+   * belong to the same subpopulation. Measurement foundation for geographic isolation and genetic
+   * divergence; works with or without spatial behavior and performs no speciation.
+   */
+  getSubpopulations(speciesId: string, linkDistance = 3): Subpopulation[] {
+    const species = this.speciesRegistry.get(speciesId);
+    let navComponent: Int32Array | undefined;
+    if (this.spatial !== null) {
+      const sIdx = this.resolveSpatialSpeciesIndex(species);
+      const profileClass = this.spatial.navigator.component;
+      navComponent = profileClass[this.spatial.getNavClass(sIdx)];
+    }
+    return computeSubpopulations(
+      this.getOrCreatePopulation(speciesId).getActiveOrganisms(),
+      this.grid.width,
+      this.grid.height,
+      linkDistance,
+      navComponent
+    );
   }
 
   /**
