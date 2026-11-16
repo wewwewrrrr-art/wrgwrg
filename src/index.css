@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-display: 'Outfit', system-ui, sans-serif;
+    --font-sans: 'Plus Jakarta Sans', system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: #0B0B0D;
+    color: #F4F2ED;
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: var(--font-display);
+  }
+
+  code, pre, .font-mono {
+    font-family: var(--font-mono);
+  }
+}
+
+.pixelated-canvas {
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+
+.checker-bg {
+  background-color: #18181B;
+  background-image:
+    linear-gradient(45deg, #222226 25%, transparent 25%),
+    linear-gradient(-45deg, #222226 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #222226 75%),
+    linear-gradient(-45deg, transparent 75%, #222226 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+}
+
+.meadow-bg {
+  background-color: #354D32;
+  background-image:
+    radial-gradient(#425E3D 15%, transparent 16%),
+    radial-gradient(#2B3F29 15%, transparent 16%);
+  background-size: 24px 24px;
+  background-position: 0 0, 12px 12px;
+}
+
+.ocean-bg {
+  background-color: #0E2B42;
+  background-image:
+    linear-gradient(180deg, #133956 0%, #0C253A 55%, #071929 100%),
+    radial-gradient(rgba(151, 224, 240, 0.08) 12%, transparent 14%);
+  background-size: 100% 100%, 22px 22px;
+}
+
