@@ -169,6 +169,11 @@ function createDefaultConservativePreyProfile(
  */
 export class DeterministicPreyFoodProvider implements FoodProvider {
   public readonly cellCount: number;
+  /**
+   * Vegetation mode (set by the simulation for one tick): edible plant mass left per cell. Background
+   * prey graze only this part of `CELL_PLANT` and decrement it, so wood is never eaten.
+   */
+  public plantEdibleLimitQ: Float64Array | null = null;
   public readonly conservationMode: FoodConservationMode;
   public readonly isPhysicallyClosed: boolean;
 
@@ -426,9 +431,11 @@ export class DeterministicPreyFoodProvider implements FoodProvider {
         : applyPpm(deficitQ, regenPpm, 'floor');
     if (targetGainMassQ <= 0) return 0;
 
-    const plantAvailQ = isLedgerTx
+    let plantAvailQ = isLedgerTx
       ? b.energyGrid.getStagedMassUnsafe(POOL_PLANT, cellIndex)
       : Number(tx.stagedMassQ(AK_CELL_PLANT, cellIndex));
+    const edibleLimit = this.plantEdibleLimitQ;
+    if (edibleLimit !== null && plantAvailQ > edibleLimit[cellIndex]) plantAvailQ = Math.max(0, edibleLimit[cellIndex]);
     const detritusAvailQ = isLedgerTx
       ? b.energyGrid.getStagedMassUnsafe(POOL_DETRITUS, cellIndex)
       : Number(tx.stagedMassQ(AK_CELL_DETRITUS, cellIndex));
@@ -459,6 +466,7 @@ export class DeterministicPreyFoodProvider implements FoodProvider {
     let totalGainedMassQ = 0;
 
     const grazePlantQ = plantAvailQ < desiredPlantMassQ ? plantAvailQ : desiredPlantMassQ;
+    if (grazePlantQ > 0 && remainingHeadroomQ > 0 && edibleLimit !== null) edibleLimit[cellIndex] -= grazePlantQ;
     if (grazePlantQ > 0 && remainingHeadroomQ > 0) {
       stageFeedingFast(
         tx,
@@ -547,6 +555,7 @@ export class DeterministicPreyFoodProvider implements FoodProvider {
     const detritusBack = gridChBack[4];
     const preySlotOffset = b.preySlotOffset;
     const plantSharePpm = b.plantDonorSharePpm;
+    const edibleLimit = this.plantEdibleLimitQ;
     const absorptionPpm = b.absorptionPpm;
     const assimilationPpm = b.assimilationPpm;
     const sdaPpm = b.sdaPpm;
@@ -572,7 +581,8 @@ export class DeterministicPreyFoodProvider implements FoodProvider {
           : applyPpm(deficitQ, regenPpm, 'floor');
       if (targetGainMassQ <= 0) continue;
 
-      const plantAvailQ = plantBack[cellIndex];
+      let plantAvailQ = plantBack[cellIndex];
+      if (edibleLimit !== null && plantAvailQ > edibleLimit[cellIndex]) plantAvailQ = Math.max(0, edibleLimit[cellIndex]);
       const detritusAvailQ = detritusBack[cellIndex];
       if (plantAvailQ === 0 && detritusAvailQ === 0) continue;
 
@@ -597,6 +607,7 @@ export class DeterministicPreyFoodProvider implements FoodProvider {
 
       let remainingHeadroomQ = targetGainMassQ;
       const grazePlantQ = plantAvailQ < desiredPlantMassQ ? plantAvailQ : desiredPlantMassQ;
+      if (grazePlantQ > 0 && remainingHeadroomQ > 0 && edibleLimit !== null) edibleLimit[cellIndex] -= grazePlantQ;
       if (grazePlantQ > 0 && remainingHeadroomQ > 0) {
         stageFeedingFast(
           tx,

@@ -76,6 +76,7 @@ import {
   getSpeciesBaselineAnatomy,
   inheritOrganismAnatomy,
 } from './anatomy';
+import { VegetationConfig, VegetationSystem } from './vegetation';
 import {
   ReproductiveCompatibilityResult,
   areSpeciesCladeCompatible,
@@ -302,6 +303,12 @@ export interface BiologySimulationConfig {
   readonly plantPhotosynthesisRate?: number;
   /** Carrying capacity scale for primary plant production (default: 1.0). */
   readonly plantCarryingCapacityScale?: number;
+  /**
+   * Autonomous plant life (Phase 2.4.1, default off): herbs/algae aggregated per cell and woody
+   * individuals with ids replace the plain logistic refill of the plant pools. Strict conservation
+   * with the simulation's own energy grid only.
+   */
+  readonly vegetation?: VegetationConfig | boolean;
   /** Per-tick fractional decay of cell carrion into ABIOTIC + HEAT in [0, 1] (default: 0.15). */
   readonly carrionDecompositionRate?: number;
   /** Per-tick fractional decay of cell detritus into ABIOTIC + HEAT in [0, 1] (default: 0.08). */
@@ -751,6 +758,11 @@ export class BiologySimulation {
   private readonly carrionDecompositionRatePpm: number;
   private readonly detritusDecompositionRatePpm: number;
   private readonly plantCapacityQ: Float64Array;
+  /** Autonomous plant life (null unless `config.vegetation`). */
+  public readonly vegetation: VegetationSystem | null = null;
+  /** Edible plant mass still available this tick (vegetation mode; grazing decrements it). */
+  private vegEdibleRemaining: Float64Array | null = null;
+  private vegProjectedSet = false;
   private readonly landCellIndices: Uint32Array;
   private readonly onPhase?: (context: BiologyPhaseHookContext) => void;
 
@@ -1151,6 +1163,19 @@ export class BiologySimulation {
     }
     this.landCellIndices = Uint32Array.from(landCells);
 
+    if (config.vegetation !== undefined && config.vegetation !== false) {
+      if (this.conservationMode !== 'strict') {
+        throw new RangeError('vegetation requires strict conservation mode');
+      }
+      if (config.worldEnergyGrid !== undefined || config.energyLedger !== undefined || config.transactionalFoodSources?.plant) {
+        throw new RangeError('vegetation requires the simulation-owned energy grid, ledger and plant pools');
+      }
+      this.vegetation = new VegetationSystem(config.grid, this.plantCapacityQ, config.vegetation === true ? {} : config.vegetation);
+      this.vegEdibleRemaining = new Float64Array(config.grid.cellCount);
+      // register the stream up front so that tick snapshots/ABORT restores always include it
+      this.streams.get('biology:vegetation');
+    }
+
     // Build or attach Energy economy stores + EnergyLedger
     const defaultAbioticMU = config.initialAbioticMassMU ?? Math.max(100_000, landCells.length * 400);
     if (!Number.isFinite(defaultAbioticMU) || defaultAbioticMU < 0) {
@@ -1426,11 +1451,20 @@ export class BiologySimulation {
 
   private seedInitialEcosystemGenesis(conservativePrey: DeterministicPreyFoodProvider | null): void {
     const tx = this.ledger.begin(0, { genesis: true });
+    // Vegetation mode: the initial plant pool is the vegetation's own initial herb cover (exact
+    // partition), including aquatic producers in water cells
+    const vegInit = this.vegetation !== null ? this.vegetation.initializeGenesis() : null;
     try {
+      if (vegInit !== null) {
+        for (let idx = 0; idx < vegInit.length; idx++) {
+          if (this.plantCapacityQ[idx] > 0 || vegInit[idx] <= 0) continue; // land cells below
+          tx.transferBiomass(PostingReason.GENESIS, AccountKind.GENESIS, 0, AccountKind.CELL_PLANT, idx, vegInit[idx], energyOfMass(vegInit[idx], RHO_PLANT));
+        }
+      }
       for (let k = 0; k < this.landCellIndices.length; k++) {
         const idx = this.landCellIndices[k];
         const capPlantQ = this.plantCapacityQ[idx];
-        const seedPlantQ = applyPpm(capPlantQ, 700_000, 'floor');
+        const seedPlantQ = vegInit !== null ? vegInit[idx] : applyPpm(capPlantQ, 700_000, 'floor');
         if (seedPlantQ > 0) {
           tx.transferBiomass(
             PostingReason.GENESIS,
@@ -1665,6 +1699,62 @@ export class BiologySimulation {
     this.reusableEnv.moisture = this.grid.moisture[cellIndex];
     this.reusableEnv.tick = tick;
     return this.reusableEnv;
+  }
+
+  /**
+   * Vegetation mode: plants `count` woody founders of `speciesId` (one per cell drawn among the
+   * suitable cells, optionally within `center`), funded from GENESIS into the cells' plant pools.
+   * Between ticks only. Returns the new plant ids.
+   */
+  spawnPlantPopulation(
+    speciesId: string,
+    count: number,
+    options: { readonly center?: { readonly x: number; readonly y: number; readonly radius?: number }; readonly sizeFraction?: number; readonly ageTicks?: number } = {}
+  ): number[] {
+    const veg = this.vegetation;
+    if (veg === null) throw new RangeError('spawnPlantPopulation requires vegetation mode');
+    if (!Number.isInteger(count) || count < 0) throw new RangeError(`count must be a non-negative integer, received: ${count}`);
+    if (this.ledger.activeTransaction !== null) throw new Error('spawnPlantPopulation cannot run inside a tick');
+    const rng = this.streams.get('biology:spawning');
+    const rngSnapshot = this.streams.snapshotStates();
+    const center = options.center;
+    const radius = center?.radius ?? Math.max(this.grid.width, this.grid.height);
+    const water = (c: number) => this.grid.terrainCode[c] <= 1;
+    const aquatic = veg.species[veg.speciesIndex(speciesId)].form === 'aquatic';
+    const pool: number[] = [];
+    for (let c = 0; c < this.grid.cellCount; c++) {
+      if (water(c) !== aquatic) continue;
+      if (center) {
+        const { x, y } = this.grid.fromIndex(c);
+        if ((x - center.x) ** 2 + (y - center.y) ** 2 > radius * radius) continue;
+      }
+      pool.push(c);
+    }
+    if (pool.length === 0 || count === 0) return [];
+    const cells: number[] = [];
+    for (let i = 0; i < count; i++) cells.push(pool[rng.nextInt(0, pool.length - 1)]);
+    const founders = veg.planFounders(speciesId, cells, options.sizeFraction ?? 0.5, rng);
+    const tx = this.ledger.begin(this.tickCount, { genesis: true });
+    try {
+      for (const f of founders) {
+        tx.transferBiomass(PostingReason.GENESIS, AccountKind.GENESIS, 0, AccountKind.CELL_PLANT, f.cell, f.massQ, energyOfMass(f.massQ, RHO_PLANT));
+      }
+      tx.prepare();
+      tx.commit();
+    } catch (err) {
+      if (tx.state === 'ACTIVE' || tx.state === 'PREPARED') tx.abort();
+      this.streams.restoreStates(rngSnapshot);
+      throw err;
+    }
+    veg.setTickHint(this.tickCount);
+    return veg.commitFounders(speciesId, founders, this.tickCount, Math.max(0, Math.floor(options.ageTicks ?? 0)));
+  }
+
+  /** Vegetation mode: adds viable seeds (no biomass) around (x, y), e.g. a single seed source. */
+  seedPlants(speciesId: string, x: number, y: number, radius: number, seedsPerCell: number): number {
+    if (this.vegetation === null) throw new RangeError('seedPlants requires vegetation mode');
+    if (!(seedsPerCell >= 0)) throw new RangeError('seedsPerCell must be >= 0');
+    return this.vegetation.addSeedSource(speciesId, x, y, Math.max(0, Math.floor(radius)), seedsPerCell);
   }
 
   /**
@@ -4404,6 +4494,7 @@ export class BiologySimulation {
     const esStructBack = entityBack ? entityBack[0] : null;
     const esResBack = entityBack ? entityBack[2] : null;
     const plantBack = gridBack ? gridBack[0] : null;
+    const vegEdible = this.vegEdibleRemaining;
     const carrionMBack = gridBack ? gridBack[2] : null;
     const carrionEBack = gridBack ? gridBack[3] : null;
     const detritusBack = gridBack ? gridBack[4] : null;
@@ -4445,7 +4536,13 @@ export class BiologySimulation {
           : useDirectGrid
             ? energyGrid.getStagedMassUnsafe(POOL_PLANT, cellIdx)
             : Number(tx.stagedMassQ(AK_CELL_PLANT, cellIdx));
-        const biteM = grantM < availM ? grantM : availM;
+        let biteM = grantM < availM ? grantM : availM;
+        if (vegEdible !== null) {
+          // vegetation mode: only leaves and herbs are food, never wood
+          const e = vegEdible[cellIdx];
+          if (biteM > e) biteM = e > 0 ? e : 0;
+          vegEdible[cellIdx] = e - biteM;
+        }
         if (biteM > 0) {
           _stageFeedingFast(
             tx,
@@ -4558,6 +4655,11 @@ export class BiologySimulation {
       this.foodProvider.stepTick(targetTick);
     }
 
+    // 3b'. Vegetation: production, respiration and turnover of every plant component
+    if (this.vegetation !== null) {
+      this.vegetation.stagePostings(tx);
+    }
+
     // 3b. Photosynthesis (SUN + ABIOTIC -> CELL_PLANT)
     const photoCount = this.curPhotoCount;
     if (photoCount > 0) {
@@ -4577,6 +4679,7 @@ export class BiologySimulation {
 
     // 3c. Conservative prey regeneration (CELL_PLANT + CELL_DETRITUS -> preyStore slots)
     if (conservativePreyProvider) {
+      conservativePreyProvider.plantEdibleLimitQ = this.vegEdibleRemaining;
       conservativePreyProvider.stepTickConservative(tx, targetTick);
     }
 
@@ -5128,6 +5231,11 @@ export class BiologySimulation {
         }
       }
     }
+
+    // 3k. Vegetation: allocate what animals ate to the eaten plant components (staged)
+    if (this.vegetation !== null) {
+      this.vegetation.stageConsumption(this.vegEdibleRemaining!);
+    }
   }
 
   private runCommitAndPostCommit(
@@ -5522,7 +5630,20 @@ export class BiologySimulation {
       // =========================================================================
       this.onPhase?.({ tick: targetTick, phase: 'RESOLVE' });
 
-      if (!isLegacyMode) {
+      if (this.vegetation !== null) {
+        // Autonomous plant life: plan growth, ageing, reproduction, death and dispersal (staged);
+        // animals may only eat the edible part of the plants
+        const abiotic = this.ledger.globalAbioticMassQ;
+        this.vegetation.plan(
+          targetTick,
+          this.streams.get('biology:vegetation'),
+          abiotic > BigInt(LOCAL_MAX_SAFE_INT) ? LOCAL_MAX_SAFE_INT : Number(abiotic)
+        );
+        const edible = this.vegetation.edibleQ;
+        this.projectedPlantCellMass.set(edible);
+        this.vegEdibleRemaining!.set(edible);
+        this.vegProjectedSet = true;
+      } else if (!isLegacyMode) {
         this.runPhotosynthesisPlan();
       }
 
@@ -5625,6 +5746,10 @@ export class BiologySimulation {
       tx.commit();
       committed = true;
       tx = null; // Once committed, errors inside POST_COMMIT never abort or rewind RNG
+      if (this.vegetation !== null) {
+        this.vegetation.commit(targetTick);
+        this.vegetation.setTickHint(targetTick);
+      }
       return this.runCommitAndPostCommit(
         targetTick,
         plannedNextId,
@@ -5648,6 +5773,15 @@ export class BiologySimulation {
       // after ABORT this is what guarantees coordinates and behavior state stay untouched)
       if (this.spatial !== null) {
         this.spatial.endTick();
+      }
+      if (this.vegetation !== null) {
+        this.vegetation.endTick();
+        if (this.vegProjectedSet) {
+          this.projectedPlantCellMass.fill(-1);
+          this.vegProjectedSet = false;
+        }
+        const prey = this.foodProvider instanceof DeterministicPreyFoodProvider ? this.foodProvider : null;
+        if (prey !== null) prey.plantEdibleLimitQ = null;
       }
       // Reset per-tick sparse dirty cell heads & clear GC object references
       const plantDirtyCount = this.curPlantDirtyCount;
@@ -5920,7 +6054,8 @@ export class BiologySimulation {
     const cc = this.grid.cellCount;
     if (this.useDirectEnergyGrid) {
       const front = this.energyGrid._getChannelStore().front;
-      view.plantMass = front[0];
+      // vegetation mode: animals perceive the edible plant mass (filled during RESOLVE before planning)
+      view.plantMass = this.vegetation !== null ? this.vegetation.edibleQ : front[0];
       view.carrionMass = front[2];
       view.detritusMass = front[4];
     } else {
