@@ -4796,7 +4796,17 @@ export class BiologySimulation {
     const touchedPops = this.stepTouchedPops;
     const popBySpeciesIdx = this.stepPopBySpeciesIdx;
 
-    this.onPhase?.({ tick: targetTick, phase: 'COMMIT', tx });
+    // The COMMIT hook still runs before the transaction is durable: if it throws, the prepared
+    // transaction must be aborted here (the caller no longer holds it), otherwise the ledger would
+    // stay stuck in PREPARED and the world could never step again.
+    try {
+      this.onPhase?.({ tick: targetTick, phase: 'COMMIT', tx });
+    } catch (err) {
+      if (tx.state === 'ACTIVE' || tx.state === 'PREPARED') {
+        tx.abort();
+      }
+      throw err;
+    }
     tx.commit();
 
     this.tickCount = targetTick;
@@ -5400,6 +5410,25 @@ export class BiologySimulation {
     if (this.spatial === null) return undefined;
     const slot = this.organismIdToSlot.get(organismId);
     return slot === undefined ? undefined : this.spatial.describeSlot(slot);
+  }
+
+  /**
+   * Number of living organisms of `speciesId` currently registered in `cellIndex` according to the
+   * population's spatial index (rebuilt lazily after movement, births and deaths).
+   */
+  getCellPopulationCount(speciesId: string, cellIndex: number): number {
+    const pop = this.populations.get(speciesId);
+    return pop ? pop.getCellPopulationCount(cellIndex) : 0;
+  }
+
+  /** Visits the living organisms of `speciesId` located in `cellIndex` in ascending id order. */
+  forEachOrganismInCell(
+    speciesId: string,
+    cellIndex: number,
+    visitor: (organism: Organism) => boolean | void
+  ): void {
+    const pop = this.populations.get(speciesId);
+    if (pop) pop.forEachInCell(cellIndex, (org) => visitor(org));
   }
 
   /**

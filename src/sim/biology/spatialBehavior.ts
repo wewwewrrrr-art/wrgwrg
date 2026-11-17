@@ -233,6 +233,10 @@ export interface SpatialStats {
   moves: number;
   /** Total path cost travelled (terrain-weighted cells). */
   pathCost: number;
+  /** Total locomotion + strike energy demanded from reserves (EU quanta); paid via the ledger. */
+  locomotionEnergyQ: number;
+  /** Full perception scans performed. */
+  scans: number;
   huntAttempts: number;
   huntSuccesses: number;
   migrationsStarted: number;
@@ -460,6 +464,8 @@ export class SpatialBehaviorSystem {
   private t_drinks = 0;
   private t_moved = 0;
   private t_pathCost = 0;
+  private t_demandQ = 0;
+  private t_scans = 0;
   private readonly t_behavior = new Int32Array(BEHAVIOR_COUNT);
   private tickOpen = false;
 
@@ -561,6 +567,8 @@ export class SpatialBehaviorSystem {
       ticks: 0,
       moves: 0,
       pathCost: 0,
+      locomotionEnergyQ: 0,
+      scans: 0,
       huntAttempts: 0,
       huntSuccesses: 0,
       migrationsStarted: 0,
@@ -875,6 +883,8 @@ export class SpatialBehaviorSystem {
     this.t_drinks = 0;
     this.t_moved = 0;
     this.t_pathCost = 0;
+    this.t_demandQ = 0;
+    this.t_scans = 0;
     this.t_behavior.fill(0);
     this.countsBuilt = false;
 
@@ -1550,11 +1560,12 @@ export class SpatialBehaviorSystem {
         const t = temps[dest];
         if (t < tLo || t > tHi) dest = -1;
       }
-      if (this.w_wpCount === 0 && dir >= 0) {
-        // Free steering (no planned route): among the three forward steps - each strictly closer to
-        // the target - take the one with the lowest step cost plus remaining distance, so cheap
-        // ground is preferred over a straight line across slow terrain.
-        let bestCost = dest !== -1 ? nav.stepCostOf(cls, dest, dir) + minCost * octileDistance(txx - cxx - NAV_DX[dir], tyy - cyy - NAV_DY[dir]) : Infinity;
+      if (this.w_wpCount === 0 && dest !== -1) {
+        // Free steering (no planned route, straight step possible): among the three forward steps
+        // - each strictly closer to the target - take the one with the lowest step cost plus
+        // remaining distance, so cheap ground is preferred over a straight line across slow
+        // terrain. A blocked straight step is never papered over here: it triggers planning below.
+        let bestCost = nav.stepCostOf(cls, dest, dir) + minCost * octileDistance(txx - cxx - NAV_DX[dir], tyy - cyy - NAV_DY[dir]);
         for (let turn = -1; turn <= 1; turn += 2) {
           const d2 = (dir + turn + 8) & 7;
           const alt = nav.canStep(cls, cur, d2);
@@ -2082,6 +2093,7 @@ export class SpatialBehaviorSystem {
       if (R < minR) R = minR;
       const wantWater = thirsty && !atWater;
       const femaleSeeker = (flags & FLAG_FEMALE) !== 0;
+      this.t_scans++;
       this.scan(sp, rt, cell, R, needQ, upper, lower, tLo, tHi, stressHere, wantWater, femaleSeeker, eligible, tick);
 
       const comp = this.nav.component[cls];
@@ -2291,13 +2303,25 @@ export class SpatialBehaviorSystem {
         fleeX = -this.sc_threatX;
         fleeY = -this.sc_threatY;
       } else if (best === BEHAVIOR_SEEK_FOOD) {
-        newGoal = foodGoal;
+        // Commitment: keep walking to the food already chosen while it is still there, instead of
+        // re-targeting every tick (which would also throw away the planned route)
+        if (
+          prevBehavior === BEHAVIOR_SEEK_FOOD &&
+          goal !== -1 &&
+          !arrived &&
+          this.ensureFoodField(sp, tick)[goal] > 0 &&
+          this.threatCountAt(goal, sp) === 0
+        ) {
+          newGoal = goal;
+        } else {
+          newGoal = foodGoal;
+        }
       } else if (best === BEHAVIOR_HUNT) {
         tgtId = view.orgId[preyDraft];
         tgtSlot = view.slot[preyDraft];
         newGoal = view.cell[preyDraft];
       } else if (best === BEHAVIOR_SEEK_WATER) {
-        newGoal = waterGoal;
+        newGoal = prevBehavior === BEHAVIOR_SEEK_WATER && goal !== -1 && !arrived ? goal : waterGoal;
       } else if (best === BEHAVIOR_SEEK_COMFORT) {
         newGoal = this.sc_comfortCell;
       } else if (best === BEHAVIOR_SEEK_MATE) {
@@ -2444,6 +2468,7 @@ export class SpatialBehaviorSystem {
       for (let i = 0; i < this.w_wpCount; i++) this.n_waypoints[base + i] = this.w_waypoints[i];
     }
     this.n_demandQ[slot] = demandQ;
+    this.t_demandQ += demandQ;
   }
 
   /**
@@ -2511,6 +2536,8 @@ export class SpatialBehaviorSystem {
     st.ticks++;
     st.moves += this.t_moved;
     st.pathCost += this.t_pathCost;
+    st.locomotionEnergyQ += this.t_demandQ;
+    st.scans += this.t_scans;
     st.huntAttempts += this.t_attempts;
     st.huntSuccesses += this.t_successes;
     st.migrationsStarted += this.t_migStart;
