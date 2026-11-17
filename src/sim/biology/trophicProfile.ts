@@ -54,6 +54,61 @@ export interface TrophicProfile {
   readonly thermoregulationFactor: number;
   readonly activityCostFactor: number;
   readonly reproductiveEfficiency: number;
+  /**
+   * Adaptive diet (optional, Phase 2.4.2; used only when the simulation runs with `adaptiveDiet`):
+   * how far each food may replace missing preferred food. Omitted foods take the defaults of the
+   * feeding type (`defaultDietFlexibility`). `dietWeights` stay the preferred composition.
+   */
+  readonly dietFlexibility?: Partial<Readonly<Record<keyof TrophicDietWeights, DietFlexibilityRule>>>;
+}
+
+/**
+ * One food in the adaptive diet: `maxShare` is the largest fraction of the tick's energy need this
+ * food may cover (>= its preferred share means it can take over missing food; 0 = not edible for
+ * this species), `extraDigestibility` scales the absorption of food eaten beyond the preferred
+ * composition (a scavenger digests detritus worse than carrion). Live prey additionally requires
+ * a hunting species (preferred prey share > 0): the rule cannot make a scavenger a hunter.
+ */
+export interface DietFlexibilityRule {
+  readonly maxShare: number;
+  readonly extraDigestibility: number;
+}
+
+const NO_FOOD: DietFlexibilityRule = Object.freeze({ maxShare: 0, extraDigestibility: 1 });
+
+/**
+ * Feeding-type defaults of the adaptive diet. They keep the specialisations: herbivores eat only
+ * plants, carnivores substitute live prey and carrion for each other, scavengers can fall back on
+ * detritus (poorly digested) but cannot hunt, detritivores can take some carrion, omnivores are broad.
+ */
+export function defaultDietFlexibility(type: TrophicType): Readonly<Record<keyof TrophicDietWeights, DietFlexibilityRule>> {
+  const r = (maxShare: number, extraDigestibility: number): DietFlexibilityRule => Object.freeze({ maxShare, extraDigestibility });
+  switch (type) {
+    case 'herbivore':
+      return Object.freeze({ plant: r(1, 1), prey: NO_FOOD, carrion: NO_FOOD, detritus: NO_FOOD });
+    case 'carnivore':
+      return Object.freeze({ plant: NO_FOOD, prey: r(1, 1), carrion: r(1, 1), detritus: NO_FOOD });
+    case 'scavenger':
+      return Object.freeze({ plant: NO_FOOD, prey: NO_FOOD, carrion: r(1, 1), detritus: r(0.6, 0.6) });
+    case 'detritivore':
+      return Object.freeze({ plant: NO_FOOD, prey: NO_FOOD, carrion: r(0.5, 0.8), detritus: r(1, 1) });
+    case 'omnivore':
+    default:
+      return Object.freeze({ plant: r(1, 0.9), prey: r(1, 1), carrion: r(1, 0.9), detritus: r(0.3, 0.6) });
+  }
+}
+
+/** Effective adaptive-diet rules of a profile (explicit rules over feeding-type defaults). */
+export function resolveDietFlexibility(profile: TrophicProfile): Readonly<Record<keyof TrophicDietWeights, DietFlexibilityRule>> {
+  const base = defaultDietFlexibility(profile.feedingType);
+  const o = profile.dietFlexibility;
+  if (!o) return base;
+  return Object.freeze({
+    plant: o.plant ?? base.plant,
+    prey: o.prey ?? base.prey,
+    carrion: o.carrion ?? base.carrion,
+    detritus: o.detritus ?? base.detritus,
+  });
 }
 
 /** Minimal legacy species contract consumed by `deriveDefaultTrophicProfile`. */
@@ -289,6 +344,15 @@ export function validateTrophicProfile(
   fractionToPpm(profile.assimilationEfficiency, 'half-even');
   fractionToPpm(profile.growthEfficiency, 'half-even');
   fractionToPpm(profile.structuralAllocationFraction, 'half-even');
+
+  if (profile.dietFlexibility !== undefined) {
+    for (const k of RESOURCE_COUNT_KEYS) {
+      const rule = profile.dietFlexibility[k];
+      if (rule === undefined) continue;
+      assertClosedUnit(rule.maxShare, `${label}.dietFlexibility.${k}.maxShare`);
+      assertHalfOpenUnit(rule.extraDigestibility, `${label}.dietFlexibility.${k}.extraDigestibility`);
+    }
+  }
 
   assertNonNegativeFinite(profile.basalMetabolicFactor, `${label}.basalMetabolicFactor`);
   assertNonNegativeFinite(profile.thermoregulationFactor, `${label}.thermoregulationFactor`);

@@ -77,6 +77,7 @@ import {
   inheritOrganismAnatomy,
 } from './anatomy';
 import { VegetationConfig, VegetationSystem } from './vegetation';
+import { resolveDietFlexibility } from './trophicProfile';
 import {
   ReproductiveCompatibilityResult,
   areSpeciesCladeCompatible,
@@ -309,6 +310,13 @@ export interface BiologySimulationConfig {
    * with the simulation's own energy grid only.
    */
   readonly vegetation?: VegetationConfig | boolean;
+  /**
+   * Adaptive food webs (Phase 2.4.2, default off): organisms replace missing preferred food by other
+   * foods their profile allows (`TrophicProfile.dietFlexibility`, feeding-type defaults), from what
+   * is left after everybody's preferred demand, at the food's digestibility; predators choose prey
+   * by expected gain and risk. Off = the P2 fixed-composition rules, bit-identical.
+   */
+  readonly adaptiveDiet?: boolean | AdaptiveDietConfig;
   /** Per-tick fractional decay of cell carrion into ABIOTIC + HEAT in [0, 1] (default: 0.15). */
   readonly carrionDecompositionRate?: number;
   /** Per-tick fractional decay of cell detritus into ABIOTIC + HEAT in [0, 1] (default: 0.08). */
@@ -393,6 +401,24 @@ function scaledAllocPpm(allocPpm: number, growthScale: number): number {
   if (growthScale === 1) return allocPpm;
   const v = Math.round(allocPpm * growthScale);
   return v < 0 ? 0 : v > 1_000_000 ? 1_000_000 : v;
+}
+
+export interface AdaptiveDietConfig {
+  /** Prey choice in spatial mode: by capture probability (P5) or by expected gain and risk (default). */
+  readonly preySelection?: 'capture' | 'profitability';
+  /** Failed attacks on large, defended prey can injure the predator (default true). */
+  readonly huntingInjuries?: boolean;
+}
+
+/** Per-tick adaptive-diet accounting (energy quanta of the food mass granted beyond the preferred diet). */
+export interface AdaptiveDietTickStats {
+  substitutedPlantQ: number;
+  substitutedCarrionQ: number;
+  substitutedDetritusQ: number;
+  preyShiftQ: number;
+  /** Energy of the live-prey share covered by food already lying in the cell (hunting avoided). */
+  preyAvoidedQ: number;
+  organismsSubstituting: number;
 }
 
 export interface SpawnFounderOptions {
@@ -577,6 +603,11 @@ interface SpeciesRuntimeCache {
   readonly dietPpm: NormalizedDietWeightsPpm;
   readonly effAbsorptionAssimPpm: number;
   readonly idx: PhysiologyLocusIndices;
+  /** Adaptive diet: max share (ppm) of the energy need per food [plant, prey, carrion, detritus] and extra digestibility (ppm). */
+  readonly flexMaxSharePpm: Int32Array;
+  readonly flexDigPpm: Int32Array;
+  /** Adaptive diet: the non-prey foods [plant 0, carrion 2, detritus 3] in order of decreasing digestibility. */
+  readonly flexOrder: Int32Array;
   readonly baseStrength: number;
   readonly baseSpeed: number;
   readonly baseEndurance: number;
@@ -802,6 +833,28 @@ export class BiologySimulation {
   };
   private readonly speciationEngine: SpeciationEngine | null;
   private readonly anatomyPhysiology: boolean;
+  /** Adaptive food webs (null = P2 fixed diet composition). */
+  public readonly adaptiveDiet: Required<AdaptiveDietConfig> | null;
+  public adaptiveDietStats: AdaptiveDietTickStats = { substitutedPlantQ: 0, substitutedCarrionQ: 0, substitutedDetritusQ: 0, preyShiftQ: 0, preyAvoidedQ: 0, organismsSubstituting: 0 };
+  private draftNeedGrossQ = new Float64Array(0);
+  private draftAltPlantQ = new Float64Array(0);
+  private draftAltCarrionQ = new Float64Array(0);
+  private draftAltDetritusQ = new Float64Array(0);
+  private draftAltReqQ = new Float64Array(0);
+  private altReqPlant = new Float64Array(0);
+  private altReqCarrion = new Float64Array(0);
+  private altReqDetritus = new Float64Array(0);
+  private altLeftPlant = new Float64Array(0);
+  private altLeftCarrion = new Float64Array(0);
+  private altLeftDetritus = new Float64Array(0);
+  private altCellMark = new Uint8Array(0);
+  private altContendCells = new Uint32Array(0);
+  private altNextDraft = new Int32Array(0);
+  private altCellHead = new Int32Array(0);
+  private altDirtyCells = new Uint32Array(0);
+  private curAltPlant = false;
+  private curAltCarrion = false;
+  private curAltDetritus = false;
   /** Evolutionary physiology model (see `EvolutionConfig.enablePhysiologicalTradeOffs`). */
   private readonly physioTradeOffs: boolean;
   private readonly anatomyPerfScratch: AnatomyPerformance = createAnatomyPerformance();
@@ -1163,6 +1216,24 @@ export class BiologySimulation {
     }
     this.landCellIndices = Uint32Array.from(landCells);
 
+    if (config.adaptiveDiet !== undefined && config.adaptiveDiet !== false) {
+      if (this.conservationMode !== 'strict') throw new RangeError('adaptiveDiet requires strict conservation mode');
+      if (config.transactionalFoodSources?.plant || config.transactionalFoodSources?.carrion || config.transactionalFoodSources?.detritus) {
+        throw new RangeError('adaptiveDiet requires the simulation-owned plant, carrion and detritus pools');
+      }
+      const a = config.adaptiveDiet === true ? {} : config.adaptiveDiet;
+      this.adaptiveDiet = Object.freeze({ preySelection: a.preySelection ?? 'profitability', huntingInjuries: a.huntingInjuries ?? true });
+      this.altCellHead = new Int32Array(config.grid.cellCount).fill(-1);
+      this.altDirtyCells = new Uint32Array(config.grid.cellCount);
+      this.altLeftPlant = new Float64Array(config.grid.cellCount);
+      this.altLeftCarrion = new Float64Array(config.grid.cellCount);
+      this.altLeftDetritus = new Float64Array(config.grid.cellCount);
+      this.altCellMark = new Uint8Array(config.grid.cellCount);
+      this.altContendCells = new Uint32Array(config.grid.cellCount);
+    } else {
+      this.adaptiveDiet = null;
+    }
+
     if (config.vegetation !== undefined && config.vegetation !== false) {
       if (this.conservationMode !== 'strict') {
         throw new RangeError('vegetation requires strict conservation mode');
@@ -1434,6 +1505,16 @@ export class BiologySimulation {
       this.physioTradeOffs = false;
     }
     this.spatial?.setPhysiologyModel(this.physioTradeOffs);
+    if (this.spatial !== null && this.adaptiveDiet !== null) {
+      // Adaptive diet: perceive each allowed food by how much it may cover x its digestibility
+      this.spatial.setFoodPerception((tp) => {
+        const fx = resolveDietFlexibility(tp);
+        const w = tp.dietWeights;
+        const acc = (pref: number, r: { maxShare: number; extraDigestibility: number }) => Math.max(pref, r.maxShare * r.extraDigestibility);
+        return { plant: acc(w.plant, fx.plant), prey: w.prey, carrion: acc(w.carrion, fx.carrion), detritus: acc(w.detritus, fx.detritus) };
+      });
+      this.spatial.setPreySelection(this.adaptiveDiet.preySelection, this.adaptiveDiet.huntingInjuries);
+    }
   }
 
   private tryRegisterStoreIfUnregistered(store: WorldEnergyGrid | EntityEnergyStore): void {
@@ -2482,6 +2563,15 @@ export class BiologySimulation {
           Math.round(profile.absorptionEfficiency * profile.assimilationEfficiency * LOCAL_PPM)
         ),
         idx,
+        ...(() => {
+          const fx = resolveDietFlexibility(profile);
+          const foods = [fx.plant, fx.prey, fx.carrion, fx.detritus];
+          return {
+            flexMaxSharePpm: Int32Array.from(foods.map((f) => Math.round(f.maxShare * LOCAL_PPM))),
+            flexDigPpm: Int32Array.from(foods.map((f) => Math.round(f.extraDigestibility * LOCAL_PPM))),
+            flexOrder: Int32Array.from([2, 0, 3].sort((a, b) => foods[b].extraDigestibility - foods[a].extraDigestibility)),
+          };
+        })(),
         baseStrength: base.strength ?? 1.0,
         baseSpeed: base.speed ?? 1.0,
         baseEndurance: base.endurance ?? 1.0,
@@ -2655,6 +2745,15 @@ export class BiologySimulation {
     this.draftDevSenesc = growF64(this.draftDevSenesc);
     this.draftThermalStress = growF64(this.draftThermalStress);
     this.draftEndurance = growF64(this.draftEndurance);
+    this.draftNeedGrossQ = growF64(this.draftNeedGrossQ);
+    this.draftAltPlantQ = growF64(this.draftAltPlantQ);
+    this.draftAltCarrionQ = growF64(this.draftAltCarrionQ);
+    this.draftAltDetritusQ = growF64(this.draftAltDetritusQ);
+    this.draftAltReqQ = growF64(this.draftAltReqQ);
+    this.altReqPlant = growF64(this.altReqPlant);
+    this.altReqCarrion = growF64(this.altReqCarrion);
+    this.altReqDetritus = growF64(this.altReqDetritus);
+    this.altNextDraft = growI32(this.altNextDraft);
     this.draftGrowthScale = growF64(this.draftGrowthScale);
     this.draftRecoveryScale = growF64(this.draftRecoveryScale);
     this.draftCanonicalOrder = growI32(this.draftCanonicalOrder);
@@ -3186,6 +3285,7 @@ export class BiologySimulation {
       let reqCarrionMassQ = 0;
       let reqDetritusMassQ = 0;
       let reqLegacyNormalized = 0;
+      let needGrossQ = 0;
 
       if (!isEgg && normAfterMetab < 0.96 && headroomMassQ > 0) {
         const hungerGapNorm = 1 - normAfterMetab;
@@ -3218,6 +3318,7 @@ export class BiologySimulation {
                   'ceil'
                 );
               }
+              needGrossQ = neededGrossEnergyQ;
               if (plantPpm > 0) {
                 reqPlantMassQ = applyPpmFloorFast(massForPlantEnergyCeil(neededGrossEnergyQ), plantPpm);
               }
@@ -3276,6 +3377,7 @@ export class BiologySimulation {
       draftReqCarrionQ[dIdx] = reqCarrionMassQ;
       draftReqDetritusQ[dIdx] = reqDetritusMassQ;
       draftReqLegacyNorm[dIdx] = reqLegacyNormalized;
+      this.draftNeedGrossQ[dIdx] = needGrossQ;
       draftNextEnergy[dIdx] = normAfterMetab;
       draftNextHealth[dIdx] = org.health;
       draftGrowthTargetStructQ[dIdx] = growthTargetStructQ;
@@ -3549,6 +3651,13 @@ export class BiologySimulation {
       gridFront ? gridFront[4] : null
     );
 
+    // 2b'. Adaptive diet: a hunter eats what lies in its cell before hunting; what it still needs
+    // (incl. missing carrion) becomes its live-prey request
+    if (this.adaptiveDiet !== null) {
+      this.beginAdaptiveDietTick();
+      this.shiftShortfallToPrey();
+    }
+
     // 2c. Live prey predation & background prey pool
     // Spatial mode: a bite requires a capture attempt that actually lands (pursuit, strike range,
     // probabilistic outcome), so co-located prey is no longer consumed automatically.
@@ -3680,6 +3789,292 @@ export class BiologySimulation {
 
     this.curPredBiteCount = predBiteCount;
     this.curPreyRemTouchedCount = preyRemTouchedCount;
+
+    // 2d. Adaptive diet: the remaining unmet need is requested from the other foods the species
+    // may eat, out of what is left after everybody's preferred demand (second contention round)
+    if (this.adaptiveDiet !== null) {
+      this.resolveAdaptiveSubstitution();
+    }
+  }
+
+  private beginAdaptiveDietTick(): void {
+    const n = this.curDraftCount;
+    const order = this.draftCanonicalOrder;
+    for (let ci = 0; ci < n; ci++) {
+      const d = order[ci];
+      this.draftAltPlantQ[d] = 0;
+      this.draftAltCarrionQ[d] = 0;
+      this.draftAltDetritusQ[d] = 0;
+    }
+    this.curAltPlant = false;
+    this.curAltCarrion = false;
+    this.curAltDetritus = false;
+    const st = this.adaptiveDietStats;
+    st.substitutedPlantQ = 0;
+    st.substitutedCarrionQ = 0;
+    st.substitutedDetritusQ = 0;
+    st.preyShiftQ = 0;
+    st.preyAvoidedQ = 0;
+    st.organismsSubstituting = 0;
+  }
+
+  /** Energy quanta per mass quantum that the request conversion assumes per food (P2 contract). */
+  private static readonly FOOD_EQ = [3, 30, 15, 3] as const; // plant, prey, carrion, detritus
+
+  /**
+   * Adaptive diet, before live predation. (1) A hunter first covers its live-prey share from the
+   * non-prey food it may eat that is still lying in its cell after everybody's preferred demand
+   * (its own kill as carrion, ...) - an animal does not hunt for what it can simply eat. (2) The
+   * prey request is then set to the need that is still open, up to the prey share its profile
+   * allows (so missing carrion becomes hunting). Whether prey is caught is decided by the existing
+   * predation; only requests change here.
+   */
+  private shiftShortfallToPrey(): void {
+    const n = this.curDraftCount;
+    const order = this.draftCanonicalOrder;
+    const flags = this.draftFlags;
+    const caches = this.speciesCacheList;
+    const sIdx = this.draftSpeciesIdx;
+    const need = this.draftNeedGrossQ;
+    const reqPrey = this.draftReqPreyQ;
+    const open = this.draftAltReqQ;
+    for (let ci = 0; ci < n; ci++) {
+      const d = order[ci];
+      open[d] = reqPrey[d] > 0 && need[d] > 0 && (flags[d] & FLAG_DIED) === 0 ? reqPrey[d] * 30 : 0;
+    }
+    const covered = this.substituteFromLeftovers(open);
+    this.adaptiveDietStats.preyAvoidedQ = covered;
+    const grants = [this.draftGrantPlantQ, this.draftGrantPreyQ, this.draftGrantCarrionQ, this.draftGrantDetritusQ];
+    const EQ = BiologySimulation.FOOD_EQ;
+    let shifted = 0;
+    for (let ci = 0; ci < n; ci++) {
+      const d = order[ci];
+      const needE = need[d];
+      if (needE <= 0 || reqPrey[d] <= 0 || (flags[d] & FLAG_DIED) !== 0) continue;
+      const openE = needE - grants[0][d] * EQ[0] - grants[2][d] * EQ[2] - grants[3][d] * EQ[3];
+      const maxPreyE = Math.floor((needE * caches[sIdx[d]].flexMaxSharePpm[1]) / LOCAL_PPM);
+      const wantE = openE < maxPreyE ? openE : maxPreyE;
+      const wantM = wantE > 0 ? Math.floor(wantE / 30) : 0;
+      if (wantM > reqPrey[d]) shifted += (wantM - reqPrey[d]) * 30;
+      reqPrey[d] = wantM;
+    }
+    this.adaptiveDietStats.preyShiftQ = shifted;
+  }
+
+  /**
+   * Adaptive diet, after predation: each organism's still unmet energy need is requested from the
+   * plant / carrion / detritus pools its profile allows, out of what is left in its cell.
+   */
+  private resolveAdaptiveSubstitution(): void {
+    const n = this.curDraftCount;
+    const order = this.draftCanonicalOrder;
+    const flags = this.draftFlags;
+    const need = this.draftNeedGrossQ;
+    const grants = [this.draftGrantPlantQ, this.draftGrantPreyQ, this.draftGrantCarrionQ, this.draftGrantDetritusQ];
+    const EQ = BiologySimulation.FOOD_EQ;
+    const open = this.draftAltReqQ;
+    for (let ci = 0; ci < n; ci++) {
+      const d = order[ci];
+      let unmet = 0;
+      if (need[d] > 0 && (flags[d] & FLAG_DIED) === 0) {
+        unmet = need[d];
+        for (let f = 0; f < 4; f++) unmet -= grants[f][d] * EQ[f];
+      }
+      open[d] = unmet > 0 ? unmet : 0;
+    }
+    this.substituteFromLeftovers(open);
+  }
+
+  /**
+   * Shared substitution round: `openE[d]` is the energy organism `d` still wants; it is requested
+   * from the non-prey foods the profile allows beyond the preferred composition (best digestibility
+   * first, each food up to its max share of the need) and every pool is contended on the mass LEFT
+   * in the cell after all grants so far, with the deterministic resolver (by organism id, not array
+   * order). Grants are added to the pool grants and to the substitution arrays (used for the lower
+   * digestibility at feeding). Returns the energy need covered.
+   */
+  private substituteFromLeftovers(openE: Float64Array): number {
+    const caches = this.speciesCacheList;
+    const n = this.curDraftCount;
+    const order = this.draftCanonicalOrder;
+    const sIdx = this.draftSpeciesIdx;
+    const cellOf = this.draftCellIndex;
+    const need = this.draftNeedGrossQ;
+    const grants = [this.draftGrantPlantQ, this.draftGrantPreyQ, this.draftGrantCarrionQ, this.draftGrantDetritusQ];
+    const reqs = [this.altReqPlant, null, this.altReqCarrion, this.altReqDetritus];
+    const lefts = [this.altLeftPlant, null, this.altLeftCarrion, this.altLeftDetritus];
+    const EQ = BiologySimulation.FOOD_EQ;
+    const mark = this.altCellMark;
+    const cells = this.altDirtyCells;
+    const st = this.adaptiveDietStats;
+
+    // 1. Cells with organisms still wanting food, and what is LEFT there of each pool after all
+    //    grants so far (everybody's preferred demand and earlier substitutions)
+    let cellCount = 0;
+    for (let ci = 0; ci < n; ci++) {
+      const d = order[ci];
+      this.altReqPlant[d] = 0;
+      this.altReqCarrion[d] = 0;
+      this.altReqDetritus[d] = 0;
+      if (openE[d] <= 0) continue;
+      const c = cellOf[d];
+      if (mark[c] === 0) {
+        mark[c] = 1;
+        cells[cellCount++] = c;
+      }
+    }
+    if (cellCount === 0) return 0;
+    const gridFront = this.useDirectEnergyGrid ? this.energyGrid._getChannelStore().front : null;
+    const pools: EnergyPoolId[] = [POOL_PLANT, POOL_PLANT, POOL_CARRION, POOL_DETRITUS];
+    const channel = [0, 0, 2, 4];
+    for (const f of [0, 2, 3]) {
+      const left = lefts[f]!;
+      for (let k = 0; k < cellCount; k++) {
+        const c = cells[k];
+        let a: number;
+        if (f === 0 && this.projectedPlantCellMass[c] >= 0) a = this.projectedPlantCellMass[c];
+        else a = gridFront !== null ? gridFront[channel[f]][c] : this.energyGrid.getMassQ(pools[f], c);
+        left[c] = a;
+      }
+      const g = grants[f];
+      for (let ci = 0; ci < n; ci++) {
+        const d = order[ci];
+        const c = cellOf[d];
+        if (g[d] > 0 && mark[c] === 1) left[c] -= g[d];
+      }
+    }
+
+    // 2. Requests: best-digested allowed food first, each up to its max share of the need and to
+    //    what the animal can see is left in its cell; the rest of the need goes to the next food
+    let anyPlant = false;
+    let anyCarrion = false;
+    let anyDetritus = false;
+    for (let ci = 0; ci < n; ci++) {
+      const d = order[ci];
+      let unmet = openE[d];
+      if (unmet <= 0) continue;
+      const sc = caches[sIdx[d]];
+      const needE = need[d];
+      const c = cellOf[d];
+      const cand = sc.flexOrder;
+      let asked = false;
+      for (let k = 0; k < 3; k++) {
+        const f = cand[k];
+        if (unmet <= 0) break;
+        const maxShare = sc.flexMaxSharePpm[f];
+        if (maxShare <= 0) continue;
+        const leftM = lefts[f]![c];
+        if (leftM <= 0) continue;
+        const room = Math.floor((needE * maxShare) / LOCAL_PPM) - grants[f][d] * EQ[f];
+        if (room <= 0) continue;
+        const leftE = leftM * EQ[f];
+        let take = unmet < room ? unmet : room;
+        if (take > leftE) take = leftE;
+        if (take <= 0) continue;
+        // The need is the gross intake the gut can process this tick (its capacity): a substitute
+        // fills the same gut volume, and its poorer digestibility is paid as less absorbed energy
+        // (absorption scaled in stagePoolForaging), never compensated by eating more of it.
+        const massQ = Math.ceil(take / EQ[f]);
+        if (massQ <= 0) continue;
+        reqs[f]![d] = massQ;
+        unmet -= take;
+        asked = true;
+        if (f === 0) anyPlant = true;
+        else if (f === 2) anyCarrion = true;
+        else anyDetritus = true;
+      }
+      if (asked) st.organismsSubstituting++;
+    }
+
+    // 3. Contention per pool on the leftovers (deterministic, by organism id)
+    let covered = 0;
+    if (anyPlant) {
+      st.substitutedPlantQ += this.contendLeftovers(this.altReqPlant, this.draftGrantPlantQ, this.draftAltPlantQ, this.altLeftPlant, 0) * 3;
+      covered += this.lastCoveredE;
+      this.curAltPlant = true;
+    }
+    if (anyCarrion) {
+      st.substitutedCarrionQ += this.contendLeftovers(this.altReqCarrion, this.draftGrantCarrionQ, this.draftAltCarrionQ, this.altLeftCarrion, 2) * 15;
+      covered += this.lastCoveredE;
+      this.curAltCarrion = true;
+    }
+    if (anyDetritus) {
+      st.substitutedDetritusQ += this.contendLeftovers(this.altReqDetritus, this.draftGrantDetritusQ, this.draftAltDetritusQ, this.altLeftDetritus, 3) * 3;
+      covered += this.lastCoveredE;
+      this.curAltDetritus = true;
+    }
+    for (let k = 0; k < cellCount; k++) mark[cells[k]] = 0;
+    return covered;
+  }
+
+  private lastCoveredE = 0;
+
+  /**
+   * One substitution contention of one pool: requests `req` (mass) are served from `left` (the
+   * mass left in each cell after all earlier grants) by the deterministic resolver. Grants are
+   * added to `grant` and `alt`. Returns the mass granted and leaves the energy need it covers in
+   * `lastCoveredE`.
+   */
+  private contendLeftovers(req: Float64Array, grant: Float64Array, alt: Float64Array, left: Float64Array, foodIdx: number): number {
+    const n = this.curDraftCount;
+    const order = this.draftCanonicalOrder;
+    const cellOf = this.draftCellIndex;
+    const head = this.altCellHead;
+    const next = this.altNextDraft;
+    const dirty = this.altContendCells;
+    const caches = this.speciesCacheList;
+    const sIdx = this.draftSpeciesIdx;
+    let dirtyCount = 0;
+    for (let ci = n - 1; ci >= 0; ci--) {
+      const d = order[ci];
+      if (req[d] <= 0) continue;
+      const c = cellOf[d];
+      if (head[c] === -1) dirty[dirtyCount++] = c;
+      next[d] = head[c];
+      head[c] = d;
+    }
+    let total = 0;
+    let coveredE = 0;
+    const orgIds = this.draftOrgId;
+    const EQf = BiologySimulation.FOOD_EQ[foodIdx];
+    for (let k = 0; k < dirtyCount; k++) {
+      const c = dirty[k];
+      const avail = left[c];
+      let m = 0;
+      for (let d = head[c]; d !== -1; d = next[d]) m++;
+      if (avail > 0) {
+        this.ensureResolveScratch(m);
+        const demands = this.resolveScratchDemands;
+        const ids = this.resolveScratchOrgIds;
+        const out = this.resolveScratchGrants;
+        const idx = this.resolveScratchDraftIdx;
+        let j = 0;
+        for (let d = head[c]; d !== -1; d = next[d]) {
+          demands[j] = req[d];
+          ids[j] = orgIds[d];
+          out[j] = 0;
+          idx[j] = d;
+          j++;
+        }
+        if (m === 1) out[0] = demands[0] < avail ? demands[0] : avail;
+        else _resolveContention(demands, m, avail, out, ids);
+        let used = 0;
+        for (j = 0; j < m; j++) {
+          const d = idx[j];
+          const g = out[j];
+          if (g <= 0) continue;
+          grant[d] += g;
+          alt[d] += g;
+          total += g;
+          used += g;
+          coveredE += Math.floor((g * EQf * caches[sIdx[d]].flexDigPpm[foodIdx]) / LOCAL_PPM);
+        }
+        left[c] = avail - used;
+      }
+      head[c] = -1;
+    }
+    this.lastCoveredE = coveredE;
+    return total;
   }
 
   /**
@@ -3913,6 +4308,7 @@ export class BiologySimulation {
       let nextHealth: number;
       let healed = false;
       let dehydrationDamage = 0;
+      let injuryDamage = 0;
       if (nextStageCode === STAGE_EGG) {
         let h = curHealth;
         if (tStress > 0) {
@@ -3929,6 +4325,9 @@ export class BiologySimulation {
         if (spatial !== null) {
           dehydrationDamage = spatial.dehydrationDamage(draftSlot[dIdx]);
           exhaustionDamage = spatial.exhaustionDamage(draftSlot[dIdx]);
+          // adaptive food webs: a failed attack on dangerous prey wounds like exertion does
+          injuryDamage = spatial.injuryDamage(draftSlot[dIdx]);
+          exhaustionDamage += injuryDamage;
         }
         let healthDelta = 0;
         if (tStress > 0) {
@@ -3972,6 +4371,7 @@ export class BiologySimulation {
         if (nextEnergy <= 0 && tStress <= 0.15) deathCause = 'starvation';
         else if (tStress > 0.15) deathCause = 'thermal-stress';
         else if (dehydrationDamage > 0) deathCause = 'dehydration';
+        else if (injuryDamage > 0) deathCause = 'injury';
         else deathCause = 'starvation';
       } else if (nextStageCode === STAGE_ELDER) {
         const genArr = org.phenotype.geneticExpression;
@@ -4445,7 +4845,9 @@ export class BiologySimulation {
     escrowSlot: number,
     reqOrGrantArr: Float64Array,
     entityBack: readonly Float64Array[] | null,
-    gridBack: readonly Float64Array[] | null
+    gridBack: readonly Float64Array[] | null,
+    altArr: Float64Array | null = null,
+    foodIdx = 0
   ): void {
     const draftCount = this.curDraftCount;
     const draftCanonicalOrder = this.draftCanonicalOrder;
@@ -4516,6 +4918,16 @@ export class BiologySimulation {
           ? entityStore.stagedReserveMassUnsafe(slot)
           : Number(tx.stagedMassQ(AK_ORGANISM_RESERVE, slot));
       const pq = speciesCaches[draftSpeciesIdx[dIdx]].pq;
+      // Adaptive diet: the substituted part of the grant is digested at the food's extra digestibility
+      let absorptionPpm = pq.absorptionPpm;
+      if (altArr !== null) {
+        const alt = altArr[dIdx];
+        if (alt > 0) {
+          const dig = speciesCaches[draftSpeciesIdx[dIdx]].flexDigPpm[foodIdx];
+          absorptionPpm = Math.round((absorptionPpm * ((grantM - alt) * LOCAL_PPM + alt * dig)) / (grantM * LOCAL_PPM));
+          if (absorptionPpm < 1) absorptionPpm = 1;
+        }
+      }
       let maxResM: number;
       if (stagedStructM === draftStructMassQ[dIdx]) {
         maxResM = draftMaxReserveMassQ[dIdx];
@@ -4552,7 +4964,7 @@ export class BiologySimulation {
             cellIdx,
             biteM,
             biteM <= PLANT_SAFE_MASS_LIMIT ? biteM * 3 : _energyOfMass(biteM, _RHO_PLANT),
-            pq.absorptionPpm,
+            absorptionPpm,
             pq.assimilationPpm,
             pq.sdaPpm,
             headroom,
@@ -4575,7 +4987,7 @@ export class BiologySimulation {
             cellIdx,
             biteM,
             biteM <= PLANT_SAFE_MASS_LIMIT ? biteM * 3 : _energyOfMass(biteM, _RHO_DETRITUS),
-            pq.absorptionPpm,
+            absorptionPpm,
             pq.assimilationPpm,
             pq.sdaPpm,
             headroom,
@@ -4602,7 +5014,7 @@ export class BiologySimulation {
             slot,
             cellIdx,
             grantM,
-            pq.absorptionPpm,
+            absorptionPpm,
             pq.assimilationPpm,
             pq.sdaPpm,
             headroom,
@@ -4746,7 +5158,7 @@ export class BiologySimulation {
     }
 
     // 3f. Foraging: only iterate pools that actually have requests/grants
-    if (this.externalPlantSource || this.curPlantDirtyCount > 0) {
+    if (this.externalPlantSource || this.curPlantDirtyCount > 0 || this.curAltPlant) {
       this.stagePoolForaging(
         tx,
         speciesCaches,
@@ -4758,10 +5170,12 @@ export class BiologySimulation {
         EXTERNAL_PLANT_ESCROW_SLOT,
         this.externalPlantSource ? this.draftReqPlantQ : this.draftGrantPlantQ,
         entityBack,
-        gridBack
+        gridBack,
+        this.curAltPlant ? this.draftAltPlantQ : null,
+        0
       );
     }
-    if (this.externalDetritusSource || this.curDetritusDirtyCount > 0) {
+    if (this.externalDetritusSource || this.curDetritusDirtyCount > 0 || this.curAltDetritus) {
       this.stagePoolForaging(
         tx,
         speciesCaches,
@@ -4773,10 +5187,12 @@ export class BiologySimulation {
         EXTERNAL_DETRITUS_ESCROW_SLOT,
         this.externalDetritusSource ? this.draftReqDetritusQ : this.draftGrantDetritusQ,
         entityBack,
-        gridBack
+        gridBack,
+        this.curAltDetritus ? this.draftAltDetritusQ : null,
+        3
       );
     }
-    if (this.externalCarrionSource || this.curCarrionDirtyCount > 0) {
+    if (this.externalCarrionSource || this.curCarrionDirtyCount > 0 || this.curAltCarrion) {
       this.stagePoolForaging(
         tx,
         speciesCaches,
@@ -4788,7 +5204,9 @@ export class BiologySimulation {
         EXTERNAL_CARRION_ESCROW_SLOT,
         this.externalCarrionSource ? this.draftReqCarrionQ : this.draftGrantCarrionQ,
         entityBack,
-        gridBack
+        gridBack,
+        this.curAltCarrion ? this.draftAltCarrionQ : null,
+        2
       );
     }
 

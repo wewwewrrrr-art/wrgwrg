@@ -119,6 +119,8 @@ const FLAG_ELIGIBLE = 1 << 4;
 
 const SALT_TEMPERAMENT = 0x51ed270b;
 const SALT_CAPTURE = 0x2545f491;
+const SALT_PREYCHOICE = 0x6a09e667;
+const SALT_INJURY = 0x3c6ef373;
 const SALT_EXPLORE = 0x7f4a7c15;
 const SALT_FLEE = 0x1b873593;
 const SALT_FOLLOW = 0x68e31da4;
@@ -221,6 +223,10 @@ interface SpeciesSpatialRuntime {
   readonly profile: SpatialSpeciesProfile;
   readonly navClass: number;
   readonly dPlant: number;
+  /** Food perception weights (= diet weights, or the adaptive-diet acceptability of each food). */
+  readonly fPlant: number;
+  readonly fCarrion: number;
+  readonly fDetritus: number;
   readonly dPrey: number;
   readonly dCarrion: number;
   readonly dDetritus: number;
@@ -274,6 +280,8 @@ export interface SpatialStats {
   scans: number;
   huntAttempts: number;
   huntSuccesses: number;
+  /** Failed attacks that injured the predator (adaptive food webs only). */
+  huntInjuries: number;
   migrationsStarted: number;
   migrationsSettled: number;
   drinks: number;
@@ -496,6 +504,7 @@ export class SpatialBehaviorSystem {
   // ---- per-tick counters (applied at commit) --------------------------------------------------
   private t_attempts = 0;
   private t_successes = 0;
+  private t_injuries = 0;
   private t_migStart = 0;
   private t_migSettle = 0;
   private t_drinks = 0;
@@ -516,6 +525,11 @@ export class SpatialBehaviorSystem {
   private sc_threatY = 0;
   private sc_threatCell = -1;
   private sc_preyCell = -1;
+  private sc_preyCell2 = -1;
+  private sc_preyCell3 = -1;
+  private sc_preyDist = 0;
+  private sc_preyDist2 = 0;
+  private sc_preyDist3 = 0;
   private sc_waterCell = -1;
   private sc_mateCell = -1;
   private sc_mateDist = 0;
@@ -614,6 +628,7 @@ export class SpatialBehaviorSystem {
       scans: 0,
       huntAttempts: 0,
       huntSuccesses: 0,
+      huntInjuries: 0,
       migrationsStarted: 0,
       migrationsSettled: 0,
       drinks: 0,
@@ -677,6 +692,14 @@ export class SpatialBehaviorSystem {
         profile,
         navClass: cls,
         dPlant: dSum > 0 ? dw.plant / dSum : 0,
+        ...(() => {
+          const fw = this.foodPerception !== null ? this.foodPerception(tp) : dw;
+          return {
+            fPlant: dSum > 0 ? fw.plant / dSum : 0,
+            fCarrion: dSum > 0 ? fw.carrion / dSum : 0,
+            fDetritus: dSum > 0 ? fw.detritus / dSum : 0,
+          };
+        })(),
         dPrey: dSum > 0 ? dw.prey / dSum : 0,
         dCarrion: dSum > 0 ? dw.carrion / dSum : 0,
         dDetritus: dSum > 0 ? dw.detritus / dSum : 0,
@@ -863,6 +886,7 @@ export class SpatialBehaviorSystem {
     this.x_attacked = growU8(this.x_attacked, cap);
     this.x_extraDemandQ = growF64(this.x_extraDemandQ, cap);
     this.x_fatigueAdd = growF32(this.x_fatigueAdd, cap);
+    this.x_injury = growF32(this.x_injury, cap);
   }
 
   /**
@@ -961,6 +985,7 @@ export class SpatialBehaviorSystem {
     this.jCount = 0;
     this.t_attempts = 0;
     this.t_successes = 0;
+    this.t_injuries = 0;
     this.t_migStart = 0;
     this.t_migSettle = 0;
     this.t_drinks = 0;
@@ -1076,9 +1101,9 @@ export class SpatialBehaviorSystem {
     const carrion = view.carrionMass;
     const bgS = view.bgPreyStruct;
     const bgR = view.bgPreyReserve;
-    const kPlant = rt.dPlant * RHO_PLANT_EU;
-    const kDet = rt.dDetritus * RHO_DETRITUS_EU;
-    const kCar = rt.dCarrion * RHO_CARRION_EU;
+    const kPlant = rt.fPlant * RHO_PLANT_EU;
+    const kDet = rt.fDetritus * RHO_DETRITUS_EU;
+    const kCar = rt.fCarrion * RHO_CARRION_EU;
     const kPreyS = bgS !== null ? rt.dPrey * RHO_STRUCT_EU : 0;
     const kPreyR = bgS !== null ? rt.dPrey * RHO_RESERVE_EU : 0;
     for (let c = 0; c < n; c++) {
@@ -1113,6 +1138,74 @@ export class SpatialBehaviorSystem {
 
   /** Evolutionary physiology model of the owning simulation (see `setPhysiologyModel`). */
   private physiologyModel = false;
+
+  // ---- adaptive food webs (Phase 2.4.2) -----------------------------------------------------------
+  private foodPerception: ((tp: TrophicProfile) => { plant: number; prey: number; carrion: number; detritus: number }) | null = null;
+  private preySelection: 'capture' | 'profitability' = 'capture';
+  private huntingInjuries = false;
+  private x_injury = new Float32Array(0);
+
+  /**
+   * Adaptive diet: animals perceive every food their profile lets them eat, weighted by how much of
+   * their need it may cover and how well they digest it (instead of the fixed diet composition).
+   * Forces a rebuild of the species runtimes on the next tick.
+   */
+  setFoodPerception(fn: ((tp: TrophicProfile) => { plant: number; prey: number; carrion: number; detritus: number }) | null): void {
+    this.foodPerception = fn;
+    this.speciesSources = [];
+  }
+
+  /** Prey choice: 'capture' (most catchable, P5) or 'profitability' (expected gain, cost and risk). */
+  setPreySelection(mode: 'capture' | 'profitability', injuries: boolean): void {
+    this.preySelection = mode;
+    this.huntingInjuries = injuries;
+  }
+
+  /** Health the occupant of `slot` lost this tick in a failed attack on dangerous prey. */
+  injuryDamage(entitySlot: number): number {
+    const slot = entitySlot - this.slotBase;
+    return slot < this.x_injury.length ? this.x_injury[slot] : 0;
+  }
+
+  /**
+   * Expected value of attacking `vd` for predator `pd`, from what the predator can perceive:
+   * capture probability x food energy it can use (its remaining appetite; a carrion eater also
+   * values the carcass it can return to), minus the energy of the chase and strike, discounted by
+   * the risk of injury from a large, defended victim (a hungry predator accepts more risk). A
+   * bounded individual misjudgement keeps the choice from always being optimal.
+   */
+  private preyValue(pd: number, vd: number, cellDist: number, opportunistic: boolean): number {
+    const view = this.view;
+    const rp = this.species[view.speciesIdx[pd]];
+    const rv = this.species[view.speciesIdx[vd]];
+    const p = this.captureProbability(pd, vd, cellDist, opportunistic);
+    const vS = view.structMassQ[vd];
+    const vR = view.reserveMassQ[vd];
+    const preyE = vS * 5 + vR * 30;
+    const needM = view.reqPreyQ[pd] - view.grantPreyQ[pd];
+    const needE = needM > 0 ? needM * 30 : 0;
+    const eaten = preyE < needE ? preyE : needE;
+    const gain = eaten + (rp.dCarrion > 0 ? 0.25 * (preyE - eaten) : 0);
+    const pMass = view.structMassQ[pd] + view.reserveMassQ[pd];
+    const chase =
+      rp.activityFactor * (pMass / 1_000_000) * rp.profile.walkCostPerCell *
+      (cellDist * rp.profile.sprintCostMultiplier + rp.profile.strikeCostCells) * 1_000_000;
+    const danger = this.preyDanger(vd, rv, pMass);
+    const hunger = 1 - clamp01(view.nextEnergy[pd]);
+    const riskAversion = 0.6 * (1 - hunger);
+    const value = (p * gain - chase) * (1 - riskAversion * (1 - p) * (danger < 1 ? danger : 1));
+    return value * (0.85 + 0.3 * this.rand01(view.tick, view.orgId[pd] * 7919 + view.orgId[vd], SALT_PREYCHOICE));
+  }
+
+  /** How dangerous a victim is to a predator of mass `pMass`: relative size x anatomical defence. */
+  private preyDanger(vd: number, rv: SpeciesSpatialRuntime, pMass: number): number {
+    const view = this.view;
+    const vMass = view.structMassQ[vd] + view.reserveMassQ[vd];
+    const vAn = view.org[vd].anatomy?.expressed;
+    const def = vAn ? anatomyDefense(vAn) / rv.anDefense0 : 1;
+    const d = (vMass / (pMass > 1 ? pMass : 1)) * def - 0.6;
+    return d < 0 ? 0 : d > 2 ? 2 : d;
+  }
 
   /**
    * Enables the evolutionary physiology model: thermal choice uses the same anatomy-derived
@@ -1266,8 +1359,8 @@ export class SpatialBehaviorSystem {
         if (this.huntable[sp * S + view.speciesIdx[cand]] === 0) continue;
         examined++;
         if (!this.isVictim(sp, cand)) continue;
-        const p = this.captureProbability(pd, cand, 0, true);
-        if (p > bestP) {
+        const p = this.preySelection === 'profitability' ? this.preyValue(pd, cand, 0, true) : this.captureProbability(pd, cand, 0, true);
+        if (best === -1 || p > bestP) {
           bestP = p;
           best = cand;
         }
@@ -1298,6 +1391,16 @@ export class SpatialBehaviorSystem {
     if (this.rand01(view.tick, view.orgId[pd], SALT_CAPTURE) < p) {
       this.t_successes++;
       return vd;
+    }
+    if (this.huntingInjuries) {
+      // a failed attack on a large, defended victim can hurt the attacker
+      const danger = this.preyDanger(vd, rv, view.structMassQ[pd] + view.reserveMassQ[pd]);
+      if (danger > 0) {
+        const inj = 0.05 * danger * (0.5 + 0.5 * this.rand01(view.tick, view.orgId[pd], SALT_INJURY));
+        const total = this.x_injury[pSlot] + inj;
+        this.x_injury[pSlot] = total < 0.25 ? total : 0.25;
+        this.t_injuries++;
+      }
     }
     return -1;
   }
@@ -1500,6 +1603,10 @@ export class SpatialBehaviorSystem {
     let threatCellDist = 1e9;
     let preyCell = -1;
     let preyDist = 1e9;
+    let preyCell2 = -1;
+    let preyDist2 = 1e9;
+    let preyCell3 = -1;
+    let preyDist3 = 1e9;
     let waterCell = -1;
     let waterDist = 1e9;
     let mateCell = -1;
@@ -1551,9 +1658,18 @@ export class SpatialBehaviorSystem {
               threatCell = c;
             }
           }
-          if (hunts && dist < preyDist && preyM[c] === 1 && comp[c] === myComp) {
-            preyDist = dist;
-            preyCell = c;
+          if (hunts && preyM[c] === 1 && comp[c] === myComp) {
+            // keep the three nearest prey cells (profitability choice weighs them against distance)
+            if (dist < preyDist) {
+              preyDist3 = preyDist2; preyCell3 = preyCell2;
+              preyDist2 = preyDist; preyCell2 = preyCell;
+              preyDist = dist; preyCell = c;
+            } else if (dist < preyDist2) {
+              preyDist3 = preyDist2; preyCell3 = preyCell2;
+              preyDist2 = dist; preyCell2 = c;
+            } else if (dist < preyDist3) {
+              preyDist3 = dist; preyCell3 = c;
+            }
           }
         }
 
@@ -1599,6 +1715,11 @@ export class SpatialBehaviorSystem {
     this.sc_threatY = threatY;
     this.sc_threatCell = threatCell;
     this.sc_preyCell = preyCell;
+    this.sc_preyCell2 = preyCell2;
+    this.sc_preyCell3 = preyCell3;
+    this.sc_preyDist = preyDist;
+    this.sc_preyDist2 = preyDist2;
+    this.sc_preyDist3 = preyDist3;
     this.sc_waterCell = waterCell;
     this.sc_mateCell = mateCell;
     this.sc_mateDist = mateDist;
@@ -1612,20 +1733,24 @@ export class SpatialBehaviorSystem {
   }
 
   /** Most catchable valid prey individual standing in `cell` for predator draft `pd` (or -1). */
-  private pickPreyInCell(pd: number, sp: number, cell: number): number {
+  private lastPickValue = 0;
+
+  private pickPreyInCell(pd: number, sp: number, cell: number, cellDist = 0): number {
     let best = -1;
     let bestP = 0;
     let examined = 0;
+    const profit = this.preySelection === 'profitability';
     for (let cand = this.occHead[cell]; cand !== -1 && examined < 24; cand = this.occNext[cand]) {
       if (cand === pd) continue;
       examined++;
       if (!this.isVictim(sp, cand)) continue;
-      const p = this.captureProbability(pd, cand, 0, false);
-      if (p > bestP) {
+      const p = profit ? this.preyValue(pd, cand, cellDist, false) : this.captureProbability(pd, cand, 0, false);
+      if (profit ? best === -1 || p > bestP : p > bestP) {
         bestP = p;
         best = cand;
       }
     }
+    this.lastPickValue = bestP;
     return best;
   }
 
@@ -2268,7 +2393,26 @@ export class SpatialBehaviorSystem {
           }
         }
         if (preyDraft === -1 && this.sc_preyCell !== -1) {
-          preyDraft = this.pickPreyInCell(d, sp, this.sc_preyCell);
+          if (this.preySelection === 'profitability') {
+            // weigh the prey of the three nearest prey cells by expected gain, chase cost and risk
+            let bestV = -Infinity;
+            const cells = [this.sc_preyCell, this.sc_preyCell2, this.sc_preyCell3];
+            const dists = [this.sc_preyDist, this.sc_preyDist2, this.sc_preyDist3];
+            for (let k = 0; k < 3; k++) {
+              if (cells[k] === -1) continue;
+              const c = this.pickPreyInCell(d, sp, cells[k], dists[k]);
+              if (c === -1) continue;
+              const v = this.lastPickValue;
+              if (v > bestV) {
+                bestV = v;
+                preyDraft = c;
+              }
+            }
+            // a well-fed predator does not bother with prey that is not worth the effort
+            if (preyDraft !== -1 && bestV <= 0 && E > 0.4) preyDraft = -1;
+          } else {
+            preyDraft = this.pickPreyInCell(d, sp, this.sc_preyCell);
+          }
         }
       }
 
@@ -2674,6 +2818,7 @@ export class SpatialBehaviorSystem {
     st.scans += this.t_scans;
     st.huntAttempts += this.t_attempts;
     st.huntSuccesses += this.t_successes;
+    st.huntInjuries += this.t_injuries;
     st.migrationsStarted += this.t_migStart;
     st.migrationsSettled += this.t_migSettle;
     st.drinks += this.t_drinks;
@@ -2700,6 +2845,7 @@ export class SpatialBehaviorSystem {
       this.x_attacked[slot] = 0;
       this.x_extraDemandQ[slot] = 0;
       this.x_fatigueAdd[slot] = 0;
+      this.x_injury[slot] = 0;
       this.n_planned[slot] = 0;
       this.n_demandQ[slot] = 0;
     }
