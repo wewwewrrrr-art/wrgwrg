@@ -75,6 +75,14 @@ import {
   validateSpeciesDefinition,
 } from './species';
 import {
+  GeneticProfileOptions,
+  PopulationGeneticProfile,
+  SubpopulationGeneticAnalysis,
+  SubpopulationGeneticOptions,
+  computeGeneticProfile,
+  computeSubpopulationGeneticAnalysis,
+} from './geneticDiversity';
+import {
   OrganismSpatialState,
   SpatialBehaviorConfig,
   SpatialBehaviorSystem,
@@ -5447,12 +5455,58 @@ export class BiologySimulation {
       const profileClass = this.spatial.navigator.component;
       navComponent = profileClass[this.spatial.getNavClass(sIdx)];
     }
+    // Read-only: never creates a population entry for a species that has none yet
+    const pop = this.populations.get(speciesId);
     return computeSubpopulations(
-      this.getOrCreatePopulation(speciesId).getActiveOrganisms(),
+      pop ? pop.getActiveOrganisms() : [],
       this.grid.width,
       this.grid.height,
       linkDistance,
       navComponent
+    );
+  }
+
+  /**
+   * On-demand genetic profile of a species: count, per-locus mean and spread of inherited trait
+   * values, gene-pool allele variance and its within / between individual components,
+   * allele-copy correlation, allelic divergence and dominance spread, for the core genome and
+   * (for organisms that carry one) the anatomy genome. One pass over the population; reads
+   * organisms only and changes no simulation state. Unknown species ids throw.
+   */
+  getGeneticProfile(speciesId: string, options: Omit<GeneticProfileOptions, 'tick'> = {}): PopulationGeneticProfile {
+    const species = this.speciesRegistry.get(speciesId);
+    const pop = this.populations.get(speciesId);
+    return computeGeneticProfile(species, pop ? pop.getActiveOrganisms() : [], {
+      includeEggs: options.includeEggs,
+      tick: this.tickCount,
+    });
+  }
+
+  /**
+   * On-demand genetic comparison of the spatially separated groups of a species (partition from
+   * `getSubpopulations(speciesId, linkDistance)`): one profile per group, pairwise locus
+   * differences and among-group differentiation. Measures divergence only; it never creates,
+   * splits or merges species and changes no simulation state.
+   */
+  analyzeSubpopulationGenetics(
+    speciesId: string,
+    options: Omit<SubpopulationGeneticOptions, 'tick'> & { readonly linkDistance?: number } = {}
+  ): SubpopulationGeneticAnalysis {
+    const species = this.speciesRegistry.get(speciesId);
+    const linkDistance = options.linkDistance ?? 3;
+    const subpopulations = this.getSubpopulations(speciesId, linkDistance);
+    const pop = this.populations.get(speciesId);
+    return computeSubpopulationGeneticAnalysis(
+      species,
+      subpopulations,
+      (id) => (pop ? pop.getById(id) : undefined),
+      linkDistance,
+      {
+        includeEggs: options.includeEggs,
+        minGroupSize: options.minGroupSize,
+        maxGroups: options.maxGroups,
+        tick: this.tickCount,
+      }
     );
   }
 

@@ -12,4 +12,5 @@ export * from './population';
 export * from './spatialProfile';
 export * from './spatialNavigation';
 export * from './spatialBehavior';
+export * from './geneticDiversity';
 export * from './biologySimulation';
