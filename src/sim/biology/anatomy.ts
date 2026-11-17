@@ -66,6 +66,12 @@ export interface OrganismAnatomyState {
   readonly expressed: Float32Array;
   locomotionMode: LocomotionMode;
   viability: number;
+  /**
+   * Derived-value cache of `getRelativeAnatomyPhysiology` (pure function of the immutable genome
+   * and the species baseline it was computed against). Never part of the simulation state.
+   */
+  physiology?: AnatomyPhysiology;
+  physiologySpecies?: SpeciesDefinition;
 }
 
 export interface AnatomyPerformance {
@@ -579,4 +585,97 @@ export function describeAnatomy(anatomy: OrganismAnatomyState): Readonly<Record<
     locomotionMode: anatomy.locomotionMode,
     viability: anatomy.viability,
   };
+}
+
+/**
+ * Physiological consequences of the anatomy genome in the evolutionary physiology model
+ * (evolution mode with `enablePhysiologicalTradeOffs`). Each link follows a causal relationship of
+ * vertebrate physiology rather than a balancing penalty:
+ *
+ * - `maintenanceScale`: resting upkeep of tissue - basal metabolic rate times the upkeep of armour,
+ *   head, limbs and insulation and the overhead of developmental mismatch. It scales the BASAL
+ *   (Kleiber) term only: the cost of activity and locomotion is mechanical and does not shrink
+ *   with a low resting metabolism.
+ * - `coldOffsetC` / `heatOffsetC`: insulation, a stocky torso and metabolic heat production widen
+ *   the tolerated range towards the cold; the same heat production and insulation are a heat load
+ *   (low BMR is the classic adaptation of desert endotherms, high BMR of cold-climate ones).
+ * - `intakeCapacityScale`: the maximal rate of food processing follows the mass of the metabolically
+ *   active organs (gut, liver) that also set BMR (assimilation-capacity / central-limitation
+ *   models); taken as sqrt(BMR).
+ * - `growthScale`: somatic growth is fuelled by metabolism (ontogenetic growth model), ~BMR.
+ * - `recoveryScale`: tissue repair and clearance of fatigue are aerobic processes, ~sqrt(BMR).
+ *
+ * Values are relative to the species baseline anatomy (`getRelativeAnatomyPhysiology`), so the
+ * baseline individual has scales 1 and offsets 0 and the species calibration is unchanged.
+ */
+export interface AnatomyPhysiology {
+  maintenanceScale: number;
+  coldOffsetC: number;
+  heatOffsetC: number;
+  intakeCapacityScale: number;
+  growthScale: number;
+  recoveryScale: number;
+}
+
+/**
+ * Metabolic heat production shifts the tolerated range by the same amount per unit as insulation
+ * does: in the Scholander-Irving heat balance (lower critical temperature = Tb - BMR x insulation)
+ * resting heat production and insulation enter symmetrically, and the same heat is a load in the
+ * heat. degC per unit of BMR above the baseline.
+ */
+export const BMR_COLD_OFFSET_C = 6.0;
+export const BMR_HEAT_OFFSET_C = 4.8;
+
+export function createAnatomyPhysiology(): AnatomyPhysiology {
+  return { maintenanceScale: 1, coldOffsetC: 0, heatOffsetC: 0, intakeCapacityScale: 1, growthScale: 1, recoveryScale: 1 };
+}
+
+/** Absolute (not baseline-relative) physiology of an anatomy, see `AnatomyPhysiology`. */
+export function computeAnatomyPhysiologyInto(anatomy: OrganismAnatomyState, out: AnatomyPhysiology): AnatomyPhysiology {
+  const ex = anatomy.expressed;
+  const torso = ex[ANATOMY_IDX.TORSO_ROBUSTNESS];
+  const head = ex[ANATOMY_IDX.HEAD_SIZE];
+  const limb = ex[ANATOMY_IDX.LIMB_LENGTH];
+  const integ = ex[ANATOMY_IDX.INTEGUMENT_THICKNESS];
+  const armor = ex[ANATOMY_IDX.ARMOR_PROTECTION];
+  const bmr = ex[ANATOMY_IDX.BASAL_METABOLIC_RATE];
+  out.coldOffsetC = (integ - 1.0) * 6.0 + (torso - 1.0) * 3.0 + (bmr - 1.0) * BMR_COLD_OFFSET_C;
+  out.heatOffsetC = -(integ - 1.0) * 4.8 - Math.max(0, torso - 1.0) * 2.0 - (bmr - 1.0) * BMR_HEAT_OFFSET_C;
+  const viabilityPenalty = 1.0 + Math.max(0, 1.0 - anatomy.viability) * 0.45;
+  out.maintenanceScale =
+    bmr * (0.84 + 0.14 * armor + 0.07 * head + 0.06 * limb + 0.04 * Math.max(0, integ - 1.0)) * viabilityPenalty;
+  out.intakeCapacityScale = Math.sqrt(bmr);
+  out.growthScale = bmr;
+  out.recoveryScale = Math.sqrt(bmr);
+  return out;
+}
+
+const speciesBaselinePhysiologyCache = new WeakMap<Float32Array, AnatomyPhysiology>();
+
+/**
+ * Physiology of `anatomy` relative to the baseline anatomy of `species` (offsets are differences,
+ * scales are ratios). Cached on the anatomy state: the result is a pure function of the immutable
+ * genome and the species baseline, so the cache never changes what the simulation computes.
+ */
+export function getRelativeAnatomyPhysiology(anatomy: OrganismAnatomyState, species: SpeciesDefinition): AnatomyPhysiology {
+  if (anatomy.physiology !== undefined && anatomy.physiologySpecies === species) return anatomy.physiology;
+  const baseState = getSpeciesBaselineAnatomy(species);
+  const baseKey = baseState.expressed;
+  let base = speciesBaselinePhysiologyCache.get(baseKey);
+  if (base === undefined) {
+    base = Object.freeze(computeAnatomyPhysiologyInto(baseState, createAnatomyPhysiology()));
+    speciesBaselinePhysiologyCache.set(baseKey, base);
+  }
+  const out = computeAnatomyPhysiologyInto(anatomy, createAnatomyPhysiology());
+  out.coldOffsetC -= base.coldOffsetC;
+  out.heatOffsetC -= base.heatOffsetC;
+  out.maintenanceScale /= base.maintenanceScale;
+  out.intakeCapacityScale /= base.intakeCapacityScale;
+  out.growthScale /= base.growthScale;
+  out.recoveryScale /= base.recoveryScale;
+  if (!Object.isFrozen(anatomy)) {
+    anatomy.physiology = out;
+    anatomy.physiologySpecies = species;
+  }
+  return out;
 }

@@ -345,7 +345,9 @@ test('Evolution: selection adapts isolated populations to their own climate, thr
   const cold0 = side(false);
   const start = { heatHot: trait(hot0, 'heatTolerance'), coldCold: trait(cold0, 'coldTolerance') };
   const isoStart = measureReproductiveIsolation(hot0, FAST, cold0, FAST).isolation;
-  sim.stepMany(1500);
+  // With the evolutionary physiology model (Phase 2.3.3) divergence is slower than under the 2.3.2
+  // rules (BMR no longer collapses, so the cold island needs less extra cold tolerance): 2500 ticks
+  sim.stepMany(2500);
   const hot = side(true);
   const cold = side(false);
   assert.ok(hot.length > 50 && cold.length > 50, 'both populations persist');

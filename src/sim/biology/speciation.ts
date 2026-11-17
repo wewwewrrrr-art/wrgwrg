@@ -37,6 +37,14 @@ export interface EvolutionConfig {
   readonly enableSexualSelection?: boolean;
   /** Enables quantitative anatomy & physiology trait evolution & trade-offs (default: true). */
   readonly enableAnatomyEvolution?: boolean;
+  /**
+   * Evolutionary physiology model (default: true; requires `enableAnatomyEvolution`): BMR and tissue
+   * upkeep scale basal metabolism only and set heat production, food-processing capacity, growth and
+   * recovery; metabolic efficiency trades against power output; perception and endurance cost tissue
+   * upkeep. `false` keeps the Phase 2.3.2 rules
+   * (one anatomy multiplier on total metabolic demand).
+   */
+  readonly enablePhysiologicalTradeOffs?: boolean;
 }
 
 export interface ResolvedEvolutionConfig {
@@ -53,6 +61,7 @@ export interface ResolvedEvolutionConfig {
   readonly enableHybridization: boolean;
   readonly enableSexualSelection: boolean;
   readonly enableAnatomyEvolution: boolean;
+  readonly enablePhysiologicalTradeOffs: boolean;
 }
 
 export function resolveEvolutionConfig(cfg?: EvolutionConfig): ResolvedEvolutionConfig {
@@ -78,6 +87,7 @@ export function resolveEvolutionConfig(cfg?: EvolutionConfig): ResolvedEvolution
     enableHybridization: cfg?.enableHybridization ?? true,
     enableSexualSelection: cfg?.enableSexualSelection ?? true,
     enableAnatomyEvolution: cfg?.enableAnatomyEvolution ?? true,
+    enablePhysiologicalTradeOffs: (cfg?.enableAnatomyEvolution ?? true) && (cfg?.enablePhysiologicalTradeOffs ?? true),
   };
 }
 

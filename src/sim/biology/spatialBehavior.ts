@@ -1,6 +1,6 @@
 import { deriveSeed, normalizeSeed, SeedInput } from '../prng';
 import { WORLD_BIOME_IDS, WorldGrid } from '../worldGrid';
-import { ANATOMY_IDX, getSpeciesBaselineAnatomy } from './anatomy';
+import { ANATOMY_IDX, getRelativeAnatomyPhysiology, getSpeciesBaselineAnatomy } from './anatomy';
 
 // Anatomy effects on locomotion, capture and thermal choice. They are applied as ratios /
 // differences against the species baseline anatomy (see getSpeciesBaselineAnatomy), so the species'
@@ -233,6 +233,7 @@ interface SpeciesSpatialRuntime {
   readonly iHeatTol: number;
   readonly iColdTol: number;
   readonly iAdapt: number;
+  readonly iMetEff: number;
   readonly baseBodySize: number;
   readonly baseStrength: number;
   readonly baseSpeed: number;
@@ -241,6 +242,7 @@ interface SpeciesSpatialRuntime {
   readonly baseHeatTol: number;
   readonly baseColdTol: number;
   readonly baseAdapt: number;
+  readonly baseMetEff: number;
   readonly optTemp: number;
   readonly halfWidth: number;
   readonly activityFactor: number;
@@ -687,6 +689,7 @@ export class SpatialBehaviorSystem {
         iHeatTol: idx.heatTolerance,
         iColdTol: idx.coldTolerance,
         iAdapt: idx.environmentalAdaptability,
+        iMetEff: idx.metabolismEfficiency,
         baseBodySize: base.bodySize ?? 1.0,
         baseStrength: base.strength ?? 1.0,
         baseSpeed: base.speed ?? 1.0,
@@ -695,6 +698,7 @@ export class SpatialBehaviorSystem {
         baseHeatTol: base.heatTolerance ?? 1.0,
         baseColdTol: base.coldTolerance ?? 1.0,
         baseAdapt: base.environmentalAdaptability ?? 0.9,
+        baseMetEff: base.metabolismEfficiency ?? 1.0,
         optTemp: sp.physiology.optimalTemperatureC,
         halfWidth: sp.physiology.baseThermalHalfWidthC,
         activityFactor: tp.activityCostFactor,
@@ -1107,6 +1111,27 @@ export class SpatialBehaviorSystem {
     return idx >= 0 ? ex[idx] : fallback;
   }
 
+  /** Evolutionary physiology model of the owning simulation (see `setPhysiologyModel`). */
+  private physiologyModel = false;
+
+  /**
+   * Enables the evolutionary physiology model: thermal choice uses the same anatomy-derived
+   * envelope as the physiology, fatigue recovery follows the aerobic (BMR) capacity, and burst
+   * speed follows the efficiency-power trade-off of the metabolism.
+   */
+  setPhysiologyModel(enabled: boolean): void {
+    this.physiologyModel = enabled;
+  }
+
+  /** Burst power of an individual relative to its species norm (efficiency-power trade-off). */
+  private burstPower(org: Organism, rt: SpeciesSpatialRuntime): number {
+    if (!this.physiologyModel || rt.iMetEff < 0) return 1;
+    const m = org.phenotype.geneticExpression[rt.iMetEff];
+    const eff = 0.55 + 0.45 * m;
+    const eff0 = 0.55 + 0.45 * rt.baseMetEff;
+    return Math.sqrt((eff0 > 0.45 ? eff0 : 0.45) / (eff > 0.45 ? eff : 0.45));
+  }
+
   private isVictim(predSpecies: number, cand: number): boolean {
     const view = this.view;
     if ((view.flags[cand] & FLAG_DIED) !== 0 || view.nextStage[cand] === STAGE_EGG) return false;
@@ -1136,9 +1161,11 @@ export class SpatialBehaviorSystem {
     const pAnSpeed = pAn ? anatomyLandSpeed(pAn) / rp.anLand0 : 1;
     const vAnSpeed = vAn ? anatomyLandSpeed(vAn) / rv.anLand0 : 1;
     const pSpeed =
-      this.trait(pe, rp.iSpeed, rp.baseSpeed) * pAnSpeed * rp.profile.cellsPerTick * rp.profile.sprintMultiplier * (1 - 0.5 * pFat);
+      this.trait(pe, rp.iSpeed, rp.baseSpeed) * pAnSpeed * rp.profile.cellsPerTick * rp.profile.sprintMultiplier * (1 - 0.5 * pFat) *
+      this.burstPower(po, rp);
     const vSpeed =
-      this.trait(ve, rv.iSpeed, rv.baseSpeed) * vAnSpeed * rv.profile.cellsPerTick * rv.profile.sprintMultiplier * (1 - 0.5 * vFat);
+      this.trait(ve, rv.iSpeed, rv.baseSpeed) * vAnSpeed * rv.profile.cellsPerTick * rv.profile.sprintMultiplier * (1 - 0.5 * vFat) *
+      this.burstPower(vo, rv);
     let speedTerm = 0.5 + 0.55 * (pSpeed / (vSpeed > 1e-3 ? vSpeed : 1e-3) - 1);
     speedTerm = speedTerm < 0.08 ? 0.08 : speedTerm > 0.95 ? 0.95 : speedTerm;
 
@@ -2078,8 +2105,11 @@ export class SpatialBehaviorSystem {
     const coldTol = this.trait(ex, rt.iColdTol, rt.baseColdTol);
     const adapt = this.trait(ex, rt.iAdapt, rt.baseAdapt);
     const an = org.anatomy?.expressed;
-    const coldShift = an ? anatomyColdShift(an) - rt.anCold0 : 0;
-    const heatShift = an ? anatomyHeatShift(an) - rt.anHeat0 : 0;
+    // With the physiology model the decision envelope is the physiological one (incl. metabolic heat)
+    const phys = this.physiologyModel && org.anatomy !== undefined ? getRelativeAnatomyPhysiology(org.anatomy, rt.species) : null;
+    const coldShift = phys !== null ? phys.coldOffsetC : an ? anatomyColdShift(an) - rt.anCold0 : 0;
+    const heatShift = phys !== null ? phys.heatOffsetC : an ? anatomyHeatShift(an) - rt.anHeat0 : 0;
+    const recovery = phys !== null ? phys.recoveryScale : 1;
     const upper = rt.optTemp + rt.halfWidth + heatTol * 7.5 + adapt * 3.5 + heatShift;
     const lower = rt.optTemp - rt.halfWidth - coldTol * 8.0 - adapt * 3.5 - coldShift;
     const tHere = this.grid.temperature[cell];
@@ -2491,7 +2521,7 @@ export class SpatialBehaviorSystem {
     if (wantsMove) {
       let speedPts = paceEstimate;
       if (thirsty && hyd <= 0) speedPts *= this.dehydratedSpeedFactor;
-      if (sprint) speedPts *= prof.sprintMultiplier;
+      if (sprint) speedPts *= prof.sprintMultiplier * this.burstPower(org, rt);
       let points = this.moveCredit[slot] + speedPts;
       // Energy of one unit of path cost, EU quanta. Movement is never free: it is paid from the
       // reserve, and an animal too depleted to pay for a step can only crawl - the unpaid part of
@@ -2533,9 +2563,9 @@ export class SpatialBehaviorSystem {
 
     // ---- fatigue -----------------------------------------------------------------------------
     if (this.mv_cost > 0) {
-      fat += ((sprint ? 0.09 : 0.008) * this.mv_cost) / endurT - 0.03 * endurT;
+      fat += ((sprint ? 0.09 : 0.008) * this.mv_cost) / endurT - 0.03 * endurT * recovery;
     } else {
-      fat -= 0.14 * endurT;
+      fat -= 0.14 * endurT * recovery;
     }
     fat = fat < 0 ? 0 : fat > 1 ? 1 : fat;
 

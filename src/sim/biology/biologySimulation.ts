@@ -72,6 +72,7 @@ import {
   computeAnatomyPerformanceInto,
   computeRelativeAnatomyPerformanceInto,
   createAnatomyPerformance,
+  getRelativeAnatomyPhysiology,
   getSpeciesBaselineAnatomy,
   inheritOrganismAnatomy,
 } from './anatomy';
@@ -372,6 +373,20 @@ interface StagedSpeciation {
 const MAX_MATE_CANDIDATES = 6;
 /** Upper bound of organisms inspected while looking for candidates (evolution mode). */
 const MAX_MATE_SCAN = 48;
+
+/**
+ * Evolutionary physiology: activity-demand units charged per trait unit of sensory (perception)
+ * and oxidative (endurance) capacity above the species norm - the coefficient the existing model
+ * already uses for neural tissue (intelligence).
+ */
+const TISSUE_UPKEEP_PER_TRAIT_UNIT = 0.1;
+
+/** Structural allocation fraction scaled by the growth capacity of the metabolism (ppm, <= 1e6). */
+function scaledAllocPpm(allocPpm: number, growthScale: number): number {
+  if (growthScale === 1) return allocPpm;
+  const v = Math.round(allocPpm * growthScale);
+  return v < 0 ? 0 : v > 1_000_000 ? 1_000_000 : v;
+}
 
 export interface SpawnFounderOptions {
   readonly stage?: Exclude<LifeStage, 'dead'>;
@@ -775,6 +790,8 @@ export class BiologySimulation {
   };
   private readonly speciationEngine: SpeciationEngine | null;
   private readonly anatomyPhysiology: boolean;
+  /** Evolutionary physiology model (see `EvolutionConfig.enablePhysiologicalTradeOffs`). */
+  private readonly physioTradeOffs: boolean;
   private readonly anatomyPerfScratch: AnatomyPerformance = createAnatomyPerformance();
   private cladeCompatMatrix = new Uint8Array(0);
   private readonly stagedProposals: StagedSpeciationProposal[] = [];
@@ -926,6 +943,8 @@ export class BiologySimulation {
   private draftDevSenesc = new Float64Array(0);
   private draftThermalStress = new Float64Array(0);
   private draftEndurance = new Float64Array(0);
+  private draftGrowthScale = new Float64Array(0);
+  private draftRecoveryScale = new Float64Array(0);
   private draftCanonicalOrder = new Int32Array(0);
 
   // Per-cell contention intrusive linked lists
@@ -1381,12 +1400,15 @@ export class BiologySimulation {
       this.phylogeny = new PhylogenyTracker(this.speciesRegistry.list());
       this.speciationEngine = new SpeciationEngine(config.grid, resolvedEvolution);
       this.anatomyPhysiology = resolvedEvolution.enableAnatomyEvolution;
+      this.physioTradeOffs = resolvedEvolution.enablePhysiologicalTradeOffs;
     } else {
       this.evolution = null;
       this.phylogeny = null;
       this.speciationEngine = null;
       this.anatomyPhysiology = false;
+      this.physioTradeOffs = false;
     }
+    this.spatial?.setPhysiologyModel(this.physioTradeOffs);
   }
 
   private tryRegisterStoreIfUnregistered(store: WorldEnergyGrid | EntityEnergyStore): void {
@@ -2543,6 +2565,8 @@ export class BiologySimulation {
     this.draftDevSenesc = growF64(this.draftDevSenesc);
     this.draftThermalStress = growF64(this.draftThermalStress);
     this.draftEndurance = growF64(this.draftEndurance);
+    this.draftGrowthScale = growF64(this.draftGrowthScale);
+    this.draftRecoveryScale = growF64(this.draftRecoveryScale);
     this.draftCanonicalOrder = growI32(this.draftCanonicalOrder);
 
     this.plantNextDraft = new Int32Array(nextCap);
@@ -2774,7 +2798,10 @@ export class BiologySimulation {
     const idxMetEff = pIdx.metabolismEfficiency;
     const idxAdapt = pIdx.environmentalAdaptability;
     const anatomyPhysiology = this.anatomyPhysiology;
+    const physioTradeOffs = this.physioTradeOffs;
     const anatomyPerf = this.anatomyPerfScratch;
+    const draftGrowthScale = this.draftGrowthScale;
+    const draftRecoveryScale = this.draftRecoveryScale;
 
     let localDraftCount = this.curDraftCount;
     let localGloballySorted = this.curGloballySorted;
@@ -2927,12 +2954,30 @@ export class BiologySimulation {
       // the species baseline anatomy (insulation helps in the cold and hurts in the heat, armour
       // and large heads cost energy). The energy accounting itself is unchanged.
       let anatomyMetabolicScale = 1;
+      let anatomyMaintenanceScale = 1;
+      let anatomyIntakeScale = 1;
+      let anatomyGrowthScale = 1;
+      let anatomyRecoveryScale = 1;
       if (anatomyPhysiology && org.anatomy !== undefined) {
-        const perf = computeRelativeAnatomyPerformanceInto(org.anatomy, sc.anatomyBaselinePerf, anatomyPerf);
-        upperLimit += perf.heatOffsetC;
-        lowerLimit -= perf.coldOffsetC;
-        anatomyMetabolicScale = perf.metabolicScale;
+        if (physioTradeOffs) {
+          // Evolutionary physiology: tissue upkeep scales the basal term only; BMR also sets heat
+          // production, food-processing capacity, growth and recovery (see AnatomyPhysiology)
+          const phys = getRelativeAnatomyPhysiology(org.anatomy, species);
+          upperLimit += phys.heatOffsetC;
+          lowerLimit -= phys.coldOffsetC;
+          anatomyMaintenanceScale = phys.maintenanceScale;
+          anatomyIntakeScale = phys.intakeCapacityScale;
+          anatomyGrowthScale = phys.growthScale;
+          anatomyRecoveryScale = phys.recoveryScale;
+        } else {
+          const perf = computeRelativeAnatomyPerformanceInto(org.anatomy, sc.anatomyBaselinePerf, anatomyPerf);
+          upperLimit += perf.heatOffsetC;
+          lowerLimit -= perf.coldOffsetC;
+          anatomyMetabolicScale = perf.metabolicScale;
+        }
       }
+      draftGrowthScale[dIdx] = anatomyGrowthScale;
+      draftRecoveryScale[dIdx] = anatomyRecoveryScale;
       const thermalStress =
         envTemp > upperLimit
           ? (envTemp - upperLimit) / 10
@@ -2993,11 +3038,27 @@ export class BiologySimulation {
         }
 
         foragePower = 0.45 + 0.22 * speed + 0.18 * perception + 0.1 * strength + 0.08 * intelligence;
-        const traitDemand = 0.45 + 0.30 * speed + 0.15 * strength + 0.10 * intelligence;
+        let traitDemand = 0.45 + 0.30 * speed + 0.15 * strength + 0.10 * intelligence;
         const effScale = Math.max(0.45, 0.55 + 0.45 * metEff);
+        if (physioTradeOffs) {
+          // Sensory and oxidative (endurance) tissue is maintained like the neural tissue already
+          // charged for intelligence; charged on the deviation from the species norm at the same
+          // developmental stage, so the baseline individual pays exactly what it paid before.
+          traitDemand +=
+            TISSUE_UPKEEP_PER_TRAIT_UNIT * (perception - sc.basePerception * modNeur) +
+            TISSUE_UPKEEP_PER_TRAIT_UNIT * (endurance - sc.baseEndurance * modPhys);
+          if (traitDemand < 0.2) traitDemand = 0.2;
+          // Efficiency-power trade-off: a metabolism that extracts more work per unit of fuel
+          // delivers it more slowly, which limits the rate of food acquisition and burst output
+          // (genetic efficiency vs the species norm; the same factor scales burst speed in spatial)
+          const genMetEff = modOther > 0 ? metEff / modOther : sc.baseMetabolismEfficiency;
+          const effGen = 0.55 + 0.45 * genMetEff;
+          const effBase = 0.55 + 0.45 * sc.baseMetabolismEfficiency;
+          foragePower *= Math.sqrt((effBase > 0.45 ? effBase : 0.45) / (effGen > 0.45 ? effGen : 0.45));
+        }
         const activityLevel = Math.max(0, (3.8 * traitDemand) / effScale);
         metabolicDemandQ = _computeTotalMetabolicDemandFast(
-          basalFactor,
+          physioTradeOffs ? basalFactor * anatomyMaintenanceScale : basalFactor,
           thermoFactor,
           activityFactor,
           structMassQ,
@@ -3038,7 +3099,7 @@ export class BiologySimulation {
 
       if (!isEgg && normAfterMetab < 0.96 && headroomMassQ > 0) {
         const hungerGapNorm = 1 - normAfterMetab;
-        const maxIntake = maxForageIntake * foragePower;
+        const maxIntake = maxForageIntake * foragePower * anatomyIntakeScale;
         const desiredNormGain = hungerGapNorm < maxIntake ? hungerGapNorm : maxIntake;
         if (desiredNormGain > 0) {
           reqLegacyNormalized = desiredNormGain;
@@ -3650,6 +3711,7 @@ export class BiologySimulation {
     const draftNextCooldown = this.draftNextCooldown;
     const draftThermalStress = this.draftThermalStress;
     const draftEndurance = this.draftEndurance;
+    const draftRecoveryScale = this.draftRecoveryScale;
     const draftMetabolicDemandQ = this.draftMetabolicDemandQ;
     const draftHealingDemandQ = this.draftHealingDemandQ;
     const speciesEligibleCounts = this.stepSpeciesEligibleCounts;
@@ -3792,7 +3854,7 @@ export class BiologySimulation {
           dehydrationDamage === 0 &&
           exhaustionDamage === 0
         ) {
-          healthDelta += sc.healingPerTick * (0.75 + 0.25 * endur);
+          healthDelta += sc.healingPerTick * (0.75 + 0.25 * endur) * draftRecoveryScale[dIdx];
           healed = true;
         }
         if (dehydrationDamage > 0) {
@@ -4882,7 +4944,7 @@ export class BiologySimulation {
             stagedResM,
             availAbiotic,
             targetStructQ,
-            pq.allocPpm,
+            this.physioTradeOffs ? scaledAllocPpm(pq.allocPpm, this.draftGrowthScale[dIdx]) : pq.allocPpm,
             pq.growthEffPpm
           );
         }
