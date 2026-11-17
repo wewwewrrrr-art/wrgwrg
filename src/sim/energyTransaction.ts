@@ -711,6 +711,12 @@ export class EnergyTransaction {
       Math.floor(massQ) !== massQ ||
       Math.floor(energyQ) !== energyQ
     ) {
+      if (!(massQ >= 0 && massQ <= LOCAL_MAX_SAFE_INT && Math.floor(massQ) === massQ)) {
+        throw new UnitsError(`massQ must be a non-negative safe integer quantum count, received: ${massQ}`);
+      }
+      if (!(energyQ >= 0 && energyQ <= LOCAL_MAX_SAFE_INT && Math.floor(energyQ) === energyQ)) {
+        throw new UnitsError(`energyQ must be a non-negative safe integer quantum count, received: ${energyQ}`);
+      }
       if (massQ > 0) this.postMass(reason, srcKind, srcId, AK_ABIOTIC, 0, massQ);
       if (energyQ > 0) this.postEnergy(reason, srcKind, srcId, AK_HEAT, 0, energyQ);
       return;
@@ -790,6 +796,12 @@ export class EnergyTransaction {
       Math.floor(energyQ) !== energyQ ||
       !L.acc.gteFast(ACC_ABIOTIC_STAGED, massQ)
     ) {
+      if (!(massQ >= 0 && massQ <= LOCAL_MAX_SAFE_INT && Math.floor(massQ) === massQ)) {
+        throw new UnitsError(`massQ must be a non-negative safe integer quantum count, received: ${massQ}`);
+      }
+      if (!(energyQ >= 0 && energyQ <= LOCAL_MAX_SAFE_INT && Math.floor(energyQ) === energyQ)) {
+        throw new UnitsError(`energyQ must be a non-negative safe integer quantum count, received: ${energyQ}`);
+      }
       if (massQ > 0) this.postMass(reason, AK_ABIOTIC, 0, dstKind, dstId, massQ);
       if (energyQ > 0) this.postEnergy(reason, AK_SUN, 0, dstKind, dstId, energyQ);
       return;
@@ -877,6 +889,24 @@ export class EnergyTransaction {
       !(heatQ >= 0 && heatQ <= LOCAL_MAX_SAFE_INT && Math.floor(heatQ) === heatQ) ||
       (srcKind !== AK_CELL_PLANT && srcKind !== AK_CELL_CARRION && srcKind !== AK_CELL_DETRITUS)
     ) {
+      if (!(depositMassQ >= 0 && depositMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(depositMassQ) === depositMassQ)) {
+        throw new UnitsError(`depositMassQ must be a non-negative safe integer quantum count, received: ${depositMassQ}`);
+      }
+      if (!(depositEnergyQ >= 0 && depositEnergyQ <= LOCAL_MAX_SAFE_INT && Math.floor(depositEnergyQ) === depositEnergyQ)) {
+        throw new UnitsError(`depositEnergyQ must be a non-negative safe integer quantum count, received: ${depositEnergyQ}`);
+      }
+      if (!(egestaMassQ >= 0 && egestaMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(egestaMassQ) === egestaMassQ)) {
+        throw new UnitsError(`egestaMassQ must be a non-negative safe integer quantum count, received: ${egestaMassQ}`);
+      }
+      if (!(egestaEnergyQ >= 0 && egestaEnergyQ <= LOCAL_MAX_SAFE_INT && Math.floor(egestaEnergyQ) === egestaEnergyQ)) {
+        throw new UnitsError(`egestaEnergyQ must be a non-negative safe integer quantum count, received: ${egestaEnergyQ}`);
+      }
+      if (!(abioticMassQ >= 0 && abioticMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(abioticMassQ) === abioticMassQ)) {
+        throw new UnitsError(`abioticMassQ must be a non-negative safe integer quantum count, received: ${abioticMassQ}`);
+      }
+      if (!(heatQ >= 0 && heatQ <= LOCAL_MAX_SAFE_INT && Math.floor(heatQ) === heatQ)) {
+        throw new UnitsError(`heatQ must be a non-negative safe integer quantum count, received: ${heatQ}`);
+      }
       if (doIng) this.transferBiomass(PR_INGESTION, srcKind, srcId, AK_ORGANISM_RESERVE, eaterSlot, depositMassQ, depositEnergyQ);
       if (doEg) this.transferBiomass(PR_EGESTION, srcKind, srcId, AK_CELL_DETRITUS, detritusCellIndex, egestaMassQ, egestaEnergyQ);
       if (abioticMassQ > 0) this.postMass(PR_SDA, srcKind, srcId, AK_ABIOTIC, 0, abioticMassQ);
@@ -1034,9 +1064,28 @@ export class EnergyTransaction {
       this.stateValue !== 'ACTIVE' ||
       L.active !== this ||
       (organismSlot >>> 0) !== organismSlot ||
-      structGainEnergyQ <= 0 ||
-      abioticInMassQ > 0 && !L.acc.gteFast(ACC_ABIOTIC_STAGED, abioticInMassQ)
+      !(structGainEnergyQ > 0 && structGainEnergyQ <= LOCAL_MAX_SAFE_INT && Math.floor(structGainEnergyQ) === structGainEnergyQ) ||
+      !(heatQ >= 0 && heatQ <= LOCAL_MAX_SAFE_INT && Math.floor(heatQ) === heatQ) ||
+      !(directReserveToStruct >= 0 && directReserveToStruct <= LOCAL_MAX_SAFE_INT && Math.floor(directReserveToStruct) === directReserveToStruct) ||
+      !(abioticInMassQ >= 0 && abioticInMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(abioticInMassQ) === abioticInMassQ) ||
+      !(abioticOutMassQ >= 0 && abioticOutMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(abioticOutMassQ) === abioticOutMassQ) ||
+      (abioticInMassQ > 0 && !L.acc.gteFast(ACC_ABIOTIC_STAGED, abioticInMassQ))
     ) {
+      if (!(structGainEnergyQ >= 0 && structGainEnergyQ <= LOCAL_MAX_SAFE_INT && Math.floor(structGainEnergyQ) === structGainEnergyQ)) {
+        throw new UnitsError(`structGainEnergyQ must be a non-negative safe integer quantum count, received: ${structGainEnergyQ}`);
+      }
+      if (!(heatQ >= 0 && heatQ <= LOCAL_MAX_SAFE_INT && Math.floor(heatQ) === heatQ)) {
+        throw new UnitsError(`heatQ must be a non-negative safe integer quantum count, received: ${heatQ}`);
+      }
+      if (!(directReserveToStruct >= 0 && directReserveToStruct <= LOCAL_MAX_SAFE_INT && Math.floor(directReserveToStruct) === directReserveToStruct)) {
+        throw new UnitsError(`directReserveToStruct must be a non-negative safe integer quantum count, received: ${directReserveToStruct}`);
+      }
+      if (!(abioticInMassQ >= 0 && abioticInMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(abioticInMassQ) === abioticInMassQ)) {
+        throw new UnitsError(`abioticInMassQ must be a non-negative safe integer quantum count, received: ${abioticInMassQ}`);
+      }
+      if (!(abioticOutMassQ >= 0 && abioticOutMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(abioticOutMassQ) === abioticOutMassQ)) {
+        throw new UnitsError(`abioticOutMassQ must be a non-negative safe integer quantum count, received: ${abioticOutMassQ}`);
+      }
       this.postEnergy(PR_GROWTH, AK_ORGANISM_RESERVE, organismSlot, AK_ORGANISM_STRUCT, organismSlot, structGainEnergyQ);
       if (heatQ > 0) this.postEnergy(PR_GROWTH, AK_ORGANISM_RESERVE, organismSlot, AK_HEAT, 0, heatQ);
       if (directReserveToStruct > 0) this.postMass(PR_GROWTH, AK_ORGANISM_RESERVE, organismSlot, AK_ORGANISM_STRUCT, organismSlot, directReserveToStruct);
@@ -1158,8 +1207,36 @@ export class EnergyTransaction {
       (motherSlot >>> 0) !== motherSlot ||
       (childSlot >>> 0) !== childSlot ||
       motherSlot === childSlot ||
+      !(childStructEnergyQ >= 0 && childStructEnergyQ <= LOCAL_MAX_SAFE_INT && Math.floor(childStructEnergyQ) === childStructEnergyQ) ||
+      !(childReserveEnergyQ >= 0 && childReserveEnergyQ <= LOCAL_MAX_SAFE_INT && Math.floor(childReserveEnergyQ) === childReserveEnergyQ) ||
+      !(heatQ >= 0 && heatQ <= LOCAL_MAX_SAFE_INT && Math.floor(heatQ) === heatQ) ||
+      !(desiredOffspringReserveMassQ >= 0 && desiredOffspringReserveMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(desiredOffspringReserveMassQ) === desiredOffspringReserveMassQ) ||
+      !(directReserveToStruct >= 0 && directReserveToStruct <= LOCAL_MAX_SAFE_INT && Math.floor(directReserveToStruct) === directReserveToStruct) ||
+      !(abioticInMassQ >= 0 && abioticInMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(abioticInMassQ) === abioticInMassQ) ||
+      !(abioticOutMassQ >= 0 && abioticOutMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(abioticOutMassQ) === abioticOutMassQ) ||
       (abioticInMassQ > 0 && !L.acc.gteFast(ACC_ABIOTIC_STAGED, abioticInMassQ))
     ) {
+      if (!(childStructEnergyQ >= 0 && childStructEnergyQ <= LOCAL_MAX_SAFE_INT && Math.floor(childStructEnergyQ) === childStructEnergyQ)) {
+        throw new UnitsError(`childStructEnergyQ must be a non-negative safe integer quantum count, received: ${childStructEnergyQ}`);
+      }
+      if (!(childReserveEnergyQ >= 0 && childReserveEnergyQ <= LOCAL_MAX_SAFE_INT && Math.floor(childReserveEnergyQ) === childReserveEnergyQ)) {
+        throw new UnitsError(`childReserveEnergyQ must be a non-negative safe integer quantum count, received: ${childReserveEnergyQ}`);
+      }
+      if (!(heatQ >= 0 && heatQ <= LOCAL_MAX_SAFE_INT && Math.floor(heatQ) === heatQ)) {
+        throw new UnitsError(`heatQ must be a non-negative safe integer quantum count, received: ${heatQ}`);
+      }
+      if (!(desiredOffspringReserveMassQ >= 0 && desiredOffspringReserveMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(desiredOffspringReserveMassQ) === desiredOffspringReserveMassQ)) {
+        throw new UnitsError(`desiredOffspringReserveMassQ must be a non-negative safe integer quantum count, received: ${desiredOffspringReserveMassQ}`);
+      }
+      if (!(directReserveToStruct >= 0 && directReserveToStruct <= LOCAL_MAX_SAFE_INT && Math.floor(directReserveToStruct) === directReserveToStruct)) {
+        throw new UnitsError(`directReserveToStruct must be a non-negative safe integer quantum count, received: ${directReserveToStruct}`);
+      }
+      if (!(abioticInMassQ >= 0 && abioticInMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(abioticInMassQ) === abioticInMassQ)) {
+        throw new UnitsError(`abioticInMassQ must be a non-negative safe integer quantum count, received: ${abioticInMassQ}`);
+      }
+      if (!(abioticOutMassQ >= 0 && abioticOutMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(abioticOutMassQ) === abioticOutMassQ)) {
+        throw new UnitsError(`abioticOutMassQ must be a non-negative safe integer quantum count, received: ${abioticOutMassQ}`);
+      }
       if (childStructEnergyQ > 0) this.postEnergy(PR_REPRODUCTION, AK_ORGANISM_RESERVE, motherSlot, AK_ORGANISM_STRUCT, childSlot, childStructEnergyQ);
       if (childReserveEnergyQ > 0) this.postEnergy(PR_REPRODUCTION, AK_ORGANISM_RESERVE, motherSlot, AK_ORGANISM_RESERVE, childSlot, childReserveEnergyQ);
       if (heatQ > 0) this.postEnergy(PR_REPRODUCTION, AK_ORGANISM_RESERVE, motherSlot, AK_HEAT, 0, heatQ);
@@ -1304,7 +1381,7 @@ export class EnergyTransaction {
     reserveMassQ: number,
     reserveEnergyQ: number
   ): void {
-    if (structMassQ === 0 && reserveMassQ === 0) return;
+    if (structMassQ === 0 && structEnergyQ === 0 && reserveMassQ === 0 && reserveEnergyQ === 0) return;
     const L = this.ledger;
     const fastOrg = L.fastStoreByKind[AK_ORGANISM_STRUCT];
     const fastCar = L.fastStoreByKind[AK_CELL_CARRION];
@@ -1315,11 +1392,25 @@ export class EnergyTransaction {
       L.active !== this ||
       (organismSlot >>> 0) !== organismSlot ||
       (cellIndex >>> 0) !== cellIndex ||
-      structMassQ < 0 ||
-      reserveMassQ < 0
+      !(structMassQ >= 0 && structMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(structMassQ) === structMassQ) ||
+      !(structEnergyQ >= 0 && structEnergyQ <= LOCAL_MAX_SAFE_INT && Math.floor(structEnergyQ) === structEnergyQ) ||
+      !(reserveMassQ >= 0 && reserveMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(reserveMassQ) === reserveMassQ) ||
+      !(reserveEnergyQ >= 0 && reserveEnergyQ <= LOCAL_MAX_SAFE_INT && Math.floor(reserveEnergyQ) === reserveEnergyQ)
     ) {
-      if (structMassQ > 0) this.transferBiomass(PR_DEATH, AK_ORGANISM_STRUCT, organismSlot, AK_CELL_CARRION, cellIndex, structMassQ, structEnergyQ);
-      if (reserveMassQ > 0) this.transferBiomass(PR_DEATH, AK_ORGANISM_RESERVE, organismSlot, AK_CELL_CARRION, cellIndex, reserveMassQ, reserveEnergyQ);
+      if (!(structMassQ >= 0 && structMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(structMassQ) === structMassQ)) {
+        throw new UnitsError(`structMassQ must be a non-negative safe integer quantum count, received: ${structMassQ}`);
+      }
+      if (!(structEnergyQ >= 0 && structEnergyQ <= LOCAL_MAX_SAFE_INT && Math.floor(structEnergyQ) === structEnergyQ)) {
+        throw new UnitsError(`structEnergyQ must be a non-negative safe integer quantum count, received: ${structEnergyQ}`);
+      }
+      if (!(reserveMassQ >= 0 && reserveMassQ <= LOCAL_MAX_SAFE_INT && Math.floor(reserveMassQ) === reserveMassQ)) {
+        throw new UnitsError(`reserveMassQ must be a non-negative safe integer quantum count, received: ${reserveMassQ}`);
+      }
+      if (!(reserveEnergyQ >= 0 && reserveEnergyQ <= LOCAL_MAX_SAFE_INT && Math.floor(reserveEnergyQ) === reserveEnergyQ)) {
+        throw new UnitsError(`reserveEnergyQ must be a non-negative safe integer quantum count, received: ${reserveEnergyQ}`);
+      }
+      if (structMassQ > 0 || structEnergyQ > 0) this.transferBiomass(PR_DEATH, AK_ORGANISM_STRUCT, organismSlot, AK_CELL_CARRION, cellIndex, structMassQ, structEnergyQ);
+      if (reserveMassQ > 0 || reserveEnergyQ > 0) this.transferBiomass(PR_DEATH, AK_ORGANISM_RESERVE, organismSlot, AK_CELL_CARRION, cellIndex, reserveMassQ, reserveEnergyQ);
       return;
     }
 

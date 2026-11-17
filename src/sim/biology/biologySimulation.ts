@@ -4480,7 +4480,6 @@ export class BiologySimulation {
   }
 
   private runCommitAndPostCommit(
-    tx: EnergyTransaction,
     targetTick: number,
     plannedNextId: number,
     sCount: number,
@@ -4517,9 +4516,6 @@ export class BiologySimulation {
     const phenCtx = this.reusablePhenContext;
     const touchedPops = this.stepTouchedPops;
     const popBySpeciesIdx = this.stepPopBySpeciesIdx;
-
-    this.onPhase?.({ tick: targetTick, phase: 'COMMIT', tx });
-    tx.commit();
 
     this.tickCount = targetTick;
     this.nextId = plannedNextId;
@@ -4747,6 +4743,7 @@ export class BiologySimulation {
     const speciesCaches = this.ensureSpeciesCaches(speciesList);
 
     let tx: EnergyTransaction | null = null;
+    let committed = false;
     const isLegacyMode = this.conservationMode === 'legacy-external-escrow';
     const hasAnyExternalSource = Boolean(
       this.externalPlantSource ||
@@ -4925,10 +4922,11 @@ export class BiologySimulation {
       // =========================================================================
       // PHASE 4 & 5: COMMIT -> POST_COMMIT
       // =========================================================================
-      const activeTx = tx;
-      tx = null; // Once committed, errors inside POST_COMMIT never abort
+      this.onPhase?.({ tick: targetTick, phase: 'COMMIT', tx });
+      tx.commit();
+      committed = true;
+      tx = null; // Once committed, errors inside POST_COMMIT never abort or rewind RNG
       return this.runCommitAndPostCommit(
-        activeTx,
         targetTick,
         plannedNextId,
         sCount,
@@ -4938,11 +4936,13 @@ export class BiologySimulation {
         pushToHistory
       );
     } catch (err) {
-      // ABORT: roll back staged ledger/stores and restore RNG state cleanly
-      if (tx && (tx.state === 'ACTIVE' || tx.state === 'PREPARED')) {
-        tx.abort();
+      // ABORT: roll back staged ledger/stores and restore RNG state only if COMMIT has not completed
+      if (!committed) {
+        if (tx && (tx.state === 'ACTIVE' || tx.state === 'PREPARED')) {
+          tx.abort();
+        }
+        this.streams.restoreStates(rngSnapshot);
       }
-      this.streams.restoreStates(rngSnapshot);
       throw err;
     } finally {
       // Reset per-tick sparse dirty cell heads & clear GC object references
