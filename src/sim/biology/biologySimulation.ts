@@ -4763,7 +4763,6 @@ export class BiologySimulation {
   }
 
   private runCommitAndPostCommit(
-    tx: EnergyTransaction,
     targetTick: number,
     plannedNextId: number,
     sCount: number,
@@ -4800,19 +4799,6 @@ export class BiologySimulation {
     const phenCtx = this.reusablePhenContext;
     const touchedPops = this.stepTouchedPops;
     const popBySpeciesIdx = this.stepPopBySpeciesIdx;
-
-    // The COMMIT hook still runs before the transaction is durable: if it throws, the prepared
-    // transaction must be aborted here (the caller no longer holds it), otherwise the ledger would
-    // stay stuck in PREPARED and the world could never step again.
-    try {
-      this.onPhase?.({ tick: targetTick, phase: 'COMMIT', tx });
-    } catch (err) {
-      if (tx.state === 'ACTIVE' || tx.state === 'PREPARED') {
-        tx.abort();
-      }
-      throw err;
-    }
-    tx.commit();
 
     this.tickCount = targetTick;
     this.nextId = plannedNextId;
@@ -5062,6 +5048,7 @@ export class BiologySimulation {
     const speciesCaches = this.ensureSpeciesCaches(speciesList);
 
     let tx: EnergyTransaction | null = null;
+    let committed = false;
     const isLegacyMode = this.conservationMode === 'legacy-external-escrow';
     const hasAnyExternalSource = Boolean(
       this.externalPlantSource ||
@@ -5250,10 +5237,11 @@ export class BiologySimulation {
       // =========================================================================
       // PHASE 4 & 5: COMMIT -> POST_COMMIT
       // =========================================================================
-      const activeTx = tx;
-      tx = null; // Once committed, errors inside POST_COMMIT never abort
+      this.onPhase?.({ tick: targetTick, phase: 'COMMIT', tx });
+      tx.commit();
+      committed = true;
+      tx = null; // Once committed, errors inside POST_COMMIT never abort or rewind RNG
       return this.runCommitAndPostCommit(
-        activeTx,
         targetTick,
         plannedNextId,
         sCount,
@@ -5263,11 +5251,13 @@ export class BiologySimulation {
         pushToHistory
       );
     } catch (err) {
-      // ABORT: roll back staged ledger/stores and restore RNG state cleanly
-      if (tx && (tx.state === 'ACTIVE' || tx.state === 'PREPARED')) {
-        tx.abort();
+      // ABORT: roll back staged ledger/stores and restore RNG state only if COMMIT has not completed
+      if (!committed) {
+        if (tx && (tx.state === 'ACTIVE' || tx.state === 'PREPARED')) {
+          tx.abort();
+        }
+        this.streams.restoreStates(rngSnapshot);
       }
-      this.streams.restoreStates(rngSnapshot);
       throw err;
     } finally {
       // Spatial mode: drop every staged decision/movement (after COMMIT they are already applied;
