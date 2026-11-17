@@ -94,7 +94,7 @@ const BASE_PROFILE: SpatialSpeciesProfile = Object.freeze({
   siteFidelity: 0.5,
   migrationLegCells: 12,
   crowdingTolerance: 3,
-  thirstPerTick: 0.07,
+  thirstPerTick: 0.05,
   waterMoistureThreshold: 0.5,
 });
 

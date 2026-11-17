@@ -99,6 +99,9 @@ const SALT_FLEE = 0x1b873593;
 const SALT_FOLLOW = 0x68e31da4;
 const SALT_DIRECTION = 0x3c6ef372;
 
+/** Per (cell, species) counters: [0] all non-egg, [1] receptive females, [2] receptive males, [3] hunting. */
+const COUNT_STRIDE = 4;
+
 const RHO_PLANT_EU = 3;
 const RHO_DETRITUS_EU = 3;
 const RHO_CARRION_EU = 15;
@@ -116,6 +119,16 @@ export interface SpatialHydrationConfig {
   readonly dehydratedSpeedFactor?: number;
 }
 
+export interface SpatialExertionConfig {
+  /**
+   * Health lost per tick when the whole locomotion cost of the previous tick exceeded the
+   * animal's energy reserve (scaled by the unpaid fraction). Default 0.04.
+   */
+  readonly exhaustionDamagePerTick?: number;
+  /** Speed multiplier of an animal whose reserve cannot pay for a single step (default 0.5). */
+  readonly exhaustedSpeedFactor?: number;
+}
+
 export interface SpatialBehaviorConfig {
   /** Content individuals re-run full perception every N ticks; urgent states think every tick (default 2). */
   readonly thinkInterval?: number;
@@ -131,6 +144,7 @@ export interface SpatialBehaviorConfig {
   readonly lethalThermalStress?: number;
   readonly navigation?: SpatialNavigatorOptions;
   readonly hydration?: SpatialHydrationConfig;
+  readonly exertion?: SpatialExertionConfig;
   /** Per-species overrides of the spatial physiology profile, keyed by species id. */
   readonly speciesProfiles?: Readonly<Record<string, Partial<SpatialSpeciesProfile>>>;
 }
@@ -239,6 +253,7 @@ export interface OrganismSpatialState {
   readonly targetId: number;
   readonly fatigue: number;
   readonly hydration: number;
+  readonly exhaustion: number;
   readonly wanderlust: number;
   readonly moveCredit: number;
   readonly homeCell: number;
@@ -319,6 +334,8 @@ export class SpatialBehaviorSystem {
   public readonly drinkPerTick: number;
   public readonly dehydrationDamagePerTick: number;
   public readonly dehydratedSpeedFactor: number;
+  public readonly exhaustionDamagePerTick: number;
+  public readonly exhaustedSpeedFactor: number;
   public readonly stats: SpatialStats;
 
   private readonly width: number;
@@ -347,6 +364,8 @@ export class SpatialBehaviorSystem {
   private moveCredit = new Float32Array(0);
   private fatigue = new Float32Array(0);
   private hydration = new Float32Array(0);
+  /** Fraction of last tick's locomotion energy the reserve could not pay (0 = fully paid). */
+  private exhaustion = new Float32Array(0);
   private goalCell = new Int32Array(0);
   private targetId = new Float64Array(0);
   private targetSlot = new Int32Array(0);
@@ -378,6 +397,7 @@ export class SpatialBehaviorSystem {
   private n_moveCredit = new Float32Array(0);
   private n_fatigue = new Float32Array(0);
   private n_hydration = new Float32Array(0);
+  private n_exhaustion = new Float32Array(0);
   private n_goalCell = new Int32Array(0);
   private n_targetId = new Float64Array(0);
   private n_targetSlot = new Int32Array(0);
@@ -416,6 +436,21 @@ export class SpatialBehaviorSystem {
   private occTouchedCount = 0;
   private counts = new Uint16Array(0);
   private countsBuilt = false;
+  // Per-species per-cell fields, rebuilt at most once per tick and shared by every individual
+  // of the species (so perception costs one read per cell instead of re-deriving the value).
+  /** Summed predator weight threatening species `s` in a cell (valid only for occupied cells). */
+  private threatField: Float32Array[] = [];
+  /** Like `threatField`, but counting only predators that are actively hunting (occupied cells only). */
+  private alarmField: Float32Array[] = [];
+  /** 1 when a cell holds at least one organism species `s` may hunt (valid only for occupied cells). */
+  private preyMask: Uint8Array[] = [];
+  /** Usable food energy (EU quanta) of a cell for species `s`; lazily filled per tick. */
+  private foodField: Float32Array[] = [];
+  private foodFieldTick: Int32Array = new Int32Array(0);
+  /** 1 when a cell offers drinkable water to species `s`; lazily filled per tick. */
+  private waterMask: Uint8Array[] = [];
+  private waterMaskTick: Int32Array = new Int32Array(0);
+  private readonly presentScratch = new Int32Array(64);
 
   // ---- per-tick counters (applied at commit) --------------------------------------------------
   private t_attempts = 0;
@@ -433,7 +468,7 @@ export class SpatialBehaviorSystem {
   private sc_bestFoodScore = 0;
   private sc_bestFoodValue = 0;
   private sc_threat = 0;
-  /** Threat from predators within three cells: what actually triggers flight. */
+  /** Immediate threat (hunting predators within three cells, any predator within one). */
   private sc_threatNear = 0;
   private sc_threatX = 0;
   private sc_threatY = 0;
@@ -486,6 +521,8 @@ export class SpatialBehaviorSystem {
     this.drinkPerTick = hyd.drinkPerTick ?? 0.6;
     this.dehydrationDamagePerTick = hyd.dehydrationDamagePerTick ?? 0.05;
     this.dehydratedSpeedFactor = hyd.dehydratedSpeedFactor ?? 0.75;
+    this.exhaustionDamagePerTick = config.exertion?.exhaustionDamagePerTick ?? 0.04;
+    this.exhaustedSpeedFactor = config.exertion?.exhaustedSpeedFactor ?? 0.5;
 
     const intChecks: readonly [string, number, number, number][] = [
       ['thinkInterval', this.thinkInterval, 1, 1024],
@@ -504,6 +541,8 @@ export class SpatialBehaviorSystem {
       ['hydration.drinkPerTick', this.drinkPerTick, 0, 1],
       ['hydration.dehydrationDamagePerTick', this.dehydrationDamagePerTick, 0, 1],
       ['hydration.dehydratedSpeedFactor', this.dehydratedSpeedFactor, 0, 1],
+      ['exertion.exhaustionDamagePerTick', this.exhaustionDamagePerTick, 0, 1],
+      ['exertion.exhaustedSpeedFactor', this.exhaustedSpeedFactor, 0, 1],
     ];
     for (const [name, value, min, max] of numChecks) {
       if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) {
@@ -625,8 +664,9 @@ export class SpatialBehaviorSystem {
       for (let v = 0; v < S; v++) {
         if (preyMatrix[p * S + v] === 0) continue;
         hunt[p * S + v] = 1;
+        // Bigger and more carnivorous predators are perceived as more dangerous
         const ratio = runtimes[p].adultMassMU / Math.max(1e-6, runtimes[v].adultMassMU);
-        threat[p * S + v] = ratio < 0.3 ? 0.3 : ratio > 2 ? 2 : ratio;
+        threat[p * S + v] = (ratio < 0.3 ? 0.3 : ratio > 2 ? 2 : ratio) * (0.4 + 0.6 * runtimes[p].dPrey);
       }
     }
 
@@ -647,8 +687,22 @@ export class SpatialBehaviorSystem {
     this.speciesCount = S;
     this.threatWeight = threat;
     this.huntable = hunt;
-    this.counts = new Uint16Array(this.cellCount * S * 3);
+    this.counts = new Uint16Array(this.cellCount * S * COUNT_STRIDE);
     this.countsBuilt = false;
+    this.threatField = [];
+    this.alarmField = [];
+    this.preyMask = [];
+    this.foodField = [];
+    this.waterMask = [];
+    for (let i = 0; i < S; i++) {
+      this.threatField.push(new Float32Array(this.cellCount));
+      this.alarmField.push(new Float32Array(this.cellCount));
+      this.preyMask.push(new Uint8Array(this.cellCount));
+      this.foodField.push(new Float32Array(this.cellCount));
+      this.waterMask.push(new Uint8Array(this.cellCount));
+    }
+    this.foodFieldTick = new Int32Array(S).fill(-1);
+    this.waterMaskTick = new Int32Array(S).fill(-1);
   }
 
   get navigator(): SpatialNavigator {
@@ -689,6 +743,7 @@ export class SpatialBehaviorSystem {
     this.moveCredit = growF32(this.moveCredit, cap);
     this.fatigue = growF32(this.fatigue, cap);
     this.hydration = growF32(this.hydration, cap);
+    this.exhaustion = growF32(this.exhaustion, cap);
     this.goalCell = growI32(this.goalCell, cap, -1);
     this.targetId = growF64(this.targetId, cap);
     this.targetSlot = growI32(this.targetSlot, cap, -1);
@@ -718,6 +773,7 @@ export class SpatialBehaviorSystem {
     this.n_moveCredit = growF32(this.n_moveCredit, cap);
     this.n_fatigue = growF32(this.n_fatigue, cap);
     this.n_hydration = growF32(this.n_hydration, cap);
+    this.n_exhaustion = growF32(this.n_exhaustion, cap);
     this.n_goalCell = growI32(this.n_goalCell, cap);
     this.n_targetId = growF64(this.n_targetId, cap);
     this.n_targetSlot = growI32(this.n_targetSlot, cap);
@@ -751,6 +807,7 @@ export class SpatialBehaviorSystem {
     this.moveCredit[slot] = 0;
     this.fatigue[slot] = 0;
     this.hydration[slot] = 1;
+    this.exhaustion[slot] = 0;
     this.goalCell[slot] = -1;
     this.targetId[slot] = 0;
     this.targetSlot[slot] = -1;
@@ -858,17 +915,101 @@ export class SpatialBehaviorSystem {
     const stage = view.nextStage;
     const cellArr = view.cell;
     const spArr = view.speciesIdx;
+    const slotArr = view.slot;
+    const behavior = this.behavior;
     for (let d = 0; d < n; d++) {
       const f = flags[d];
       if ((f & FLAG_DIED) !== 0 || stage[d] === STAGE_EGG) continue;
-      const base = (cellArr[d] * S + spArr[d]) * 3;
+      const base = (cellArr[d] * S + spArr[d]) * COUNT_STRIDE;
       if (counts[base] < 65535) counts[base]++;
       if ((f & FLAG_ELIGIBLE) !== 0) {
         const k = base + ((f & FLAG_FEMALE) !== 0 ? 1 : 2);
         if (counts[k] < 65535) counts[k]++;
       }
+      if (behavior[slotArr[d]] === BEHAVIOR_HUNT && counts[base + 3] < 65535) counts[base + 3]++;
+    }
+
+    // Derive, for every occupied cell, what each species perceives there as threat and as prey
+    const touched = this.occTouched;
+    const touchedCount = this.occTouchedCount;
+    const threatW = this.threatWeight;
+    const huntable = this.huntable;
+    const threatField = this.threatField;
+    const alarmField = this.alarmField;
+    const preyMask = this.preyMask;
+    const present = this.presentScratch;
+    const maxPresent = present.length;
+    for (let i = 0; i < touchedCount; i++) {
+      const c = touched[i];
+      const base = c * S * COUNT_STRIDE;
+      let np = 0;
+      for (let q = 0; q < S && np < maxPresent; q++) {
+        if (counts[base + q * COUNT_STRIDE] > 0) present[np++] = q;
+      }
+      for (let me = 0; me < S; me++) {
+        let threat = 0;
+        let alarm = 0;
+        let prey = 0;
+        for (let k = 0; k < np; k++) {
+          const q = present[k];
+          const tw = threatW[q * S + me];
+          if (tw > 0) {
+            threat += tw * counts[base + q * COUNT_STRIDE];
+            alarm += tw * counts[base + q * COUNT_STRIDE + 3];
+          }
+          if (huntable[me * S + q] === 1) prey = 1;
+        }
+        threatField[me][c] = threat;
+        alarmField[me][c] = alarm;
+        preyMask[me][c] = prey;
+      }
     }
     this.countsBuilt = true;
+  }
+
+  /** Food energy field of species `sp` for this tick (computed once, on first use). */
+  private ensureFoodField(sp: number, tick: number): Float32Array {
+    const field = this.foodField[sp];
+    if (this.foodFieldTick[sp] === tick) return field;
+    this.foodFieldTick[sp] = tick;
+    const rt = this.species[sp];
+    const view = this.view;
+    const n = this.cellCount;
+    const comp = this.nav.component[rt.navClass];
+    const plant = view.plantMass;
+    const detritus = view.detritusMass;
+    const carrion = view.carrionMass;
+    const bgS = view.bgPreyStruct;
+    const bgR = view.bgPreyReserve;
+    const kPlant = rt.dPlant * RHO_PLANT_EU;
+    const kDet = rt.dDetritus * RHO_DETRITUS_EU;
+    const kCar = rt.dCarrion * RHO_CARRION_EU;
+    const kPreyS = bgS !== null ? rt.dPrey * RHO_STRUCT_EU : 0;
+    const kPreyR = bgS !== null ? rt.dPrey * RHO_RESERVE_EU : 0;
+    for (let c = 0; c < n; c++) {
+      if (comp[c] < 0) {
+        field[c] = 0;
+        continue;
+      }
+      let v = 0;
+      if (kPlant > 0) v += plant[c] * kPlant;
+      if (kDet > 0) v += detritus[c] * kDet;
+      if (kCar > 0) v += carrion[c] * kCar;
+      if (kPreyR > 0) v += bgS![c] * kPreyS + bgR![c] * kPreyR;
+      field[c] = v;
+    }
+    return field;
+  }
+
+  /** Drinkable-water mask of species `sp` for this tick (computed once, on first use). */
+  private ensureWaterMask(sp: number, tick: number): Uint8Array {
+    const mask = this.waterMask[sp];
+    if (this.waterMaskTick[sp] === tick) return mask;
+    this.waterMaskTick[sp] = tick;
+    const rt = this.species[sp];
+    const n = this.cellCount;
+    for (let c = 0; c < n; c++) mask[c] = this.hasWater(c, rt) ? 1 : 0;
+    return mask;
   }
 
   private trait(ex: Float32Array, idx: number, fallback: number): number {
@@ -1039,6 +1180,14 @@ export class SpatialBehaviorSystem {
     return this.hydrationEnabled && this.hydration[slot] <= 0 ? this.dehydrationDamagePerTick : 0;
   }
 
+  /**
+   * Health lost this tick by the occupant of `slot` because it moved on energy it did not have:
+   * exertion beyond the reserve is paid with body condition instead of being free.
+   */
+  exhaustionDamage(slot: number): number {
+    return this.exhaustion[slot] * this.exhaustionDamagePerTick;
+  }
+
   /** Locomotion + strike energy (EU quanta) staged for the occupant of `slot` this tick. */
   stagedDemandQ(slot: number): number {
     return this.n_planned[slot] === 1 ? this.n_demandQ[slot] : this.x_extraDemandQ[slot];
@@ -1164,19 +1313,6 @@ export class SpatialBehaviorSystem {
     return rt.amphibiousDrinker && terr === 1;
   }
 
-  /** Energy value (EU quanta) of the food a species can use in `cell`, from committed pools. */
-  private foodValueAt(cell: number, rt: SpeciesSpatialRuntime): number {
-    const view = this.view;
-    let value = 0;
-    if (rt.dPlant > 0) value += view.plantMass[cell] * RHO_PLANT_EU * rt.dPlant;
-    if (rt.dDetritus > 0) value += view.detritusMass[cell] * RHO_DETRITUS_EU * rt.dDetritus;
-    if (rt.dCarrion > 0) value += view.carrionMass[cell] * RHO_CARRION_EU * rt.dCarrion;
-    if (rt.dPrey > 0 && view.bgPreyStruct !== null) {
-      value += (view.bgPreyStruct[cell] * RHO_STRUCT_EU + view.bgPreyReserve![cell] * RHO_RESERVE_EU) * rt.dPrey;
-    }
-    return value;
-  }
-
   /**
    * Bounded perception: inspects only the cells within Chebyshev radius `R` of the organism,
    * clipped to the finite map. Results are written to the `sc_*` scratch fields.
@@ -1194,9 +1330,9 @@ export class SpatialBehaviorSystem {
     stressHere: number,
     wantWater: boolean,
     femaleSeeker: boolean,
-    seekMate: boolean
+    seekMate: boolean,
+    tick: number
   ): void {
-    const view = this.view;
     const S = this.speciesCount;
     const w = this.width;
     const h = this.height;
@@ -1207,16 +1343,22 @@ export class SpatialBehaviorSystem {
     const y0 = cy - R < 0 ? 0 : cy - R;
     const y1 = cy + R >= h ? h - 1 : cy + R;
 
-    const cost = this.nav.stepCost[rt.navClass];
     const comp = this.nav.component[rt.navClass];
     const myComp = comp[cell];
     const temps = this.grid.temperature;
     const occHead = this.occHead;
     const counts = this.counts;
-    const threatW = this.threatWeight;
-    const huntable = this.huntable;
-    const mateK = femaleSeeker ? 2 : 1;
+    const threatF = this.threatField[sp];
+    const preyM = this.preyMask[sp];
+    const hunts = rt.hasPreyDiet;
+    const alarmF = this.alarmField[sp];
+    const conspOffset = sp * COUNT_STRIDE;
+    const mateOffset = conspOffset + (femaleSeeker ? 2 : 1);
+    const stride = S * COUNT_STRIDE;
+    const food = needQ > 0 ? this.ensureFoodField(sp, tick) : null;
+    const water = wantWater ? this.ensureWaterMask(sp, tick) : null;
     const valueCap = needQ * 4;
+    const invR1 = 1 / (R + 1);
 
     let bestFoodCell = -1;
     let bestFoodScore = 0;
@@ -1237,7 +1379,6 @@ export class SpatialBehaviorSystem {
     let comfortStress = stressHere;
     let comfortDist = 1e9;
     let consp = 0;
-    let cellsSeen = 0;
 
     for (let y = y0; y <= y1; y++) {
       const dy = y - cy;
@@ -1248,48 +1389,47 @@ export class SpatialBehaviorSystem {
         const dx = x - cx;
         const adx = dx < 0 ? -dx : dx;
         const dist = adx > ady ? adx : ady;
-        cellsSeen++;
 
         let conspHere = 0;
         let threatHere = 0;
         if (occHead[c] !== -1) {
-          const base = c * S * 3;
-          for (let q = 0; q < S; q++) {
-            const n = counts[base + q * 3];
-            if (n === 0) continue;
-            if (q === sp) {
-              conspHere = n;
-              if (seekMate && counts[base + q * 3 + mateK] > 0 && dist < mateDist) {
-                // the seeker itself is not of the opposite sex, so any hit is another individual
-                mateDist = dist;
-                mateCell = c;
-              }
-            }
-            const tw = threatW[q * S + sp];
-            if (tw > 0) {
-              const wgt = tw * n * (1 - dist / (R + 1));
-              threatHere += wgt;
-              if (dist <= 3) threatNear += tw * n * (1 - dist * 0.25);
-              if (dist > 0) {
-                threatX += (dx / dist) * wgt;
-                threatY += (dy / dist) * wgt;
-              }
-              if (dist < threatCellDist) {
-                threatCellDist = dist;
-                threatCell = c;
-              }
-            }
-            if (huntable[sp * S + q] === 1 && dist < preyDist && comp[c] === myComp) {
-              preyDist = dist;
-              preyCell = c;
+          const base = c * stride;
+          conspHere = counts[base + conspOffset];
+          if (conspHere > 0) {
+            consp += conspHere;
+            if (seekMate && dist < mateDist && counts[base + mateOffset] > 0) {
+              // the seeker itself is not of the opposite sex, so any hit is another individual
+              mateDist = dist;
+              mateCell = c;
             }
           }
-          threat += threatHere;
-          consp += conspHere;
+          const tf = threatF[c];
+          if (tf > 0) {
+            threatHere = tf * (1 - dist * invR1);
+            threat += threatHere;
+            // Flight is provoked by predators that are hunting within three cells and by any
+            // predator sharing the animal's own cell; calm predators at a distance are tolerated.
+            if (dist <= 3) {
+              threatNear += alarmF[c] * (1 - dist * 0.25);
+              if (dist === 0) threatNear += 0.5 * tf;
+            }
+            if (dist > 0) {
+              const inv = threatHere / dist;
+              threatX += dx * inv;
+              threatY += dy * inv;
+            }
+            if (dist < threatCellDist) {
+              threatCellDist = dist;
+              threatCell = c;
+            }
+          }
+          if (hunts && dist < preyDist && preyM[c] === 1 && comp[c] === myComp) {
+            preyDist = dist;
+            preyCell = c;
+          }
         }
 
-        if (dist === 0) continue;
-        if (cost[c] <= 0 || comp[c] !== myComp) continue;
+        if (dist === 0 || comp[c] !== myComp) continue;
         const t = temps[c];
         if (t < tLo || t > tHi) continue;
 
@@ -1302,13 +1442,13 @@ export class SpatialBehaviorSystem {
           }
         }
 
-        if (wantWater && dist < waterDist && st <= stressHere && this.hasWater(c, rt)) {
+        if (water !== null && dist < waterDist && water[c] === 1 && st <= stressHere) {
           waterDist = dist;
           waterCell = c;
         }
 
-        if (needQ > 0 && threatHere === 0) {
-          const value = this.foodValueAt(c, rt);
+        if (food !== null && threatHere === 0) {
+          const value = food[c];
           if (value > 0) {
             const capped = value < valueCap ? value : valueCap;
             // Rich, near, uncrowded and thermally safe cells score highest
@@ -1338,18 +1478,11 @@ export class SpatialBehaviorSystem {
     this.sc_mateDist = mateDist;
     this.sc_comfortCell = comfortCell;
     this.sc_consp = consp;
-    this.sc_cellsSeen = cellsSeen;
+    this.sc_cellsSeen = (x1 - x0 + 1) * (y1 - y0 + 1);
   }
 
   private threatCountAt(cell: number, sp: number): number {
-    if (this.occHead[cell] === -1) return 0;
-    const S = this.speciesCount;
-    const base = cell * S * 3;
-    let total = 0;
-    for (let q = 0; q < S; q++) {
-      if (this.threatWeight[q * S + sp] > 0) total += this.counts[base + q * 3];
-    }
-    return total;
+    return this.occHead[cell] === -1 ? 0 : this.threatField[sp][cell];
   }
 
   /** Most catchable valid prey individual standing in `cell` for predator draft `pd` (or -1). */
@@ -1690,6 +1823,8 @@ export class SpatialBehaviorSystem {
     const temps = this.grid.temperature;
     const counts = this.counts;
     const valueCap = needQ * 4;
+    const food = needQ > 0 ? this.ensureFoodField(sp, tick) : null;
+    const threatF = this.threatField[sp];
     for (let y = y0; y <= y1; y++) {
       for (let x = x0; x <= x1; x++) {
         const dx = x - cx;
@@ -1703,14 +1838,11 @@ export class SpatialBehaviorSystem {
         const c = y * w + x;
         secCells[sec]++;
         if (this.occHead[c] !== -1) {
-          const base = c * S * 3;
-          secConsp[sec] += counts[base + sp * 3];
-          for (let q = 0; q < S; q++) {
-            if (this.threatWeight[q * S + sp] > 0) secThreat[sec] += counts[base + q * 3];
-          }
+          secConsp[sec] += counts[(c * S + sp) * COUNT_STRIDE];
+          secThreat[sec] += threatF[c];
         }
         if (cost[c] > 0 && comp[c] === myComp) {
-          const v = needQ > 0 ? this.foodValueAt(c, rt) : 0;
+          const v = food !== null ? food[c] : 0;
           secFood[sec] += v < valueCap ? v : valueCap;
           const t = temps[c];
           secStress[sec] += t > upper ? (t - upper) / 10 : t < lower ? (lower - t) / 10 : 0;
@@ -1859,15 +1991,17 @@ export class SpatialBehaviorSystem {
     const thirsty = this.hydrationEnabled && prof.thirstPerTick > 0;
     let hyd = this.hydration[slot];
     let atWater = false;
+    let thirstRate = 1;
     if (thirsty) {
       atWater = this.hasWater(cell, rt);
+      const heat = tHere > rt.optTemp ? (tHere - rt.optTemp) / 25 : 0;
+      thirstRate = prof.thirstPerTick * (1 + heat);
       if (atWater) {
         if (hyd < 0.999) this.t_drinks++;
         hyd += this.drinkPerTick;
         if (hyd > 1) hyd = 1;
       } else {
-        const heat = tHere > rt.optTemp ? (tHere - rt.optTemp) / 25 : 0;
-        hyd -= prof.thirstPerTick * (1 + heat);
+        hyd -= thirstRate;
         if (hyd < 0) hyd = 0;
       }
     } else {
@@ -1919,6 +2053,10 @@ export class SpatialBehaviorSystem {
       this.w_wpIdx = 0;
     }
 
+    // Walking pace this individual can currently sustain (movement points per tick)
+    const paceEstimate =
+      prof.cellsPerTick * speedT * Math.sqrt(Math.sqrt(sizeT > 0.05 ? sizeT : 0.05)) * (1 - 0.5 * fat);
+
     let behavior = prevBehavior;
     let fleeX = 0;
     let fleeY = 0;
@@ -1932,7 +2070,7 @@ export class SpatialBehaviorSystem {
       prevBehavior === BEHAVIOR_HUNT ||
       stressHere > 0 ||
       (!fedWell && E < 0.6) ||
-      (thirsty && !atWater && hyd < 0.35) ||
+      (thirsty && !atWater && hyd < 0.6) ||
       (goal === -1 && prevBehavior !== BEHAVIOR_REST && prevBehavior !== BEHAVIOR_FORAGE);
     const think = urgent || (tick + id) % this.thinkInterval === 0;
 
@@ -1944,7 +2082,7 @@ export class SpatialBehaviorSystem {
       if (R < minR) R = minR;
       const wantWater = thirsty && !atWater;
       const femaleSeeker = (flags & FLAG_FEMALE) !== 0;
-      this.scan(sp, rt, cell, R, needQ, upper, lower, tLo, tHi, stressHere, wantWater, femaleSeeker, eligible);
+      this.scan(sp, rt, cell, R, needQ, upper, lower, tLo, tHi, stressHere, wantWater, femaleSeeker, eligible, tick);
 
       const comp = this.nav.component[cls];
 
@@ -1956,8 +2094,8 @@ export class SpatialBehaviorSystem {
       else if (wantWater && this.sc_waterCell !== -1) this.remember(slot, MEMORY_WATER, this.sc_waterCell, 1);
       if (attacked) {
         this.remember(slot, MEMORY_DANGER, cell, 2);
-      } else if (this.sc_threat > 0 && this.sc_threatCell !== -1) {
-        this.remember(slot, MEMORY_DANGER, this.sc_threatCell, this.sc_threat);
+      } else if (this.sc_threatNear > 0 && this.sc_threatCell !== -1) {
+        this.remember(slot, MEMORY_DANGER, this.sc_threatCell, this.sc_threatNear);
       }
       if (reqE > 0 && satisfaction < 0.3 && this.remembers(slot, MEMORY_FOOD, cell, tick)) {
         this.remember(slot, MEMORY_BARREN, cell, 0);
@@ -2000,7 +2138,7 @@ export class SpatialBehaviorSystem {
       // Hunger only pushes an animal away when it neither sees better food nor has prey in sight
       if (!fedWell && E < 0.45 && !betterElsewhere && preyDraft === -1) pressure += 0.06 + 0.015 * (streak < 10 ? streak : 10);
       if (stressHere > 0 && this.sc_comfortCell === -1) pressure += 0.12 * (stressHere > 1 ? 2 : stressHere * 2);
-      if (this.sc_threat > 0) pressure += 0.03 * (this.sc_threat > 3 ? 3 : this.sc_threat);
+      if (attacked || this.sc_threatNear > 0) pressure += 0.05;
       if (crowd > prof.crowdingTolerance && prof.crowdingTolerance > 0) {
         const excess = crowd / prof.crowdingTolerance - 1;
         pressure += 0.04 * (excess > 3 ? 3 : excess);
@@ -2020,7 +2158,7 @@ export class SpatialBehaviorSystem {
           cell !== home &&
           fedHere &&
           waterOk &&
-          this.sc_threat === 0 &&
+          this.sc_threatNear === 0 &&
           stressHere === 0 &&
           crowd <= prof.crowdingTolerance
         ) {
@@ -2088,12 +2226,23 @@ export class SpatialBehaviorSystem {
           best = BEHAVIOR_HUNT;
         }
       }
-      if (wantWater && hyd < 0.6 && waterGoal !== -1) {
-        const dry = 1 - hyd;
-        const u = 0.2 + 1.3 * dry * dry + (prevBehavior === BEHAVIOR_SEEK_WATER ? inertia : 0);
-        if (u > bestU) {
-          bestU = u;
-          best = BEHAVIOR_SEEK_WATER;
+      if (wantWater && hyd < 0.9 && waterGoal !== -1) {
+        // Anticipation: how many ticks of water are left versus how long the walk to the known
+        // water takes at this animal's own pace. The trip starts while there is still slack.
+        const gy = (waterGoal / w) | 0;
+        const cyy = (cell / w) | 0;
+        const ddx = waterGoal - gy * w - (cell - cyy * w);
+        const ddy = gy - cyy;
+        const dist = (ddx < 0 ? -ddx : ddx) > (ddy < 0 ? -ddy : ddy) ? (ddx < 0 ? -ddx : ddx) : ddy < 0 ? -ddy : ddy;
+        const travelTicks = (dist * 1.3) / (paceEstimate > 0.15 ? paceEstimate : 0.15);
+        const slack = hyd / thirstRate - travelTicks;
+        const urgency = slack <= 1 ? 1 : slack >= 9 ? 0 : 1 - (slack - 1) / 8;
+        if (urgency > 0) {
+          const u = 0.25 + 1.25 * urgency + (prevBehavior === BEHAVIOR_SEEK_WATER ? inertia : 0);
+          if (u > bestU) {
+            bestU = u;
+            best = BEHAVIOR_SEEK_WATER;
+          }
         }
       }
       if (stressHere > 0 && this.sc_comfortCell !== -1) {
@@ -2203,6 +2352,8 @@ export class SpatialBehaviorSystem {
 
     let newCell: number = cell;
     let credit = 0;
+    let unitQ = 0;
+    let exhaustion = 0;
     this.mv_cost = 0;
     this.mv_prev = this.prevCell[slot];
     this.mv_heading = this.heading[slot];
@@ -2211,16 +2362,16 @@ export class SpatialBehaviorSystem {
     let demandQ = this.x_extraDemandQ[slot];
 
     if (wantsMove) {
-      let speedPts = prof.cellsPerTick * speedT * Math.sqrt(Math.sqrt(sizeT > 0.05 ? sizeT : 0.05)) * (1 - 0.5 * fat);
+      let speedPts = paceEstimate;
       if (thirsty && hyd <= 0) speedPts *= this.dehydratedSpeedFactor;
       if (sprint) speedPts *= prof.sprintMultiplier;
       let points = this.moveCredit[slot] + speedPts;
-      // Energy of one unit of path cost, EU quanta. Movement is never free: an animal cannot spend
-      // more than 60% of the reserve it has left after this tick's feeding on locomotion.
-      const unitQ = rt.activityFactor * massMU * prof.walkCostPerCell * (sprint ? prof.sprintCostMultiplier : 1) * 1_000_000;
-      if (unitQ > 0) {
-        const affordable = (reserveQ * RHO_RESERVE_EU * 0.6) / unitQ;
-        if (points > affordable) points = affordable;
+      // Energy of one unit of path cost, EU quanta. Movement is never free: it is paid from the
+      // reserve, and an animal too depleted to pay for a step can only crawl - the unpaid part of
+      // its effort then costs health next tick (exhaustion) instead of energy it does not have.
+      unitQ = rt.activityFactor * massMU * prof.walkCostPerCell * (sprint ? prof.sprintCostMultiplier : 1) * 1_000_000;
+      if (reserveQ * RHO_RESERVE_EU < unitQ) {
+        points = this.moveCredit[slot] + speedPts * this.exhaustedSpeedFactor;
       }
       if (behavior === BEHAVIOR_FLEE) {
         newCell = this.moveFlee(cls, sp, cell, fleeX, fleeY, points, tLo, tHi, tick, id);
@@ -2233,7 +2384,10 @@ export class SpatialBehaviorSystem {
       // Unspent points carry over only as progress toward a step that was too costly this tick
       credit = this.mv_pending ? this.mv_points : 0;
       if (this.mv_cost > 0) {
-        demandQ += Math.round(unitQ * this.mv_cost);
+        const moveQ = Math.round(unitQ * this.mv_cost);
+        demandQ += moveQ;
+        const availableQ = reserveQ * RHO_RESERVE_EU;
+        if (moveQ > availableQ) exhaustion = (moveQ - availableQ) / moveQ;
         this.t_pathCost += this.mv_cost;
         if (newCell !== cell) this.t_moved++;
       }
@@ -2269,6 +2423,7 @@ export class SpatialBehaviorSystem {
     this.n_moveCredit[slot] = credit;
     this.n_fatigue[slot] = fat;
     this.n_hydration[slot] = hyd;
+    this.n_exhaustion[slot] = exhaustion;
     this.n_goalCell[slot] = goal;
     this.n_targetId[slot] = tgtId;
     this.n_targetSlot[slot] = tgtSlot;
@@ -2324,6 +2479,7 @@ export class SpatialBehaviorSystem {
       this.moveCredit[slot] = this.n_moveCredit[slot];
       this.fatigue[slot] = this.n_fatigue[slot];
       this.hydration[slot] = this.n_hydration[slot];
+      this.exhaustion[slot] = this.n_exhaustion[slot];
       this.goalCell[slot] = this.n_goalCell[slot];
       this.targetId[slot] = this.n_targetId[slot];
       this.targetSlot[slot] = this.n_targetSlot[slot];
@@ -2388,7 +2544,7 @@ export class SpatialBehaviorSystem {
     const occHead = this.occHead;
     const touched = this.occTouched;
     const S = this.speciesCount;
-    const stride = S * 3;
+    const stride = S * COUNT_STRIDE;
     const clearCounts = this.countsBuilt;
     for (let i = 0; i < this.occTouchedCount; i++) {
       const c = touched[i];
@@ -2430,6 +2586,7 @@ export class SpatialBehaviorSystem {
       targetId: this.targetId[slot],
       fatigue: this.fatigue[slot],
       hydration: this.hydration[slot],
+      exhaustion: this.exhaustion[slot],
       wanderlust: this.wanderlust[slot],
       moveCredit: this.moveCredit[slot],
       homeCell: this.homeCell[slot],

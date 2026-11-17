@@ -3606,8 +3606,13 @@ export class BiologySimulation {
         }
         nextHealth = h;
       } else {
-        // Spatial mode only: a fully dehydrated organism loses health and cannot heal
-        dehydrationDamage = spatial !== null ? spatial.dehydrationDamage(draftSlot[dIdx]) : 0;
+        // Spatial mode only: a fully dehydrated organism loses health and cannot heal, and effort
+        // spent beyond the energy reserve (exhaustion) is paid with health
+        let exhaustionDamage = 0;
+        if (spatial !== null) {
+          dehydrationDamage = spatial.dehydrationDamage(draftSlot[dIdx]);
+          exhaustionDamage = spatial.exhaustionDamage(draftSlot[dIdx]);
+        }
         let healthDelta = 0;
         if (tStress > 0) {
           healthDelta -= tStress * sc.thermalDamagePerTick;
@@ -3615,12 +3620,21 @@ export class BiologySimulation {
         if (nextEnergy <= 0) {
           const starvationMitigation = Math.max(0.65, 1.15 - 0.15 * endur);
           healthDelta -= sc.starvationDamagePerTick * starvationMitigation;
-        } else if (tStress === 0 && nextEnergy >= 0.45 && curHealth < 1.0 && dehydrationDamage === 0) {
+        } else if (
+          tStress === 0 &&
+          nextEnergy >= 0.45 &&
+          curHealth < 1.0 &&
+          dehydrationDamage === 0 &&
+          exhaustionDamage === 0
+        ) {
           healthDelta += sc.healingPerTick * (0.75 + 0.25 * endur);
           healed = true;
         }
         if (dehydrationDamage > 0) {
           healthDelta -= dehydrationDamage;
+        }
+        if (exhaustionDamage > 0) {
+          healthDelta -= exhaustionDamage;
         }
         nextHealth = Math.min(1.0, Math.max(0, curHealth + healthDelta));
       }
