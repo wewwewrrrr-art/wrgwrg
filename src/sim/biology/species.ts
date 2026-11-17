@@ -8,6 +8,7 @@ import {
   TraitRange,
 } from './genome';
 import { MutationConfig, validateMutationConfig } from './mutation';
+import type { SpatialSpeciesProfile } from './spatialProfile';
 import {
   TrophicProfile,
   TrophicType,
@@ -108,6 +109,12 @@ export interface SpeciesDefinition {
   readonly mutation: MutationConfig;
   /** Optional explicit Revision 3 trophic parameters; falls back to legacy adapter when omitted. */
   readonly trophicProfile?: TrophicProfile;
+  /**
+   * Optional spatial physiology (locomotion mode, speed, perception range, terrain costs, ...).
+   * Only consulted when the simulation runs with spatial behavior enabled; omitted fields fall
+   * back to diet-derived defaults.
+   */
+  readonly spatial?: Partial<SpatialSpeciesProfile>;
 }
 
 /**
