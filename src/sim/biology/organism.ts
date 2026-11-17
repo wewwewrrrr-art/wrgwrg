@@ -1,3 +1,5 @@
+import { OrganismAnatomyState, createFounderAnatomy, describeAnatomy } from './anatomy';
+import type { OrganismAncestry } from './evolution';
 import { SeededRng } from '../prng';
 import {
   DiploidGenome,
@@ -84,6 +86,12 @@ export interface Organism {
   reproductionCooldown: number;
   offspringCount: number;
   mutationsReceived: number;
+  /** Heritable quantitative anatomical & physiological trait state (Phase 2.3). */
+  anatomy?: OrganismAnatomyState;
+  /** Optional lineage admixture / hybrid fertility tracking (Phase 2.3). */
+  ancestry?: OrganismAncestry;
+  /** Optional daughter lineage ID assigned to diverged subpopulation parents on speciation. */
+  divergedLineageId?: string;
 }
 
 export interface CreateOrganismParams {
@@ -105,6 +113,8 @@ export interface CreateOrganismParams {
   readonly reproductionCooldown?: number;
   readonly mutationsReceived?: number;
   readonly skipInitialPhenotype?: boolean;
+  readonly anatomy?: OrganismAnatomyState;
+  readonly ancestry?: OrganismAncestry;
 }
 
 export function getOrganismBiologicalAgeYears(
@@ -241,6 +251,9 @@ export function createOrganism(params: CreateOrganismParams): Organism {
     phenotype = computePhenotype(params.genome, params.species.genomeSchema, refreshScratchContext);
   }
 
+  const anatomy =
+    params.anatomy ?? createFounderAnatomy(params.species, params.id, params.genome);
+
   return {
     id: params.id,
     speciesId: params.species.id,
@@ -264,6 +277,8 @@ export function createOrganism(params: CreateOrganismParams): Organism {
     reproductionCooldown: params.reproductionCooldown ?? 0,
     offspringCount: 0,
     mutationsReceived: params.mutationsReceived ?? 0,
+    anatomy,
+    ...(params.ancestry ? { ancestry: params.ancestry } : {}),
   };
 }
 
@@ -347,5 +362,7 @@ export function describeOrganism(organism: Organism, species: SpeciesDefinition)
     deathCause: organism.deathCause,
     genotype: genomeToSnapshot(organism.genome, species.genomeSchema),
     phenotype: traitArrayToRecord(organism.phenotype.expressed, species.genomeSchema),
+    anatomy: organism.anatomy ? describeAnatomy(organism.anatomy) : undefined,
+    ancestry: organism.ancestry,
   };
 }

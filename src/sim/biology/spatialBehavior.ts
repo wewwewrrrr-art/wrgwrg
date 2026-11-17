@@ -1,5 +1,6 @@
 import { deriveSeed, normalizeSeed, SeedInput } from '../prng';
 import { WORLD_BIOME_IDS, WorldGrid } from '../worldGrid';
+import { ANATOMY_IDX } from './anatomy';
 import { getPhysiologyIndices } from './lifecycle';
 import type { Organism } from './organism';
 import type { SpeciesDefinition } from './species';
@@ -1085,10 +1086,20 @@ export class SpatialBehaviorSystem {
 
     const pFat = clamp01(this.fatigue[pSlot] + this.x_fatigueAdd[pSlot]);
     const vFat = clamp01(this.fatigue[vSlot] + this.x_fatigueAdd[vSlot]);
+    const pAn = po.anatomy?.expressed;
+    const vAn = vo.anatomy?.expressed;
+    const pAnSpeed = pAn
+      ? (0.76 + 0.22 * pAn[ANATOMY_IDX.LIMB_LENGTH] + 0.05 * (pAn[ANATOMY_IDX.TAIL_LENGTH] - 1)) *
+        (1 - 0.18 * pAn[ANATOMY_IDX.ARMOR_PROTECTION])
+      : 1;
+    const vAnSpeed = vAn
+      ? (0.76 + 0.22 * vAn[ANATOMY_IDX.LIMB_LENGTH] + 0.05 * (vAn[ANATOMY_IDX.TAIL_LENGTH] - 1)) *
+        (1 - 0.18 * vAn[ANATOMY_IDX.ARMOR_PROTECTION])
+      : 1;
     const pSpeed =
-      this.trait(pe, rp.iSpeed, rp.baseSpeed) * rp.profile.cellsPerTick * rp.profile.sprintMultiplier * (1 - 0.5 * pFat);
+      this.trait(pe, rp.iSpeed, rp.baseSpeed) * pAnSpeed * rp.profile.cellsPerTick * rp.profile.sprintMultiplier * (1 - 0.5 * pFat);
     const vSpeed =
-      this.trait(ve, rv.iSpeed, rv.baseSpeed) * rv.profile.cellsPerTick * rv.profile.sprintMultiplier * (1 - 0.5 * vFat);
+      this.trait(ve, rv.iSpeed, rv.baseSpeed) * vAnSpeed * rv.profile.cellsPerTick * rv.profile.sprintMultiplier * (1 - 0.5 * vFat);
     let speedTerm = 0.5 + 0.55 * (pSpeed / (vSpeed > 1e-3 ? vSpeed : 1e-3) - 1);
     speedTerm = speedTerm < 0.08 ? 0.08 : speedTerm > 0.95 ? 0.95 : speedTerm;
 
@@ -1113,16 +1124,25 @@ export class SpatialBehaviorSystem {
     // tropical-forest = 2, temperate-forest = 3: dense cover favors the prey
     const cover = biome === 2 || biome === 3 ? 0.85 : 1;
 
+    const pAttackScale = pAn
+      ? 0.78 + 0.16 * pAn[ANATOMY_IDX.HEAD_SIZE] + 0.14 * pAn[ANATOMY_IDX.CARNIVORY_APPARATUS]
+      : 1;
+    const vDefenseScale = vAn
+      ? 1 + 0.65 * vAn[ANATOMY_IDX.ARMOR_PROTECTION] + 0.14 * vAn[ANATOMY_IDX.TORSO_ROBUSTNESS]
+      : 1;
+
     const p =
-      speedTerm *
-      sizeTerm *
-      vulnerability *
-      awareness *
-      condition *
-      strength *
-      (cellDist === 0 ? 1 : 0.7) *
-      (opportunistic ? 0.6 : 1) *
-      cover;
+      (speedTerm *
+        sizeTerm *
+        vulnerability *
+        awareness *
+        condition *
+        strength *
+        pAttackScale *
+        (cellDist === 0 ? 1 : 0.7) *
+        (opportunistic ? 0.6 : 1) *
+        cover) /
+      vDefenseScale;
     return p < 0.02 ? 0.02 : p > 0.97 ? 0.97 : p;
   }
 
@@ -2022,8 +2042,15 @@ export class SpatialBehaviorSystem {
     const heatTol = this.trait(ex, rt.iHeatTol, rt.baseHeatTol);
     const coldTol = this.trait(ex, rt.iColdTol, rt.baseColdTol);
     const adapt = this.trait(ex, rt.iAdapt, rt.baseAdapt);
-    const upper = rt.optTemp + rt.halfWidth + heatTol * 7.5 + adapt * 3.5;
-    const lower = rt.optTemp - rt.halfWidth - coldTol * 8.0 - adapt * 3.5;
+    const an = org.anatomy?.expressed;
+    const coldShift = an
+      ? (an[ANATOMY_IDX.INTEGUMENT_THICKNESS] - 1.0) * 6.0 + (an[ANATOMY_IDX.TORSO_ROBUSTNESS] - 1.0) * 3.0
+      : 0;
+    const heatShift = an
+      ? -(an[ANATOMY_IDX.INTEGUMENT_THICKNESS] - 1.0) * 4.8 - Math.max(0, an[ANATOMY_IDX.TORSO_ROBUSTNESS] - 1.0) * 2.0
+      : 0;
+    const upper = rt.optTemp + rt.halfWidth + heatTol * 7.5 + adapt * 3.5 + heatShift;
+    const lower = rt.optTemp - rt.halfWidth - coldTol * 8.0 - adapt * 3.5 - coldShift;
     const tHere = this.grid.temperature[cell];
     const stressHere = tHere > upper ? (tHere - upper) / 10 : tHere < lower ? (lower - tHere) / 10 : 0;
     let tHi = upper + 10 * this.lethalThermalStress;
@@ -2099,8 +2126,21 @@ export class SpatialBehaviorSystem {
     }
 
     // Walking pace this individual can currently sustain (movement points per tick)
+    const terr = this.grid.terrainCode[cell];
+    let anPaceMul = 1;
+    if (an) {
+      if (terr <= 1) {
+        anPaceMul = 0.72 + 0.55 * an[ANATOMY_IDX.AQUATIC_AFFINITY];
+      } else if (terr >= 4) {
+        anPaceMul = (0.82 + 0.40 * an[ANATOMY_IDX.CLIMBING_AFFINITY]) * (1 - 0.14 * an[ANATOMY_IDX.ARMOR_PROTECTION]);
+      } else {
+        anPaceMul =
+          (0.76 + 0.22 * an[ANATOMY_IDX.LIMB_LENGTH] + 0.05 * (an[ANATOMY_IDX.TAIL_LENGTH] - 1)) *
+          (1 - 0.18 * an[ANATOMY_IDX.ARMOR_PROTECTION]);
+      }
+    }
     const paceEstimate =
-      prof.cellsPerTick * speedT * Math.sqrt(Math.sqrt(sizeT > 0.05 ? sizeT : 0.05)) * (1 - 0.5 * fat);
+      prof.cellsPerTick * speedT * anPaceMul * Math.sqrt(Math.sqrt(sizeT > 0.05 ? sizeT : 0.05)) * (1 - 0.5 * fat);
 
     let behavior = prevBehavior;
     let fleeX = 0;
