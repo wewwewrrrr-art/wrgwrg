@@ -4,7 +4,6 @@ import {
   ANATOMY_RANGES,
   OrganismAnatomyState,
   deriveSpeciesAnatomyBaseline,
-  ensureOrganismAnatomy,
 } from './anatomy';
 import { GenomeSchema } from './genome';
 import { Organism } from './organism';
@@ -168,16 +167,18 @@ export function computeEcologicalMorphDistance(
   let sumSq = dSize * dSize + 0.5 * dHeat * dHeat + 0.5 * dCold * dCold;
   let terms = 2.0;
 
-  const anA = ensureOrganismAnatomy(orgA, spA);
-  const anB = ensureOrganismAnatomy(orgB, spB);
-  const dAq = anA.expressed[ANATOMY_IDX.AQUATIC_AFFINITY] - anB.expressed[ANATOMY_IDX.AQUATIC_AFFINITY];
-  const dInt = anA.expressed[ANATOMY_IDX.INTEGUMENT_THICKNESS] - anB.expressed[ANATOMY_IDX.INTEGUMENT_THICKNESS];
-  const dHerb = anA.expressed[ANATOMY_IDX.HERBIVORY_APPARATUS] - anB.expressed[ANATOMY_IDX.HERBIVORY_APPARATUS];
-  const dCarn = anA.expressed[ANATOMY_IDX.CARNIVORY_APPARATUS] - anB.expressed[ANATOMY_IDX.CARNIVORY_APPARATUS];
-  const dArmor = anA.expressed[ANATOMY_IDX.ARMOR_PROTECTION] - anB.expressed[ANATOMY_IDX.ARMOR_PROTECTION];
-
-  sumSq += 1.5 * dAq * dAq + 0.6 * dInt * dInt + dHerb * dHerb + dCarn * dCarn + 0.6 * dArmor * dArmor;
-  terms += 4.3;
+  // Anatomy terms only when both organisms actually carry an anatomy genome (never synthesized)
+  const anA = orgA.anatomy;
+  const anB = orgB.anatomy;
+  if (anA !== undefined && anB !== undefined) {
+    const dAq = anA.expressed[ANATOMY_IDX.AQUATIC_AFFINITY] - anB.expressed[ANATOMY_IDX.AQUATIC_AFFINITY];
+    const dInt = anA.expressed[ANATOMY_IDX.INTEGUMENT_THICKNESS] - anB.expressed[ANATOMY_IDX.INTEGUMENT_THICKNESS];
+    const dHerb = anA.expressed[ANATOMY_IDX.HERBIVORY_APPARATUS] - anB.expressed[ANATOMY_IDX.HERBIVORY_APPARATUS];
+    const dCarn = anA.expressed[ANATOMY_IDX.CARNIVORY_APPARATUS] - anB.expressed[ANATOMY_IDX.CARNIVORY_APPARATUS];
+    const dArmor = anA.expressed[ANATOMY_IDX.ARMOR_PROTECTION] - anB.expressed[ANATOMY_IDX.ARMOR_PROTECTION];
+    sumSq += 1.5 * dAq * dAq + 0.6 * dInt * dInt + dHerb * dHerb + dCarn * dCarn + 0.6 * dArmor * dArmor;
+    terms += 4.3;
+  }
 
   const dOptT = (spA.physiology.optimalTemperatureC - spB.physiology.optimalTemperatureC) / 25;
   sumSq += dOptT * dOptT;
@@ -357,6 +358,7 @@ export function computePopulationGeneticSummary(
   const varAnat = new Float64Array(ANATOMY_LOCUS_COUNT);
 
   let n = 0;
+  let anatN = 0;
   let hetSum = 0;
 
   for (let i = 0; i < organisms.length; i++) {
@@ -374,9 +376,13 @@ export function computePopulationGeneticSummary(
       const span = Math.max(1e-6, range.max - range.min);
       hetSum += Math.abs(m - p) / span;
     }
-    const anat = ensureOrganismAnatomy(org, species);
-    for (let a = 0; a < ANATOMY_LOCUS_COUNT; a++) {
-      meanAnat[a] += (anat.maternal[a] + anat.paternal[a]) * 0.5;
+    // Read-only: anatomy statistics cover organisms that carry an anatomy genome
+    const anat = org.anatomy;
+    if (anat !== undefined) {
+      anatN++;
+      for (let a = 0; a < ANATOMY_LOCUS_COUNT; a++) {
+        meanAnat[a] += (anat.maternal[a] + anat.paternal[a]) * 0.5;
+      }
     }
   }
 
@@ -393,8 +399,9 @@ export function computePopulationGeneticSummary(
   }
 
   const invN = 1 / n;
+  const invAnatN = anatN > 0 ? 1 / anatN : 0;
   for (let l = 0; l < locusCount; l++) meanCore[l] *= invN;
-  for (let a = 0; a < ANATOMY_LOCUS_COUNT; a++) meanAnat[a] *= invN;
+  for (let a = 0; a < ANATOMY_LOCUS_COUNT; a++) meanAnat[a] *= invAnatN;
 
   let normVarSum = 0;
   for (let i = 0; i < organisms.length; i++) {
@@ -423,7 +430,7 @@ export function computePopulationGeneticSummary(
     normVarSum += Math.sqrt(varCore[l]) / span;
   }
   for (let a = 0; a < ANATOMY_LOCUS_COUNT; a++) {
-    varAnat[a] *= invN;
+    varAnat[a] *= invAnatN;
     const r = ANATOMY_RANGES[a];
     normVarSum += Math.sqrt(varAnat[a]) / (r.max - r.min);
   }
@@ -467,4 +474,114 @@ export function computePairwiseGeneticDivergence(
     count++;
   }
   return Math.sqrt(sqDiff / Math.max(1, count));
+}
+
+export interface ReproductiveIsolationMeasurement {
+  /** Sampled matings between the two groups (both directions). */
+  readonly crossPairs: number;
+  /** Sampled matings inside each group (reference). */
+  readonly withinPairs: number;
+  /** Mean expected fertile offspring factor of cross-group matings: pre * post * fertility. */
+  readonly crossSuccess: number;
+  readonly withinSuccess: number;
+  /** `1 - crossSuccess / withinSuccess` in [0, 1]; `NaN` when not measurable (no mature pairs). */
+  readonly isolation: number;
+  /** Isolation from mate recognition alone: `1 - meanPre(cross) / meanPre(within)`. */
+  readonly prezygoticIsolation: number;
+  /** Isolation from zygote viability and hybrid fertility: `1 - meanPost(cross) / meanPost(within)`. */
+  readonly postzygoticIsolation: number;
+}
+
+function matureByOrder(group: readonly Organism[], sex: 'female' | 'male'): Organism[] {
+  const out: Organism[] = [];
+  for (const o of group) {
+    if (o.alive && o.sex === sex && (o.stage === 'adult' || o.stage === 'elder')) out.push(o);
+  }
+  out.sort((a, b) => a.id - b.id);
+  return out;
+}
+
+/**
+ * Measures how well two groups of organisms could still reproduce with each other if they met,
+ * using exactly the compatibility model that governs real matings in the simulation
+ * (`evaluateReproductiveCompatibility`: assortative mate recognition, Dobzhansky-Muller zygote
+ * viability, hybrid fertility). Spatial separation is deliberately NOT part of the measure: two
+ * groups that merely live apart but are fully compatible measure as 0.
+ *
+ * Deterministic and RNG-free: mature females of one group are paired with mature males of the
+ * other at evenly spread positions (ascending id order), at most `maxPairs` per direction.
+ */
+export function measureReproductiveIsolation(
+  groupA: readonly Organism[],
+  speciesA: SpeciesDefinition,
+  groupB: readonly Organism[],
+  speciesB: SpeciesDefinition,
+  cladeCompatible = true,
+  maxPairs = 24
+): ReproductiveIsolationMeasurement {
+  const fA = matureByOrder(groupA, 'female');
+  const mA = matureByOrder(groupA, 'male');
+  const fB = matureByOrder(groupB, 'female');
+  const mB = matureByOrder(groupB, 'male');
+
+  let crossN = 0;
+  let crossS = 0;
+  let crossPre = 0;
+  let crossPost = 0;
+  let withinN = 0;
+  let withinS = 0;
+  let withinPre = 0;
+  let withinPost = 0;
+
+  const sample = (
+    females: readonly Organism[],
+    fSp: SpeciesDefinition,
+    males: readonly Organism[],
+    mSp: SpeciesDefinition,
+    cross: boolean
+  ): void => {
+    const nf = females.length;
+    const nm = males.length;
+    if (nf === 0 || nm === 0) return;
+    const k = Math.min(maxPairs, Math.max(nf, nm));
+    for (let i = 0; i < k; i++) {
+      const f = females[Math.floor((i * nf) / k)];
+      // golden-ratio stride decorrelates the male choice from the female choice
+      const m = males[Math.floor(((i * 0.6180339887498949 + 0.5) % 1) * nm)];
+      const c = evaluateReproductiveCompatibility(f, fSp, m, mSp, cladeCompatible);
+      const pre = c.compatible ? c.preZygoticCompatibility * c.parentFertilityMultiplier : 0;
+      const post = c.compatible ? c.postZygoticViability * c.offspringHybridFertility : 0;
+      if (cross) {
+        crossN++;
+        crossS += pre * post;
+        crossPre += pre;
+        crossPost += post;
+      } else {
+        withinN++;
+        withinS += pre * post;
+        withinPre += pre;
+        withinPost += post;
+      }
+    }
+  };
+  sample(fA, speciesA, mB, speciesB, true);
+  sample(fB, speciesB, mA, speciesA, true);
+  sample(fA, speciesA, mA, speciesA, false);
+  sample(fB, speciesB, mB, speciesB, false);
+
+  const ratioIso = (cross: number, cn: number, within: number, wn: number): number => {
+    if (cn === 0 || wn === 0) return NaN;
+    const w = within / wn;
+    if (w <= 0) return NaN;
+    return clamp01(1 - cross / cn / w);
+  };
+  return {
+    crossPairs: crossN,
+    withinPairs: withinN,
+    crossSuccess: crossN > 0 ? crossS / crossN : NaN,
+    withinSuccess: withinN > 0 ? withinS / withinN : NaN,
+    isolation: ratioIso(crossS, crossN, withinS, withinN),
+    prezygoticIsolation: ratioIso(crossPre, crossN, withinPre, withinN),
+    postzygoticIsolation: ratioIso(crossPost, crossN, withinPost, withinN),
+  };
 }

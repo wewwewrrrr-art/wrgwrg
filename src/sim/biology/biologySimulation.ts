@@ -67,6 +67,29 @@ import {
   createOrganism,
   refreshOrganismPhenotype,
 } from './organism';
+import {
+  AnatomyPerformance,
+  computeAnatomyPerformanceInto,
+  computeRelativeAnatomyPerformanceInto,
+  createAnatomyPerformance,
+  getSpeciesBaselineAnatomy,
+  inheritOrganismAnatomy,
+} from './anatomy';
+import {
+  ReproductiveCompatibilityResult,
+  areSpeciesCladeCompatible,
+  computeSexualAttractiveness,
+  evaluateReproductiveCompatibility,
+} from './evolution';
+import { PhylogenyTracker } from './phylogeny';
+import {
+  EvolutionConfig,
+  ResolvedEvolutionConfig,
+  SpeciationEngine,
+  StagedClusterTrackerUpdate,
+  StagedSpeciationProposal,
+  resolveEvolutionConfig,
+} from './speciation';
 import { PopulationManager, PopulationStats, validateDeathCauseStrict } from './population';
 import {
   SpeciesDefinition,
@@ -309,7 +332,46 @@ export interface BiologySimulationConfig {
    * keeps every pre-existing code path bit-identical.
    */
   readonly spatial?: SpatialBehaviorConfig | boolean;
+  /**
+   * Enables evolution inside the atomic tick (`true` = defaults, see `EvolutionConfig`):
+   *   - heritable anatomy acts on physiology (thermal tolerance, metabolic upkeep), relative to
+   *     the species baseline anatomy;
+   *   - mates are accepted through the reproductive compatibility model (assortative mate
+   *     recognition, zygote viability, hybrid fertility; optional sister-species hybridization);
+   *   - isolated, diverged, reproductively isolated subpopulations found new species;
+   *   - a phylogeny of lineages, speciations, hybridizations and extinctions is kept.
+   * Default: disabled. Anatomy inheritance and mutation run in every mode.
+   */
+  readonly evolution?: EvolutionConfig | boolean;
 }
+
+export interface EvolutionTickStats {
+  /** Committed ticks with evolution enabled. */
+  ticks: number;
+  /** Mate candidates evaluated with the compatibility model. */
+  mateEvaluations: number;
+  /** Candidates refused by mate recognition (pre-zygotic). */
+  mateRejections: number;
+  /** Zygotes formed that were not viable (post-zygotic; die as eggs). */
+  inviableZygotes: number;
+  /** Offspring of matings between different species. */
+  hybridOffspring: number;
+  /** Committed speciation events. */
+  speciations: number;
+  /** Speciation checks performed. */
+  speciationChecks: number;
+}
+
+interface StagedSpeciation {
+  readonly proposal: StagedSpeciationProposal;
+  readonly population: PopulationManager;
+  readonly memberIds: Set<number>;
+}
+
+/** Upper bound of mate candidates a female evaluates per breeding attempt (evolution mode). */
+const MAX_MATE_CANDIDATES = 6;
+/** Upper bound of organisms inspected while looking for candidates (evolution mode). */
+const MAX_MATE_SCAN = 48;
 
 export interface SpawnFounderOptions {
   readonly stage?: Exclude<LifeStage, 'dead'>;
@@ -538,6 +600,10 @@ interface SpeciesRuntimeCache {
   readonly eggReserveMassQ: MassQ;
   readonly eggActualInitNorm: number;
   readonly mutationPlan: CompiledMutationPlan;
+  /** Effective mutation process of the species (also governs anatomy loci). */
+  readonly mutationConfig: MutationConfig;
+  /** Anatomy performance of the species baseline anatomy (reference for relative effects). */
+  readonly anatomyBaselinePerf: AnatomyPerformance;
   readonly scratchPhenotype: PhenotypeProfile;
 }
 
@@ -693,6 +759,38 @@ export class BiologySimulation {
   private readonly wrapX: boolean;
   /** Autonomous spatial behavior system, or `null` when spatial behavior is disabled. */
   public readonly spatial: SpatialBehaviorSystem | null;
+  /** Resolved evolution settings, or `null` when evolution is disabled. */
+  public readonly evolution: ResolvedEvolutionConfig | null;
+  /** Lineage history (evolution mode); mutated only after COMMIT. */
+  public readonly phylogeny: PhylogenyTracker | null;
+  /** Cumulative evolution counters (evolution mode), updated only after COMMIT. */
+  public readonly evolutionStats: EvolutionTickStats = {
+    ticks: 0,
+    mateEvaluations: 0,
+    mateRejections: 0,
+    inviableZygotes: 0,
+    hybridOffspring: 0,
+    speciations: 0,
+    speciationChecks: 0,
+  };
+  private readonly speciationEngine: SpeciationEngine | null;
+  private readonly anatomyPhysiology: boolean;
+  private readonly anatomyPerfScratch: AnatomyPerformance = createAnatomyPerformance();
+  private cladeCompatMatrix = new Uint8Array(0);
+  private readonly stagedProposals: StagedSpeciationProposal[] = [];
+  private readonly stagedTrackerUpdates: StagedClusterTrackerUpdate[] = [];
+  private readonly stagedSpeciations: StagedSpeciation[] = [];
+  private stagedSpeciationCheck = false;
+  private mateCompat: ReproductiveCompatibilityResult | null = null;
+  private readonly mateCandidateScratch = new Int32Array(MAX_MATE_CANDIDATES + 2);
+  private t_mateEvaluations = 0;
+  private t_mateRejections = 0;
+  private t_inviableZygotes = 0;
+  private t_hybridOffspring = 0;
+  private eggFatherSpeciesIdx = new Int32Array(64);
+  private eggHybridViability = new Float32Array(64);
+  private eggHybridFertility = new Float32Array(64);
+  private eggHybridBackcross = new Uint8Array(64);
   private readonly spatialView: SpatialTickView | null;
   private spatialFallbackPlant: Float64Array | null = null;
   private spatialFallbackCarrion: Float64Array | null = null;
@@ -936,6 +1034,10 @@ export class BiologySimulation {
       'biology:mutation',
       'biology:reproduction',
       'biology:lifecycle',
+      // Anatomy inheritance & mutation: separate stream so core-genome draws stay unchanged
+      'biology:anatomy',
+      // Mate acceptance & zygote viability under the reproductive compatibility model
+      'biology:mating',
     ]);
 
     this.speciesRegistry = config.speciesRegistry ?? createDefaultSpeciesRegistry();
@@ -1268,6 +1370,22 @@ export class BiologySimulation {
     } else {
       this.spatial = null;
       this.spatialView = null;
+    }
+
+    // Optional evolution (inheritance-driven selection, reproductive isolation, speciation)
+    const evoCfg = config.evolution;
+    const resolvedEvolution =
+      evoCfg !== undefined && evoCfg !== false ? resolveEvolutionConfig(evoCfg === true ? {} : evoCfg) : null;
+    if (resolvedEvolution !== null && resolvedEvolution.enabled) {
+      this.evolution = resolvedEvolution;
+      this.phylogeny = new PhylogenyTracker(this.speciesRegistry.list());
+      this.speciationEngine = new SpeciationEngine(config.grid, resolvedEvolution);
+      this.anatomyPhysiology = resolvedEvolution.enableAnatomyEvolution;
+    } else {
+      this.evolution = null;
+      this.phylogeny = null;
+      this.speciationEngine = null;
+      this.anatomyPhysiology = false;
     }
   }
 
@@ -2297,6 +2415,8 @@ export class BiologySimulation {
         eggReserveMassQ,
         eggActualInitNorm,
         mutationPlan: compileMutationPlan(schema, sp.traitRanges, mutCfg),
+        mutationConfig: mutCfg,
+        anatomyBaselinePerf: computeAnatomyPerformanceInto(getSpeciesBaselineAnatomy(sp), createAnatomyPerformance()),
         scratchPhenotype: this.getScratchPhenotype(sp),
       };
     }
@@ -2314,6 +2434,18 @@ export class BiologySimulation {
           : 0;
       }
     }
+
+    // Which species pairs may attempt to interbreed (evolution mode with hybridization)
+    const clade = new Uint8Array(sCount * sCount);
+    if (this.evolution !== null && this.evolution.enableHybridization) {
+      for (let f = 0; f < sCount; f++) {
+        for (let m = 0; m < sCount; m++) {
+          clade[f * sCount + m] =
+            f === m || areSpeciesCladeCompatible(list[f].species, list[m].species, this.phylogeny ?? undefined) ? 1 : 0;
+        }
+      }
+    }
+    this.cladeCompatMatrix = clade;
 
     this.speciesCacheList = list;
     this.speciesPreyMatrix = preyMatrix;
@@ -2487,6 +2619,11 @@ export class BiologySimulation {
     this.eggDraftSlot = growI(this.eggDraftSlot);
     this.eggIsReused = growU8(this.eggIsReused);
     this.eggProvisioned = growU8(this.eggProvisioned);
+    this.eggFatherSpeciesIdx = growI(this.eggFatherSpeciesIdx);
+    const growF32 = (o: Float32Array) => { const n = new Float32Array(nextCap); n.set(o); return n; };
+    this.eggHybridViability = growF32(this.eggHybridViability);
+    this.eggHybridFertility = growF32(this.eggHybridFertility);
+    this.eggHybridBackcross = growU8(this.eggHybridBackcross);
     this.slotPlanSlots = new Int32Array(nextCap);
     this.slotPlanReused = new Uint8Array(nextCap);
   }
@@ -2636,6 +2773,8 @@ export class BiologySimulation {
     const idxColdTol = pIdx.coldTolerance;
     const idxMetEff = pIdx.metabolismEfficiency;
     const idxAdapt = pIdx.environmentalAdaptability;
+    const anatomyPhysiology = this.anatomyPhysiology;
+    const anatomyPerf = this.anatomyPerfScratch;
 
     let localDraftCount = this.curDraftCount;
     let localGloballySorted = this.curGloballySorted;
@@ -2782,8 +2921,18 @@ export class BiologySimulation {
             ? expressTraitF32(gMat, gPat, gDom, modKinds, idxAdapt, modPhys, modNeur, modOther)
             : sc.baseEnvironmentalAdaptability;
       }
-      const upperLimit = optTemp + halfWidth + heatTol * 7.5 + adapt * 3.5;
-      const lowerLimit = optTemp - halfWidth - coldTol * 8.0 - adapt * 3.5;
+      let upperLimit = optTemp + halfWidth + heatTol * 7.5 + adapt * 3.5;
+      let lowerLimit = optTemp - halfWidth - coldTol * 8.0 - adapt * 3.5;
+      // Evolution mode: heritable anatomy shifts thermal tolerance and metabolic upkeep relative to
+      // the species baseline anatomy (insulation helps in the cold and hurts in the heat, armour
+      // and large heads cost energy). The energy accounting itself is unchanged.
+      let anatomyMetabolicScale = 1;
+      if (anatomyPhysiology && org.anatomy !== undefined) {
+        const perf = computeRelativeAnatomyPerformanceInto(org.anatomy, sc.anatomyBaselinePerf, anatomyPerf);
+        upperLimit += perf.heatOffsetC;
+        lowerLimit -= perf.coldOffsetC;
+        anatomyMetabolicScale = perf.metabolicScale;
+      }
       const thermalStress =
         envTemp > upperLimit
           ? (envTemp - upperLimit) / 10
@@ -2856,6 +3005,9 @@ export class BiologySimulation {
           thermalStress,
           activityLevel
         );
+        if (anatomyMetabolicScale !== 1) {
+          metabolicDemandQ = Math.round(metabolicDemandQ * anatomyMetabolicScale);
+        }
       }
 
       let metabBurnMassQ = 0;
@@ -3709,6 +3861,99 @@ export class BiologySimulation {
     this.curDiedCount = diedCount;
   }
 
+  /**
+   * Evolution-mode mate search: up to `MAX_MATE_CANDIDATES` eligible males from the female's cell
+   * and its neighbours (canonical order), plus clade-compatible males of sister species sharing her
+   * cell when hybridization is enabled. Each candidate is accepted with the probability given by
+   * the reproductive compatibility model (mate recognition x parental fertility x, with sexual
+   * selection, male condition); the first acceptance wins. Sets `this.mateCompat`.
+   */
+  private findMateWithCompatibility(
+    fIdx: number,
+    s: number,
+    speciesCaches: SpeciesRuntimeCache[],
+    cellHead: Int32Array,
+    cellNext: Int32Array,
+    active: readonly Organism[],
+    activeToDraft: Int32Array | null,
+    unsortedIdToDraft: Map<number, number> | null,
+    matingRng: SeededRng
+  ): number {
+    const draftFlags = this.draftFlags;
+    const draftOrg = this.draftOrg;
+    const draftSpeciesIdx = this.draftSpeciesIdx;
+    const female = draftOrg[fIdx];
+    const femaleSp = speciesCaches[s].species;
+    const seekerCell = this.draftCellIndex[fIdx];
+    const width = this.grid.width;
+    const height = this.grid.height;
+    const wrapX = this.effectiveWrapX;
+    const evo = this.evolution!;
+    const candidates = this.mateCandidateScratch;
+    let nCand = 0;
+    let scanned = 0;
+
+    const consider = (dIdx: number): void => {
+      const flags = draftFlags[dIdx];
+      if ((flags & FLAG_ELIGIBLE) === 0 || (flags & (FLAG_DIED | FLAG_FEMALE)) !== 0) return;
+      candidates[nCand++] = dIdx;
+    };
+    const visitCell = (cell: number): void => {
+      for (let idx = cellHead[cell]; idx !== -1 && nCand < MAX_MATE_CANDIDATES && scanned < MAX_MATE_SCAN; idx = cellNext[idx]) {
+        scanned++;
+        const cand = active[idx];
+        if (!cand.alive || cand.sex === 'female' || cand.id === female.id) continue;
+        const d = activeToDraft !== null ? activeToDraft[idx] : (unsortedIdToDraft?.get(cand.id) ?? -1);
+        if (d !== -1) consider(d);
+      }
+    };
+    visitCell(seekerCell);
+    const fy = (seekerCell / width) | 0;
+    const fx = seekerCell - fy * width;
+    for (let k = 0; k < 8 && nCand < MAX_MATE_CANDIDATES && scanned < MAX_MATE_SCAN; k++) {
+      let nx = fx + MOORE_DX[k];
+      const ny = fy + MOORE_DY[k];
+      if (ny < 0 || ny >= height) continue;
+      if (wrapX) nx = ((nx % width) + width) % width;
+      else if (nx < 0 || nx >= width) continue;
+      const nIdx = ny * width + nx;
+      if (nIdx !== seekerCell) visitCell(nIdx);
+    }
+    // Sister-species males in the same cell (all-species draft index of this tick)
+    if (evo.enableHybridization && this.curAliveDirtyCount > 0) {
+      const sCount = speciesCaches.length;
+      let hetero = 0;
+      for (let d = this.aliveCellHead[seekerCell]; d !== -1 && hetero < 2 && nCand < MAX_MATE_CANDIDATES + 2; d = this.aliveNextDraft[d]) {
+        const sp = draftSpeciesIdx[d];
+        if (sp === s || this.cladeCompatMatrix[s * sCount + sp] === 0) continue;
+        if (draftOrg[d].sex === 'female') continue;
+        const before = nCand;
+        consider(d);
+        if (nCand > before) hetero++;
+      }
+    }
+
+    for (let i = 0; i < nCand; i++) {
+      const mIdx = candidates[i];
+      const male = draftOrg[mIdx];
+      const maleSp = speciesCaches[draftSpeciesIdx[mIdx]].species;
+      // Heterospecific candidates were admitted only when clade-compatible (cladeCompatMatrix)
+      const compat = evaluateReproductiveCompatibility(female, femaleSp, male, maleSp, true);
+      this.t_mateEvaluations++;
+      let p = compat.compatible ? compat.preZygoticCompatibility * compat.parentFertilityMultiplier : 0;
+      if (p > 0 && evo.enableSexualSelection) {
+        const attr = computeSexualAttractiveness(male, maleSp);
+        p *= Math.min(1, 0.5 + 0.5 * attr);
+      }
+      if (matingRng.chance(p)) {
+        this.mateCompat = compat;
+        return mIdx;
+      }
+      this.t_mateRejections++;
+    }
+    return -1;
+  }
+
   private planReproductionPhase(
     sCount: number,
     speciesCaches: SpeciesRuntimeCache[],
@@ -3721,6 +3966,9 @@ export class BiologySimulation {
     let reproPlanCount = 0;
     let eggPlanCount = 0;
     const trackMut = this.trackMutationEvents;
+    const anatomyRng = this.streams.get('biology:anatomy');
+    const matingRng = this.streams.get('biology:mating');
+    const evolutionMating = this.evolution !== null;
     const gridWidth = this.grid.width;
 
     const popBySpeciesIdx = this.stepPopBySpeciesIdx;
@@ -3783,7 +4031,20 @@ export class BiologySimulation {
         if ((fFlags & FLAG_DIED) !== 0) continue;
 
         const female = draftOrg[fIdx];
-        const mIdx = isCanonical
+        this.mateCompat = null;
+        const mIdx = evolutionMating
+          ? this.findMateWithCompatibility(
+              fIdx,
+              s,
+              speciesCaches,
+              cellHead,
+              cellNext,
+              rawActive,
+              isCanonical ? activeToDraft : null,
+              unsortedMap,
+              matingRng
+            )
+          : isCanonical
           ? this.findMateDraftWithCursor(
               female.x,
               female.y,
@@ -3807,6 +4068,7 @@ export class BiologySimulation {
         if (mIdx === -1) continue;
 
         const male = draftOrg[mIdx];
+        const compat = this.mateCompat as ReproductiveCompatibilityResult | null;
         const nestCellIdx = this.chooseNestCell(
           female.x,
           female.y,
@@ -3914,6 +4176,13 @@ export class BiologySimulation {
             mutRecords = undefined;
           }
           const sex: Sex = reproductionRng.chance(femaleProb) ? 'female' : 'male';
+          // Heritable anatomy: one allele copy from each parent per locus plus mutation, drawn from
+          // the dedicated anatomy stream (restored on ABORT with all other streams). Parents are
+          // only read. Without an anatomy genome in both parents none is invented for the child.
+          const childAnatomy =
+            female.anatomy !== undefined && male.anatomy !== undefined
+              ? inheritOrganismAnatomy(female.anatomy, male.anatomy, sc.mutationConfig, anatomyRng).anatomy
+              : undefined;
           const child: Organism = {
             id: plannedNextId++,
             speciesId: speciesIdStr,
@@ -3941,9 +4210,38 @@ export class BiologySimulation {
             reproductionCooldown: 0,
             offspringCount: 0,
             mutationsReceived: mutCount,
+            anatomy: childAnatomy,
           };
+          let fatherSpeciesIdx = -1;
+          if (compat !== null) {
+            // Post-zygotic barrier: an inviable zygote is still laid and provisioned (the mother's
+            // investment is lost) but cannot develop and dies as an egg.
+            if (compat.postZygoticViability < 1 && !matingRng.chance(compat.postZygoticViability)) {
+              child.health = 0;
+              this.t_inviableZygotes++;
+            }
+            if (compat.isInterspecific || compat.offspringAdmixtureRatio > 0 || compat.offspringHybridFertility < 1) {
+              // Offspring belong to the maternal population; admixture and reduced fertility are heritable facts
+              child.ancestry = {
+                primarySpeciesId: speciesIdStr,
+                secondarySpeciesId: compat.offspringSecondarySpeciesId,
+                admixtureRatio: compat.offspringAdmixtureRatio,
+                hybridFertility: compat.offspringHybridFertility,
+              };
+            }
+            if (compat.isInterspecific) {
+              fatherSpeciesIdx = this.draftSpeciesIdx[mIdx];
+              this.t_hybridOffspring++;
+            }
+          }
 
           const epIdx = eggPlanCount++;
+          this.eggFatherSpeciesIdx[epIdx] = fatherSpeciesIdx;
+          if (fatherSpeciesIdx >= 0) {
+            this.eggHybridViability[epIdx] = compat!.postZygoticViability;
+            this.eggHybridFertility[epIdx] = compat!.offspringHybridFertility;
+            this.eggHybridBackcross[epIdx] = compat!.isBackcross ? 1 : 0;
+          }
           this.eggOrg[epIdx] = child;
           this.eggSpeciesIdx[epIdx] = s;
           this.eggDraftSlot[epIdx] = -1;
@@ -4981,6 +5279,11 @@ export class BiologySimulation {
       }
     }
 
+    // Evolution mode: register daughter species, move their founders, record lineage events.
+    if (this.evolution !== null) {
+      this.commitEvolution(targetTick);
+    }
+
     // =========================================================================
     // PHASE 5: POST_COMMIT (Listeners, Diagnostics, Compaction — never rolls back physics)
     // =========================================================================
@@ -5035,6 +5338,9 @@ export class BiologySimulation {
       }
       this.pendingCompactPops.clear();
       this.isPostCommit = false;
+      if (this.phylogeny !== null) {
+        this.syncPhylogeny(targetTick);
+      }
     }
   }
 
@@ -5182,6 +5488,11 @@ export class BiologySimulation {
         plannedNextId
       );
 
+      // Evolution mode: periodic, read-only divergence & isolation check (staged proposals only)
+      if (this.speciationEngine !== null) {
+        this.stageSpeciationCheck(targetTick, sCount, speciesList, speciesCaches);
+      }
+
       // Spatial mode: every surviving organism perceives its surroundings, chooses an activity and
       // plans this tick's movement. Results are STAGED; nothing is applied before COMMIT.
       if (this.spatial !== null) {
@@ -5192,6 +5503,9 @@ export class BiologySimulation {
       // PHASE 2.5: PRE_ALLOCATE (Between transactions — zero semantic state mutated)
       // =========================================================================
       this.onPhase?.({ tick: targetTick, phase: 'PRE_ALLOCATE' });
+      if (this.stagedProposals.length > 0) {
+        this.preallocateSpeciations();
+      }
 
       const eggPlanCount = this.curEggPlanCount;
       let freshCursor = this.nextFreshOrganismSlot;
@@ -5311,6 +5625,16 @@ export class BiologySimulation {
         this.mateCellCursor[this.mateCellTouched[i]] = -2;
       }
       this.mateTouchedCount = 0;
+      // Staged evolution state never survives the tick (applied at COMMIT or dropped on ABORT)
+      this.stagedProposals.length = 0;
+      this.stagedTrackerUpdates.length = 0;
+      this.stagedSpeciations.length = 0;
+      this.stagedSpeciationCheck = false;
+      this.mateCompat = null;
+      this.t_mateEvaluations = 0;
+      this.t_mateRejections = 0;
+      this.t_inviableZygotes = 0;
+      this.t_hybridOffspring = 0;
       const draftCount = this.curDraftCount;
       for (let i = 0; i < draftCount; i++) {
         this.draftOrg[i] = undefined as unknown as Organism;
@@ -5336,6 +5660,168 @@ export class BiologySimulation {
       this.curNewlyDiedCellCount = 0;
       this.curDiedCount = 0;
     }
+  }
+
+  /** RESOLVE: runs the speciation engine over this tick's surviving drafts (read-only). */
+  private stageSpeciationCheck(
+    targetTick: number,
+    sCount: number,
+    speciesList: readonly SpeciesDefinition[],
+    speciesCaches: SpeciesRuntimeCache[]
+  ): void {
+    const engine = this.speciationEngine!;
+    if (targetTick % this.evolution!.evolutionCheckInterval !== 0) return;
+    let navComponents: readonly Int32Array[] | null = null;
+    let speciesNavClass: Int32Array | null = null;
+    if (this.spatial !== null) {
+      navComponents = this.spatial.navigator.component;
+      speciesNavClass = new Int32Array(sCount);
+      for (let i = 0; i < sCount; i++) speciesNavClass[i] = this.spatial.getNavClass(i);
+    }
+    const phylogeny = this.phylogeny!;
+    engine.evaluateTick({
+      targetTick,
+      grid: this.grid,
+      speciesCount: sCount,
+      speciesList,
+      existingSpeciesIds: new Set(speciesList.map((sp) => sp.id)),
+      speciesDraftStart: this.stepSpeciesDraftStart,
+      speciesDraftEnd: this.stepSpeciesDraftEnd,
+      draftOrg: this.draftOrg,
+      draftCellIndex: this.draftCellIndex,
+      draftFlags: this.draftFlags,
+      navComponents,
+      speciesNavClass,
+      outProposals: this.stagedProposals,
+      outTrackerUpdates: this.stagedTrackerUpdates,
+      rootSpeciesResolver: (id) => phylogeny.getRootSpeciesId(id),
+    });
+    this.stagedSpeciationCheck = true;
+    void speciesCaches;
+  }
+
+  /**
+   * PRE_ALLOCATE: everything that could fail for a speciation (allocation, id collisions) happens
+   * here, before the energy transaction opens, so COMMIT only links prepared objects.
+   */
+  private preallocateSpeciations(): void {
+    const draftOrg = this.draftOrg;
+    for (const proposal of this.stagedProposals) {
+      const daughter = proposal.daughterSpecies;
+      if (this.speciesRegistry.has(daughter.id) || this.populations.has(daughter.id)) {
+        throw new Error(`Speciation id collision: "${daughter.id}" already exists`);
+      }
+      if (this.phylogeny!.getNode(daughter.id) !== undefined) {
+        throw new Error(`Speciation id collision in phylogeny: "${daughter.id}"`);
+      }
+      validateSpeciesDefinition(daughter);
+      const memberIds = new Set<number>();
+      for (const d of proposal.memberDraftIndices) memberIds.add(draftOrg[d].id);
+      this.stagedSpeciations.push({
+        proposal,
+        population: new PopulationManager(daughter, this.grid, Math.max(64, memberIds.size * 2)),
+        memberIds,
+      });
+    }
+  }
+
+  /**
+   * COMMIT (after the energy transaction is durable): registers daughter species, moves their
+   * founding members (and the eggs those members laid this tick) unchanged into the new
+   * population, records phylogeny events and commits divergence trackers. Organisms keep their
+   * ids, genomes, bodies and energy accounts; no organism or energy is created or destroyed.
+   */
+  private commitEvolution(targetTick: number): void {
+    const stats = this.evolutionStats;
+    stats.ticks++;
+    stats.mateEvaluations += this.t_mateEvaluations;
+    stats.mateRejections += this.t_mateRejections;
+    stats.inviableZygotes += this.t_inviableZygotes;
+    stats.hybridOffspring += this.t_hybridOffspring;
+    const phylogeny = this.phylogeny!;
+    const speciesList = this.speciesCacheList;
+
+    // Interspecific births of this tick (only provisioned eggs exist)
+    const eggPlanCount = this.curEggPlanCount;
+    for (let i = 0; i < eggPlanCount; i++) {
+      if (this.eggProvisioned[i] === 0) continue;
+      const fatherIdx = this.eggFatherSpeciesIdx[i];
+      if (fatherIdx < 0) continue;
+      const egg = this.eggOrg[i];
+      phylogeny.recordHybridization({
+        tick: targetTick,
+        motherSpeciesId: egg.speciesId,
+        fatherSpeciesId: speciesList[fatherIdx].species.id,
+        offspringSpeciesId: egg.speciesId,
+        viability: this.eggHybridViability[i],
+        fertility: this.eggHybridFertility[i],
+        isBackcross: this.eggHybridBackcross[i] === 1,
+      });
+    }
+
+    const committed: { proposal: StagedSpeciationProposal; assignedId: string }[] = [];
+    for (const staged of this.stagedSpeciations) {
+      const { proposal, population, memberIds } = staged;
+      const daughter = proposal.daughterSpecies;
+      const parentPop = this.populations.get(proposal.parentSpeciesId);
+      if (!parentPop) continue;
+      // Eggs laid this tick by founding mothers belong to the founding group
+      for (let i = 0; i < eggPlanCount; i++) {
+        if (this.eggProvisioned[i] === 0) continue;
+        const egg = this.eggOrg[i];
+        if (egg.speciesId === proposal.parentSpeciesId && egg.parentAId !== null && memberIds.has(egg.parentAId)) {
+          memberIds.add(egg.id);
+        }
+      }
+      // Founders survived this tick's mortality (checked in RESOLVE); register, then move them
+      this.speciesRegistry.register(daughter);
+      this.populations.set(daughter.id, population);
+      const moved = parentPop.extractForSpeciation(memberIds);
+      moved.sort((a, b) => a.id - b.id);
+      for (const org of moved) org.speciesId = daughter.id;
+      population.adoptFromSpeciation(moved);
+      phylogeny.recordSpeciation({
+        tick: targetTick,
+        parentSpecies: this.speciesRegistry.get(proposal.parentSpeciesId),
+        daughterSpecies: daughter,
+        cause: proposal.cause,
+        geneticDistance: proposal.geneticDistance,
+        ecologicalDistance: proposal.ecologicalDistance,
+        reproductiveIsolation: proposal.reproductiveIsolation,
+        persistenceTicks: proposal.persistenceTicks,
+        founderCount: moved.length,
+        cellCentroid: proposal.cellCentroid,
+        geneticSignature: proposal.geneticSignature,
+        anatomySignature: proposal.anatomySignature,
+      });
+      committed.push({ proposal, assignedId: daughter.id });
+      stats.speciations++;
+    }
+    if (this.stagedSpeciationCheck) {
+      stats.speciationChecks++;
+      this.speciationEngine!.commitTrackerUpdates(this.stagedTrackerUpdates, committed, targetTick);
+    }
+  }
+
+  /** After compaction: population sizes, peaks and extinctions of every registered lineage. */
+  private syncPhylogeny(tick: number): void {
+    const phylogeny = this.phylogeny!;
+    for (const sp of this.speciesRegistry.list()) {
+      phylogeny.ensureFounderNode(sp, tick);
+      const pop = this.populations.get(sp.id);
+      phylogeny.syncPopulationState(
+        sp.id,
+        pop ? pop.size : 0,
+        pop ? pop.getBirthsTotal() : 0,
+        pop ? pop.getDeathsTotal() : 0,
+        tick
+      );
+    }
+  }
+
+  /** Committed divergence trackers of the speciation engine (evolution mode; empty otherwise). */
+  getSpeciationTrackers() {
+    return this.speciationEngine ? this.speciationEngine.getTrackers() : [];
   }
 
   /**

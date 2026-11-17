@@ -29,6 +29,10 @@ export interface PopulationStats {
   readonly totalAlive: number;
   /** Total organisms introduced via founder seeding or manual spawning (never counted as biological births) */
   readonly introducedTotal: number;
+  /** Members received when this species was founded from a subpopulation of its parent species */
+  readonly speciationTransfersIn: number;
+  /** Members that left to found a daughter species */
+  readonly speciationTransfersOut: number;
   /** Total biological births resulting from reproduction */
   readonly birthsTotal: number;
   readonly deathsTotal: number;
@@ -103,6 +107,8 @@ export class PopulationManager {
 
   // Cumulative counters
   private introducedTotal = 0;
+  private speciationTransfersIn = 0;
+  private speciationTransfersOut = 0;
   private birthsTotal = 0;
   private deathsTotal = 0;
   private birthsThisTick = 0;
@@ -301,6 +307,55 @@ export class PopulationManager {
     } else {
       this.introducedTotal += len;
     }
+    this.spatialIndexBuilt = false;
+  }
+
+  /** Cumulative biological births (cheap accessor, no statistics pass). */
+  getBirthsTotal(): number {
+    return this.birthsTotal;
+  }
+
+  /** Cumulative deaths (cheap accessor, no statistics pass). */
+  getDeathsTotal(): number {
+    return this.deathsTotal;
+  }
+
+  /**
+   * Removes the living organisms whose ids are in `ids` (speciation transfer), preserving the order
+   * of everyone else. Dead organisms are left for the regular compaction. Never throws.
+   */
+  extractForSpeciation(ids: ReadonlySet<number>): Organism[] {
+    const out: Organism[] = [];
+    let write = 0;
+    for (let read = 0; read < this.active.length; read++) {
+      const org = this.active[read];
+      if (org.alive && ids.has(org.id)) {
+        out.push(org);
+        this.byId.delete(org.id);
+        continue;
+      }
+      if (write !== read) this.active[write] = org;
+      write++;
+    }
+    this.active.length = write;
+    if (out.length > 0) {
+      this.speciationTransfersOut += out.length;
+      this.spatialIndexBuilt = false;
+    }
+    return out;
+  }
+
+  /**
+   * Adds founding members of this (daughter) species. They are neither births nor introductions;
+   * `organisms` must already carry this species' id and be in ascending id order.
+   */
+  adoptFromSpeciation(organisms: readonly Organism[]): void {
+    for (let i = 0; i < organisms.length; i++) {
+      const org = organisms[i];
+      this.active.push(org);
+      this.byId.set(org.id, org);
+    }
+    this.speciationTransfersIn += organisms.length;
     this.spatialIndexBuilt = false;
   }
 
@@ -707,6 +762,8 @@ export class PopulationManager {
       speciesId: this.species.id,
       totalAlive,
       introducedTotal: this.introducedTotal,
+      speciationTransfersIn: this.speciationTransfersIn,
+      speciationTransfersOut: this.speciationTransfersOut,
       birthsTotal: this.birthsTotal,
       deathsTotal: this.deathsTotal,
       birthsThisTick: this.birthsThisTick,

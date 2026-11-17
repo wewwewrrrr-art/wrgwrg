@@ -4,14 +4,11 @@ import {
   ANATOMY_LOCUS_COUNT,
   ANATOMY_RANGES,
   deriveSpeciesAnatomyBaseline,
-  ensureOrganismAnatomy,
 } from './anatomy';
-import { TraitId } from './genome';
+import { measureReproductiveIsolation } from './evolution';
 import { Organism } from './organism';
 import { DivergenceCause } from './phylogeny';
-import { SpatialSpeciesProfile } from './spatialProfile';
-import { SpeciesDefinition, TrophicType, validateSpeciesDefinition } from './species';
-import { TrophicProfile, resolveSpeciesTrophicProfile } from './trophicProfile';
+import { SpeciesDefinition, validateSpeciesDefinition } from './species';
 
 export interface EvolutionConfig {
   /** Enables autonomous evolution, selection, hybridization, anatomy adaptation & speciation (default: true). */
@@ -89,6 +86,11 @@ export interface StagedClusterTrackerUpdate {
   readonly clusterKey: string;
   readonly nextStreak: number;
   readonly lastSeenTick: number;
+  /** Divergence measured at this check (diagnostics; the decision uses the same values). */
+  readonly geneticDistance: number;
+  readonly ecologicalDistance: number;
+  readonly reproductiveIsolation: number;
+  readonly memberCount: number;
 }
 
 export interface StagedSpeciationProposal {
@@ -112,6 +114,10 @@ export interface ClusterTrackerState {
   streak: number;
   lastSeenTick: number;
   assignedSpeciesId: string | null;
+  geneticDistance: number;
+  ecologicalDistance: number;
+  reproductiveIsolation: number;
+  memberCount: number;
 }
 
 const FLAG_DIED = 1 << 2;
@@ -125,8 +131,15 @@ function clamp01(v: number): number {
 }
 
 /**
- * Synthesizes a valid, gradually modified daughter SpeciesDefinition from a diverging
- * subpopulation's evolved genetic, anatomical, thermal, and habitat centroids.
+ * Builds the SpeciesDefinition of a daughter lineage at the moment of cladogenesis.
+ *
+ * The daughter inherits every mechanical parameter of the parent unchanged (physiology, diet,
+ * trophic, spatial and reproductive profiles, genome schema, trait baselines and ranges). At the
+ * instant of speciation nothing about the founding organisms changes: their divergence already
+ * lives in their inherited genomes and anatomies and keeps evolving through inheritance and
+ * selection. Re-deriving physiology, diet or locomotion from population means here would
+ * transform every founder instantly and arbitrarily, so the evolved centroids are used only for a
+ * descriptive ecotype name (the measured signatures are kept in the phylogeny).
  */
 export function synthesizeDaughterSpecies(params: {
   readonly parent: SpeciesDefinition;
@@ -138,150 +151,31 @@ export function synthesizeDaughterSpecies(params: {
   readonly dominantBiome?: WorldBiomeId;
   readonly cause: Exclude<DivergenceCause, 'founder'>;
 }): SpeciesDefinition {
-  const { parent, newSpeciesId, meanCoreAlleles, meanAnatomyAlleles, meanHabitatTempC, dominantBiome } = params;
-  const schema = parent.genomeSchema;
-
-  const newBaselines: Partial<Record<TraitId, number>> = { ...parent.traitBaselines };
-  for (let l = 0; l < schema.locusCount; l++) {
-    const def = schema.loci[l];
-    const r = parent.traitRanges[def.id] ?? def.defaultRange;
-    const evolved = clamp(meanCoreAlleles[l], r.min, r.max);
-    const parentVal = parent.traitBaselines[def.id] ?? evolved;
-    // Gradual baseline consolidation (75% toward evolved cluster centroid)
-    newBaselines[def.id] = clamp(parentVal + (evolved - parentVal) * 0.75, r.min, r.max);
-  }
-
-  // Gradual thermal optimum shift capped within +-9 C per speciation event
-  const rawTempShift = meanHabitatTempC - parent.physiology.optimalTemperatureC;
-  const boundedTempShift = clamp(rawTempShift * 0.65, -9.0, 9.0);
-  const newOptTemp = clamp(parent.physiology.optimalTemperatureC + boundedTempShift, -25, 50);
-
-  // Locomotion & terrain affinity gradual adaptation from evolved anatomy
+  const { parent, newSpeciesId, meanAnatomyAlleles, meanHabitatTempC } = params;
   const aq = meanAnatomyAlleles[ANATOMY_IDX.AQUATIC_AFFINITY];
   const climb = meanAnatomyAlleles[ANATOMY_IDX.CLIMBING_AFFINITY];
   const limb = meanAnatomyAlleles[ANATOMY_IDX.LIMB_LENGTH];
   const integ = meanAnatomyAlleles[ANATOMY_IDX.INTEGUMENT_THICKNESS];
+  const parentAnatomy = deriveSpeciesAnatomyBaseline(parent);
 
-  let nextLocomotion: 'terrestrial' | 'amphibious' | 'aquatic' = parent.spatial?.locomotion ?? 'terrestrial';
-  if (nextLocomotion === 'terrestrial' && aq >= 0.34) {
-    nextLocomotion = 'amphibious';
-  } else if (nextLocomotion === 'amphibious' && aq >= 0.70) {
-    nextLocomotion = 'aquatic';
-  } else if (nextLocomotion === 'aquatic' && aq < 0.45) {
-    nextLocomotion = 'amphibious';
-  }
-
-  const baseSpatial = parent.spatial;
-  const nextTerrainCost = baseSpatial?.terrainCost ? { ...baseSpatial.terrainCost } : {};
-  if (aq >= 0.34) {
-    nextTerrainCost['shallow-water'] = Math.max(1.0, (nextTerrainCost['shallow-water'] ?? 2.4) * (1 - 0.35 * aq));
-    if (aq >= 0.68) {
-      nextTerrainCost['deep-water'] = Math.max(1.0, (nextTerrainCost['deep-water'] ?? 3.5) * 0.45);
-    }
-  }
-  if (climb >= 0.40) {
-    nextTerrainCost.hills = Math.max(1.0, (nextTerrainCost.hills ?? 1.4) * (1 - 0.22 * climb));
-    nextTerrainCost.mountains = Math.max(1.2, (nextTerrainCost.mountains ?? 2.4) * (1 - 0.28 * climb));
-  }
-
-  const nextSpatial: SpatialSpeciesProfile | undefined = baseSpatial
-    ? {
-        ...baseSpatial,
-        locomotion: nextLocomotion,
-        terrainCost: nextTerrainCost,
-        thirstPerTick: aq >= 0.45 ? Math.max(0.01, (baseSpatial.thirstPerTick ?? 0.04) * 0.7) : baseSpatial.thirstPerTick,
-      }
-    : undefined;
-
-  // Gradual trophic shift (only via viable omnivore/intermediate stepping stones; never carnivore <-> herbivore jump)
-  const herbApp = meanAnatomyAlleles[ANATOMY_IDX.HERBIVORY_APPARATUS];
-  const carnApp = meanAnatomyAlleles[ANATOMY_IDX.CARNIVORY_APPARATUS];
-  const parentTrophic = resolveSpeciesTrophicProfile(parent);
-  let nextDiet: TrophicType = parent.diet;
-  let nextTrophic: TrophicProfile = { ...parentTrophic };
-
-  if (parent.diet === 'herbivore' && carnApp >= 0.42 && herbApp <= 0.65) {
-    nextDiet = 'omnivore';
-    nextTrophic = {
-      ...parentTrophic,
-      feedingType: 'omnivore',
-      dietWeights: { plant: 0.65, prey: 0.22, carrion: 0.13, detritus: 0 },
-    };
-  } else if (parent.diet === 'carnivore' && herbApp >= 0.42 && carnApp <= 0.65) {
-    nextDiet = 'omnivore';
-    nextTrophic = {
-      ...parentTrophic,
-      feedingType: 'omnivore',
-      dietWeights: { plant: 0.28, prey: 0.56, carrion: 0.16, detritus: 0 },
-    };
-  } else if (parent.diet === 'omnivore') {
-    if (herbApp - carnApp >= 0.36) {
-      nextDiet = 'herbivore';
-      nextTrophic = {
-        ...parentTrophic,
-        feedingType: 'herbivore',
-        dietWeights: { plant: 0.85, prey: 0, carrion: 0, detritus: 0.15 },
-      };
-    } else if (carnApp - herbApp >= 0.36) {
-      nextDiet = 'carnivore';
-      nextTrophic = {
-        ...parentTrophic,
-        feedingType: 'carnivore',
-        dietWeights: { plant: 0, prey: 0.82, carrion: 0.18, detritus: 0 },
-      };
-    }
-  }
-
-  // Body structural mass modulation from evolved bodyScale
-  const parentBody = parent.traitBaselines.bodySize ?? 1.0;
-  const evolvedBody = newBaselines.bodySize ?? parentBody;
-  const sizeRatio = clamp(evolvedBody / Math.max(0.25, parentBody), 0.72, 1.40);
-  nextTrophic = {
-    ...nextTrophic,
-    adultStructuralMassMU: Number((parentTrophic.adultStructuralMassMU * sizeRatio).toFixed(4)),
-  };
-
-  // Descriptive ecological suffix
   let ecotypeLabel = params.cause === 'allopatric' ? 'Insular' : 'Divergent';
-  if (newOptTemp <= parent.physiology.optimalTemperatureC - 3.5 || integ >= 1.28) {
+  if (meanHabitatTempC <= parent.physiology.optimalTemperatureC - 6 || integ >= parentAnatomy[ANATOMY_IDX.INTEGUMENT_THICKNESS] + 0.12) {
     ecotypeLabel = 'Boreal';
-  } else if (newOptTemp >= parent.physiology.optimalTemperatureC + 3.5 || integ <= 0.72) {
+  } else if (meanHabitatTempC >= parent.physiology.optimalTemperatureC + 6 || integ <= parentAnatomy[ANATOMY_IDX.INTEGUMENT_THICKNESS] - 0.12) {
     ecotypeLabel = 'Arid';
-  } else if (nextLocomotion === 'amphibious' || nextLocomotion === 'aquatic') {
+  } else if (aq >= parentAnatomy[ANATOMY_IDX.AQUATIC_AFFINITY] + 0.2) {
     ecotypeLabel = 'Littoral';
-  } else if (climb >= 0.42) {
+  } else if (climb >= parentAnatomy[ANATOMY_IDX.CLIMBING_AFFINITY] + 0.2) {
     ecotypeLabel = 'Montane';
-  } else if (limb >= 1.25) {
+  } else if (limb >= parentAnatomy[ANATOMY_IDX.LIMB_LENGTH] + 0.15) {
     ecotypeLabel = 'Cursorial';
   }
 
-  const nextPreferredBiomes =
-    dominantBiome && !parent.preferredBiomes.includes(dominantBiome)
-      ? [...parent.preferredBiomes, dominantBiome]
-      : [...parent.preferredBiomes];
-
   const daughter: SpeciesDefinition = {
+    ...parent,
     id: newSpeciesId,
     name: `${ecotypeLabel} ${parent.name}`,
-    diet: nextDiet,
-    preferredBiomes: nextPreferredBiomes,
-    timeScale: parent.timeScale,
-    lifecycle: { ...parent.lifecycle },
-    reproduction: { ...parent.reproduction },
-    physiology: {
-      ...parent.physiology,
-      optimalTemperatureC: Number(newOptTemp.toFixed(2)),
-    },
-    genomeSchema: parent.genomeSchema,
-    requiredTraits: parent.requiredTraits,
-    traitRanges: parent.traitRanges,
-    traitBaselines: newBaselines,
-    initialGeneticSpread: parent.initialGeneticSpread,
-    mutation: { ...parent.mutation },
-    trophicProfile: nextTrophic,
-    ...(nextSpatial ? { spatial: nextSpatial } : {}),
   };
-
   validateSpeciesDefinition(daughter);
   return daughter;
 }
@@ -333,11 +227,23 @@ export class SpeciationEngine {
       const fullKey = `${u.parentSpeciesId}::${u.clusterKey}`;
       let state = this.clusterTrackers.get(fullKey);
       if (!state) {
-        state = { streak: u.nextStreak, lastSeenTick: u.lastSeenTick, assignedSpeciesId: null };
+        state = {
+          streak: u.nextStreak,
+          lastSeenTick: u.lastSeenTick,
+          assignedSpeciesId: null,
+          geneticDistance: u.geneticDistance,
+          ecologicalDistance: u.ecologicalDistance,
+          reproductiveIsolation: u.reproductiveIsolation,
+          memberCount: u.memberCount,
+        };
         this.clusterTrackers.set(fullKey, state);
       } else {
         state.streak = u.nextStreak;
         state.lastSeenTick = u.lastSeenTick;
+        state.geneticDistance = u.geneticDistance;
+        state.ecologicalDistance = u.ecologicalDistance;
+        state.reproductiveIsolation = u.reproductiveIsolation;
+        state.memberCount = u.memberCount;
       }
     }
     for (let i = 0; i < committedSpeciations.length; i++) {
@@ -352,6 +258,10 @@ export class SpeciationEngine {
           streak: 0,
           lastSeenTick: currentTick,
           assignedSpeciesId: assignedId,
+          geneticDistance: proposal.geneticDistance,
+          ecologicalDistance: proposal.ecologicalDistance,
+          reproductiveIsolation: proposal.reproductiveIsolation,
+          memberCount: proposal.founderCount,
         });
       }
       this.nextDaughterSeq += 1;
@@ -376,10 +286,30 @@ export class SpeciationEngine {
     return this.clusterTrackers.get(`${speciesId}::${clusterKey}`)?.assignedSpeciesId ?? null;
   }
 
+  /** Committed divergence trackers (read-only snapshot, deterministic key order). */
+  getTrackers(): readonly ({ readonly key: string } & Readonly<ClusterTrackerState>)[] {
+    return [...this.clusterTrackers.entries()]
+      .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0))
+      .map(([key, v]) => Object.freeze({ key, ...v }));
+  }
+
   /**
-   * Pure RESOLVE-phase evaluation: scans surviving drafts per species, detects isolated/divergent
-   * subpopulations, computes genetic/ecological/reproductive isolation metrics, and emits
-   * staged speciation proposals + tracker updates without mutating persistent state.
+   * Pure RESOLVE-phase evaluation: scans surviving drafts per species, detects spatially (or
+   * ecologically) separated subpopulations, measures their heritable divergence and their
+   * reproductive isolation, and emits staged speciation proposals and tracker updates. Persistent
+   * state is never mutated here (see `commitTrackerUpdates`), organisms are only read.
+   *
+   * A subpopulation becomes a proposal only when, for `requiredPersistenceChecks` consecutive
+   * checks, all of the following hold:
+   *   - a sister group of at least `minParentRemainSize` individuals remains (cladogenesis; a
+   *     lineage that merely drifted away from its registered baseline is not split off);
+   *   - heritable divergence (core + anatomy allele means) >= `minGeneticDivergence`;
+   *   - ecological divergence >= `minEcologicalDivergence`;
+   *   - measured reproductive isolation >= `minReproductiveIsolation`, where isolation is the
+   *     reduction of expected fertile offspring when members of the two groups mate, computed with
+   *     the same compatibility model that decides real matings (`measureReproductiveIsolation`).
+   *     Living apart is not isolation: fully compatible groups measure 0.
+   * Cost per check: O(N + occupied cells * linkDistance^2) plus a bounded pair sample per cluster.
    */
   evaluateTick(params: {
     readonly targetTick: number;
@@ -398,18 +328,14 @@ export class SpeciationEngine {
     readonly outTrackerUpdates: StagedClusterTrackerUpdate[];
     readonly rootSpeciesResolver: (speciesId: string) => string;
   }): void {
-    outReset: {
-      params.outProposals.length = 0;
-      params.outTrackerUpdates.length = 0;
-      break outReset;
-    }
+    params.outProposals.length = 0;
+    params.outTrackerUpdates.length = 0;
 
     const cfg = this.config;
     if (!cfg.enabled) return;
     if (params.targetTick % cfg.evolutionCheckInterval !== 0) return;
 
-    const totalSpeciesCount = params.speciesCount;
-    let remainingSpeciesBudget = Math.max(0, cfg.maxSpeciesCount - totalSpeciesCount);
+    let remainingSpeciesBudget = Math.max(0, cfg.maxSpeciesCount - params.speciesCount);
     let seqCursor = this.nextDaughterSeq;
 
     const w = this.gridWidth;
@@ -417,16 +343,17 @@ export class SpeciationEngine {
     const linkR = cfg.geneFlowLinkDistance;
     const temps = params.grid.temperature;
     const moists = params.grid.moisture;
+    const biomeCodes = params.grid.biomeCode;
     const cellPresent = this.cellPresent;
     const cellClusterId = this.cellClusterId;
     const occCells = this.occCells;
     const bfsQueue = this.bfsQueue;
+    const minTotal = cfg.minClusterSize + cfg.minParentRemainSize;
 
-    for (let s = 0; s < totalSpeciesCount; s++) {
+    for (let s = 0; s < params.speciesCount; s++) {
       const start = params.speciesDraftStart[s];
       const end = params.speciesDraftEnd[s];
-      const upperSpan = end - start;
-      if (upperSpan < cfg.minClusterSize) continue;
+      if (end - start < minTotal) continue;
 
       const species = params.speciesList[s];
       const schema = species.genomeSchema;
@@ -436,7 +363,7 @@ export class SpeciationEngine {
           ? params.navComponents[params.speciesNavClass[s]] ?? null
           : null;
 
-      // 1. Collect living draft indices and mark occupied cells in O(N_s)
+      // 1. Living drafts (ascending id order) and occupied cells, O(N_s)
       const aliveDrafts: number[] = [];
       let occCount = 0;
       for (let d = start; d < end; d++) {
@@ -448,15 +375,14 @@ export class SpeciationEngine {
           occCells[occCount++] = c;
         }
       }
-
       const nAlive = aliveDrafts.length;
-      if (nAlive < cfg.minClusterSize) {
+      if (nAlive < minTotal) {
         for (let i = 0; i < occCount; i++) cellPresent[occCells[i]] = 0;
         continue;
       }
 
-      // 2. Partition occupied cells into spatially cohesive clusters via BFS within linkDistance
-      //    Respecting navigation barrier components when spatial mode is active!
+      // 2. Spatial clusters: occupied cells linked within linkDistance, never across a navigation
+      //    barrier (impassable terrain) when spatial navigation is active
       let clusterCount = 0;
       for (let i = 0; i < occCount; i++) {
         const seedCell = occCells[i];
@@ -466,18 +392,15 @@ export class SpeciationEngine {
         let qTail = 0;
         bfsQueue[qTail++] = seedCell;
         cellClusterId[seedCell] = cid;
-
         while (qHead < qTail) {
           const cur = bfsQueue[qHead++];
           const cy = (cur / w) | 0;
           const cx = cur - cy * w;
           const myNav = navComp ? navComp[cur] : 0;
-
           const x0 = cx - linkR < 0 ? 0 : cx - linkR;
           const x1 = cx + linkR >= w ? w - 1 : cx + linkR;
           const y0 = cy - linkR < 0 ? 0 : cy - linkR;
           const y1 = cy + linkR >= h ? h - 1 : cy + linkR;
-
           for (let ny = y0; ny <= y1; ny++) {
             const row = ny * w;
             for (let nx = x0; nx <= x1; nx++) {
@@ -491,283 +414,218 @@ export class SpeciationEngine {
         }
       }
 
-      // 3. Bucket alive organisms into their spatial clusters
-      let clusterMembers: number[][] = new Array(clusterCount);
-      for (let c = 0; c < clusterCount; c++) clusterMembers[c] = [];
-      for (let i = 0; i < nAlive; i++) {
-        const d = aliveDrafts[i];
-        const cid = cellClusterId[params.draftCellIndex[d]];
-        clusterMembers[cid].push(d);
-      }
-
-      // Cleanup cell arrays immediately
+      // 3. Cluster label per living draft (index-aligned with aliveDrafts)
+      const clusterOf = new Int32Array(nAlive);
+      for (let i = 0; i < nAlive; i++) clusterOf[i] = cellClusterId[params.draftCellIndex[aliveDrafts[i]]];
       for (let i = 0; i < occCount; i++) {
         const c = occCells[i];
         cellPresent[c] = 0;
         cellClusterId[c] = -1;
       }
 
-      // 4. Determine mode:
-      //    - Multi-cluster (allopatric / parapatric spatial separation), OR
-      //    - Single-cluster ecological split (if clear thermal/aquatic bimodality exists), OR
-      //    - Single isolated population strongly diverged from registered baseline (anagenesis)
+      // 4. A single contiguous population may still hold ecologically separated groups (contrasting
+      //    thermal or aquatic niches). Whether they are reproductively isolated is measured below.
       let evalMode: Exclude<DivergenceCause, 'founder'> = 'allopatric';
-      let isEcologicalBimodalSplit = false;
-
-      if (clusterCount === 1 && nAlive >= cfg.minClusterSize * 2) {
-        // Check if organisms span contrasting thermal or aquatic regimes (bimodal niche check)
+      let isEcologicalSplit = false;
+      if (clusterCount === 1) {
         let minT = Infinity;
         let maxT = -Infinity;
         let minAq = Infinity;
         let maxAq = -Infinity;
         for (let i = 0; i < nAlive; i++) {
           const d = aliveDrafts[i];
-          const c = params.draftCellIndex[d];
-          const t = temps[c];
+          const t = temps[params.draftCellIndex[d]];
           if (t < minT) minT = t;
           if (t > maxT) maxT = t;
-          const anat = ensureOrganismAnatomy(params.draftOrg[d], species);
-          const aq = anat.expressed[ANATOMY_IDX.AQUATIC_AFFINITY];
-          if (aq < minAq) minAq = aq;
-          if (aq > maxAq) maxAq = aq;
+          const an = params.draftOrg[d].anatomy;
+          if (an !== undefined) {
+            const aq = an.expressed[ANATOMY_IDX.AQUATIC_AFFINITY];
+            if (aq < minAq) minAq = aq;
+            if (aq > maxAq) maxAq = aq;
+          }
         }
-
+        let n0 = 0;
         if (maxT - minT >= 10.0) {
           const midT = (minT + maxT) * 0.5;
-          const coldGroup: number[] = [];
-          const warmGroup: number[] = [];
           for (let i = 0; i < nAlive; i++) {
-            const d = aliveDrafts[i];
-            if (temps[params.draftCellIndex[d]] < midT) coldGroup.push(d);
-            else warmGroup.push(d);
+            clusterOf[i] = temps[params.draftCellIndex[aliveDrafts[i]]] < midT ? 0 : 1;
+            if (clusterOf[i] === 0) n0++;
           }
-          if (coldGroup.length >= cfg.minClusterSize && warmGroup.length >= cfg.minClusterSize) {
-            clusterMembers = [coldGroup, warmGroup];
-            clusterCount = 2;
-            evalMode = 'ecological';
-            isEcologicalBimodalSplit = true;
-          }
-        } else if (maxAq - minAq >= 0.30) {
+        } else if (maxAq - minAq >= 0.3) {
           const midAq = (minAq + maxAq) * 0.5;
-          const landGroup: number[] = [];
-          const waterGroup: number[] = [];
           for (let i = 0; i < nAlive; i++) {
-            const d = aliveDrafts[i];
-            const aq = ensureOrganismAnatomy(params.draftOrg[d], species).expressed[ANATOMY_IDX.AQUATIC_AFFINITY];
-            if (aq < midAq) landGroup.push(d);
-            else waterGroup.push(d);
+            const an = params.draftOrg[aliveDrafts[i]].anatomy;
+            clusterOf[i] = an !== undefined && an.expressed[ANATOMY_IDX.AQUATIC_AFFINITY] >= midAq ? 1 : 0;
+            if (clusterOf[i] === 0) n0++;
           }
-          if (landGroup.length >= cfg.minClusterSize && waterGroup.length >= cfg.minClusterSize) {
-            clusterMembers = [landGroup, waterGroup];
-            clusterCount = 2;
-            evalMode = 'ecological';
-            isEcologicalBimodalSplit = true;
-          }
+        } else {
+          continue; // one interbreeding population, nothing to split
         }
+        if (n0 < cfg.minClusterSize || nAlive - n0 < cfg.minClusterSize) continue;
+        clusterCount = 2;
+        evalMode = 'ecological';
+        isEcologicalSplit = true;
       }
 
-      // Compute whole-species sums for fast complement centroid computation
+      // 5. Whole-species sums (core: everyone; anatomy: carriers only, nothing is synthesized)
+      const clusterSize = new Int32Array(clusterCount);
+      const clusterMinId = new Float64Array(clusterCount).fill(Infinity);
       const totalCoreSum = new Float64Array(locusCount);
       const totalAnatSum = new Float64Array(ANATOMY_LOCUS_COUNT);
+      let totalAnatN = 0;
       let totalTempSum = 0;
-      let totalMoistSum = 0;
       for (let i = 0; i < nAlive; i++) {
         const d = aliveDrafts[i];
         const org = params.draftOrg[d];
-        const c = params.draftCellIndex[d];
-        totalTempSum += temps[c];
-        totalMoistSum += moists[c];
+        const cid = clusterOf[i];
+        clusterSize[cid]++;
+        if (org.id < clusterMinId[cid]) clusterMinId[cid] = org.id;
+        totalTempSum += temps[params.draftCellIndex[d]];
         const mat = org.genome.maternalAlleles;
         const pat = org.genome.paternalAlleles;
-        for (let l = 0; l < locusCount; l++) {
-          totalCoreSum[l] += (mat[l] + pat[l]) * 0.5;
-        }
-        const anat = ensureOrganismAnatomy(org, species);
-        for (let a = 0; a < ANATOMY_LOCUS_COUNT; a++) {
-          totalAnatSum[a] += (anat.maternal[a] + anat.paternal[a]) * 0.5;
+        for (let l = 0; l < locusCount; l++) totalCoreSum[l] += (mat[l] + pat[l]) * 0.5;
+        const an = org.anatomy;
+        if (an !== undefined) {
+          totalAnatN++;
+          for (let a = 0; a < ANATOMY_LOCUS_COUNT; a++) totalAnatSum[a] += (an.maternal[a] + an.paternal[a]) * 0.5;
         }
       }
 
-      // Evaluate each qualifying cluster against either its sister complement or ancestral baseline
+      // Deterministic cluster order: smallest member id first
+      const order: number[] = [];
+      for (let c = 0; c < clusterCount; c++) if (clusterSize[c] >= cfg.minClusterSize) order.push(c);
+      order.sort((a, b) => clusterMinId[a] - clusterMinId[b]);
+
       const clCoreSum = new Float64Array(locusCount);
       const clAnatSum = new Float64Array(ANATOMY_LOCUS_COUNT);
       const clMeanCore = new Float64Array(locusCount);
       const clMeanAnat = new Float64Array(ANATOMY_LOCUS_COUNT);
       const refMeanCore = new Float64Array(locusCount);
       const refMeanAnat = new Float64Array(ANATOMY_LOCUS_COUNT);
-
-      // Sort clusters deterministically by smallest member organism ID so proposals are canonical
-      const clusterMeta: Array<{ cid: number; minOrgId: number }> = [];
-      for (let c = 0; c < clusterCount; c++) {
-        const members = clusterMembers[c];
-        if (members.length < cfg.minClusterSize) continue;
-        let minId = Infinity;
-        for (let i = 0; i < members.length; i++) {
-          const id = params.draftOrg[members[i]].id;
-          if (id < minId) minId = id;
-        }
-        clusterMeta.push({ cid: c, minOrgId: minId });
-      }
-      clusterMeta.sort((a, b) => a.minOrgId - b.minOrgId);
-
-      // Avoid splitting ALL clusters at once on the same tick when there are only 2 clusters:
-      // split the smaller/more-diverged sister subpopulation while keeping the larger parental lineage intact!
       let proposedForThisSpecies = false;
 
-      for (let m = 0; m < clusterMeta.length; m++) {
-        const members = clusterMembers[clusterMeta[m].cid];
-        const clN = members.length;
+      for (const cid of order) {
+        const clN = clusterSize[cid];
         const restN = nAlive - clN;
-
-        // Require either a valid sister population remaining OR strong divergence from registered baseline
-        const hasSisterComplement = restN >= cfg.minParentRemainSize;
-        if (!hasSisterComplement && clusterCount > 1) continue;
+        if (restN < cfg.minParentRemainSize) continue;
 
         clCoreSum.fill(0);
         clAnatSum.fill(0);
+        let clAnatN = 0;
         let clTempSum = 0;
         let clMoistSum = 0;
         let sumX = 0;
         let sumY = 0;
-        let eligibleOrAdultCount = 0;
-        const biomeCodes = params.grid.biomeCode;
+        let matureCount = 0;
         const biomeCounts = new Int32Array(WORLD_BIOME_IDS.length);
-
-        for (let i = 0; i < clN; i++) {
-          const d = members[i];
+        const members: number[] = [];
+        const memberOrgs: Organism[] = [];
+        const restSample: Organism[] = [];
+        const restStride = Math.max(1, Math.floor(restN / 96));
+        let restSeen = 0;
+        for (let i = 0; i < nAlive; i++) {
+          const d = aliveDrafts[i];
           const org = params.draftOrg[d];
+          if (clusterOf[i] !== cid) {
+            if (restSeen++ % restStride === 0) restSample.push(org);
+            continue;
+          }
+          members.push(d);
+          memberOrgs.push(org);
           const c = params.draftCellIndex[d];
           clTempSum += temps[c];
           clMoistSum += moists[c];
           const bCode = biomeCodes[c];
           if (bCode < biomeCounts.length) biomeCounts[bCode]++;
           const cy = (c / w) | 0;
-          const cx = c - cy * w;
-          sumX += cx;
+          sumX += c - cy * w;
           sumY += cy;
-          if (org.stage === 'adult' || org.stage === 'elder') {
-            eligibleOrAdultCount++;
-          }
+          if (org.stage === 'adult' || org.stage === 'elder') matureCount++;
           const mat = org.genome.maternalAlleles;
           const pat = org.genome.paternalAlleles;
-          for (let l = 0; l < locusCount; l++) {
-            clCoreSum[l] += (mat[l] + pat[l]) * 0.5;
-          }
-          const anat = ensureOrganismAnatomy(org, species);
-          for (let a = 0; a < ANATOMY_LOCUS_COUNT; a++) {
-            clAnatSum[a] += (anat.maternal[a] + anat.paternal[a]) * 0.5;
+          for (let l = 0; l < locusCount; l++) clCoreSum[l] += (mat[l] + pat[l]) * 0.5;
+          const an = org.anatomy;
+          if (an !== undefined) {
+            clAnatN++;
+            for (let a = 0; a < ANATOMY_LOCUS_COUNT; a++) clAnatSum[a] += (an.maternal[a] + an.paternal[a]) * 0.5;
           }
         }
-
-        // Cannot form a new reproducing lineage from sterile eggs alone
-        if (eligibleOrAdultCount < 2) continue;
+        // A lineage cannot be founded by eggs and juveniles alone
+        if (matureCount < 2) continue;
 
         const invCl = 1 / clN;
-        for (let l = 0; l < locusCount; l++) clMeanCore[l] = clCoreSum[l] * invCl;
-        for (let a = 0; a < ANATOMY_LOCUS_COUNT; a++) clMeanAnat[a] = clAnatSum[a] * invCl;
+        const invRest = 1 / restN;
+        for (let l = 0; l < locusCount; l++) {
+          clMeanCore[l] = clCoreSum[l] * invCl;
+          refMeanCore[l] = (totalCoreSum[l] - clCoreSum[l]) * invRest;
+        }
+        const restAnatN = totalAnatN - clAnatN;
+        const hasAnatomy = clAnatN > 0 && restAnatN > 0;
+        for (let a = 0; a < ANATOMY_LOCUS_COUNT; a++) {
+          clMeanAnat[a] = clAnatN > 0 ? clAnatSum[a] / clAnatN : 0;
+          refMeanAnat[a] = restAnatN > 0 ? (totalAnatSum[a] - clAnatSum[a]) / restAnatN : 0;
+        }
         const clMeanTemp = clTempSum * invCl;
         const clMeanMoist = clMoistSum * invCl;
+        const refTemp = (totalTempSum - clTempSum) * invRest;
         const cxCentroid = Math.round(sumX * invCl);
         const cyCentroid = Math.round(sumY * invCl);
+        const clusterKey = isEcologicalSplit
+          ? `eco_${cid}_${Math.round(clMeanTemp / 5)}`
+          : `allo_${cxCentroid >> 3}_${cyCentroid >> 3}`;
 
-        // Build spatial/niche tracker key using quantized centroid bucket (16x16 grid region + ecotype)
-        const regionX = cxCentroid >> 3;
-        const regionY = cyCentroid >> 3;
-        const clusterKey = isEcologicalBimodalSplit
-          ? `eco_${clusterMeta[m].cid}_${Math.round(clMeanTemp / 5)}`
-          : `allo_${regionX}_${regionY}`;
-
-        // Compute reference centroid: sister complement if cladogenetic, else parent baseline if anagenetic
-        let refTemp: number;
-        if (hasSisterComplement) {
-          const invRest = 1 / restN;
-          for (let l = 0; l < locusCount; l++) {
-            refMeanCore[l] = (totalCoreSum[l] - clCoreSum[l]) * invRest;
-          }
-          for (let a = 0; a < ANATOMY_LOCUS_COUNT; a++) {
-            refMeanAnat[a] = (totalAnatSum[a] - clAnatSum[a]) * invRest;
-          }
-          refTemp = (totalTempSum - clTempSum) * invRest;
-        } else {
-          // Single-cluster comparison against ancestral registered SpeciesDefinition baseline
-          for (let l = 0; l < locusCount; l++) {
-            const def = schema.loci[l];
-            refMeanCore[l] = species.traitBaselines[def.id] ?? 1.0;
-          }
-          const spBase = deriveSpeciesAnatomyBaseline(species);
-          for (let a = 0; a < ANATOMY_LOCUS_COUNT; a++) {
-            refMeanAnat[a] = spBase[a];
-          }
-          refTemp = species.physiology.optimalTemperatureC;
-        }
-
-        // Compute normalized heritable genetic divergence D_gen
+        // Heritable divergence between the group and its sister group (allele means, range-normalized)
         let sqGen = 0;
-        let totalLoci = 0;
+        let nLoci = 0;
         for (let l = 0; l < locusCount; l++) {
           const def = schema.loci[l];
           const r = species.traitRanges[def.id] ?? def.defaultRange;
           const span = Math.max(1e-6, r.max - r.min);
           const diff = (clMeanCore[l] - refMeanCore[l]) / span;
           sqGen += diff * diff;
-          totalLoci++;
+          nLoci++;
         }
-        for (let a = 0; a < ANATOMY_LOCUS_COUNT; a++) {
-          const r = ANATOMY_RANGES[a];
-          const diff = (clMeanAnat[a] - refMeanAnat[a]) / (r.max - r.min);
-          sqGen += diff * diff;
-          totalLoci++;
+        if (hasAnatomy) {
+          for (let a = 0; a < ANATOMY_LOCUS_COUNT; a++) {
+            const r = ANATOMY_RANGES[a];
+            const diff = (clMeanAnat[a] - refMeanAnat[a]) / (r.max - r.min);
+            sqGen += diff * diff;
+            nLoci++;
+          }
         }
-        const geneticDistance = Math.sqrt(sqGen / Math.max(1, totalLoci));
+        const geneticDistance = Math.sqrt(sqGen / Math.max(1, nLoci));
 
-        // Compute ecological & morphological divergence D_eco
+        // Ecological & morphological divergence (habitat temperature, body size, key anatomy)
         const dTemp = (clMeanTemp - refTemp) / 25;
         const dSize = (clMeanCore[0] ?? 1) - (refMeanCore[0] ?? 1);
-        const dInteg = clMeanAnat[ANATOMY_IDX.INTEGUMENT_THICKNESS] - refMeanAnat[ANATOMY_IDX.INTEGUMENT_THICKNESS];
-        const dAq = clMeanAnat[ANATOMY_IDX.AQUATIC_AFFINITY] - refMeanAnat[ANATOMY_IDX.AQUATIC_AFFINITY];
-        const dHerb = clMeanAnat[ANATOMY_IDX.HERBIVORY_APPARATUS] - refMeanAnat[ANATOMY_IDX.HERBIVORY_APPARATUS];
-        const dCarn = clMeanAnat[ANATOMY_IDX.CARNIVORY_APPARATUS] - refMeanAnat[ANATOMY_IDX.CARNIVORY_APPARATUS];
+        const anatDiff = (idx: number) => (hasAnatomy ? clMeanAnat[idx] - refMeanAnat[idx] : 0);
+        const dInteg = anatDiff(ANATOMY_IDX.INTEGUMENT_THICKNESS);
+        const dAq = anatDiff(ANATOMY_IDX.AQUATIC_AFFINITY);
+        const dHerb = anatDiff(ANATOMY_IDX.HERBIVORY_APPARATUS);
+        const dCarn = anatDiff(ANATOMY_IDX.CARNIVORY_APPARATUS);
         const ecologicalDistance = Math.sqrt(
           (dTemp * dTemp + dSize * dSize + dInteg * dInteg + 1.5 * dAq * dAq + dHerb * dHerb + dCarn * dCarn) / 6.5
         );
 
-        // Compute emergent reproductive isolation score from pre-zygotic + post-zygotic barriers
-        const iPre = clamp01(1 - Math.exp(-3.8 * ecologicalDistance * ecologicalDistance));
-        const postT = geneticDistance > 0.085 ? (geneticDistance - 0.085) / 0.30 : 0;
-        const iPost = clamp01(0.75 * postT);
-        const reproductiveIsolation = clamp01(1 - (1 - iPre) * (1 - iPost));
+        // Reproductive isolation measured with the mating model itself
+        const iso = measureReproductiveIsolation(memberOrgs, species, restSample, species, true, 24);
+        const reproductiveIsolation = Number.isNaN(iso.isolation) ? 0 : iso.isolation;
 
-        // Apply stricter bar when no spatial barrier separates clusters (ecological / single-pop)
-        const genReq = !hasSisterComplement
-          ? cfg.minGeneticDivergence * 1.38
-          : isEcologicalBimodalSplit
-            ? cfg.minGeneticDivergence * 1.15
-            : cfg.minGeneticDivergence;
-        const ecoReq = !hasSisterComplement ? cfg.minEcologicalDivergence * 1.35 : cfg.minEcologicalDivergence;
-        const isoReq = !hasSisterComplement ? cfg.minReproductiveIsolation * 1.15 : cfg.minReproductiveIsolation;
-        const streakReq = !hasSisterComplement ? cfg.requiredPersistenceChecks + 1 : cfg.requiredPersistenceChecks;
-
-        const prevState = this.clusterTrackers.get(`${species.id}::${clusterKey}`);
-        if (prevState?.assignedSpeciesId) {
-          // Already speciated cluster; decay/keep idle
-          continue;
-        }
-
-        const prevStreak = prevState?.streak ?? 0;
+        const genReq = isEcologicalSplit ? cfg.minGeneticDivergence * 1.15 : cfg.minGeneticDivergence;
         const meetsThresholds =
           geneticDistance >= genReq &&
-          ecologicalDistance >= ecoReq &&
-          reproductiveIsolation >= isoReq;
+          ecologicalDistance >= cfg.minEcologicalDivergence &&
+          reproductiveIsolation >= cfg.minReproductiveIsolation;
 
-        // Track streak purely on sustained divergence & isolation so slight size fluctuations
-        // do not wipe out an isolated subpopulation's divergence history.
-        const nextStreak = meetsThresholds ? prevStreak + 1 : Math.max(0, prevStreak - 1);
+        const prevState = this.clusterTrackers.get(`${species.id}::${clusterKey}`);
+        if (prevState?.assignedSpeciesId) continue;
+        const prevStreak = prevState?.streak ?? 0;
+        // Persistence: consecutive checks build the streak; any lapse restarts it
+        const nextStreak = meetsThresholds ? prevStreak + 1 : 0;
 
-        // When picking which subpopulation splits as a new taxon on cladogenesis:
-        // split the smaller cluster OR (if larger) only if it diverged noticeably further from
-        // the ancestral baseline than the remaining group.
-        let isEligibleToBudOff = !hasSisterComplement || clN <= restN;
-        if (hasSisterComplement && clN > restN && meetsThresholds) {
+        // The smaller group buds off; a larger one only if it is clearly the more derived lineage
+        let isEligibleToBudOff = clN <= restN;
+        if (clN > restN && meetsThresholds) {
           const spBaseAnat = deriveSpeciesAnatomyBaseline(species);
           let sqCl = 0;
           let sqRest = 0;
@@ -781,17 +639,17 @@ export class SpeciationEngine {
             sqCl += dC * dC;
             sqRest += dR * dR;
           }
-          for (let a = 0; a < ANATOMY_LOCUS_COUNT; a++) {
-            const r = ANATOMY_RANGES[a];
-            const span = r.max - r.min;
-            const dC = (clMeanAnat[a] - spBaseAnat[a]) / span;
-            const dR = (refMeanAnat[a] - spBaseAnat[a]) / span;
-            sqCl += dC * dC;
-            sqRest += dR * dR;
+          if (hasAnatomy) {
+            for (let a = 0; a < ANATOMY_LOCUS_COUNT; a++) {
+              const r = ANATOMY_RANGES[a];
+              const span = r.max - r.min;
+              const dC = (clMeanAnat[a] - spBaseAnat[a]) / span;
+              const dR = (refMeanAnat[a] - spBaseAnat[a]) / span;
+              sqCl += dC * dC;
+              sqRest += dR * dR;
+            }
           }
-          if (sqCl > sqRest * 1.35) {
-            isEligibleToBudOff = true;
-          }
+          if (sqCl > sqRest * 1.35) isEligibleToBudOff = true;
         }
 
         params.outTrackerUpdates.push({
@@ -799,6 +657,10 @@ export class SpeciationEngine {
           clusterKey,
           nextStreak,
           lastSeenTick: params.targetTick,
+          geneticDistance,
+          ecologicalDistance,
+          reproductiveIsolation,
+          memberCount: clN,
         });
 
         if (
@@ -806,7 +668,7 @@ export class SpeciationEngine {
           remainingSpeciesBudget > 0 &&
           meetsThresholds &&
           isEligibleToBudOff &&
-          nextStreak >= streakReq
+          nextStreak >= cfg.requiredPersistenceChecks
         ) {
           const rootId = params.rootSpeciesResolver(species.id);
           let candidateId = `${rootId}_d${seqCursor}`;
@@ -826,16 +688,14 @@ export class SpeciationEngine {
               bestBiomeIdx = b;
             }
           }
-          const dominantBiome = WORLD_BIOME_IDS[bestBiomeIdx];
-
           const daughter = synthesizeDaughterSpecies({
             parent: species,
             newSpeciesId: candidateId,
             meanCoreAlleles: clMeanCore,
-            meanAnatomyAlleles: clMeanAnat,
+            meanAnatomyAlleles: hasAnatomy ? clMeanAnat : Float64Array.from(deriveSpeciesAnatomyBaseline(species)),
             meanHabitatTempC: clMeanTemp,
             meanHabitatMoisture: clMeanMoist,
-            dominantBiome,
+            dominantBiome: WORLD_BIOME_IDS[bestBiomeIdx],
             cause: evalMode,
           });
 
@@ -857,7 +717,7 @@ export class SpeciationEngine {
             geneticSignature: genSig,
             anatomySignature: anatSig,
             clusterKey,
-            memberDraftIndices: members.slice(),
+            memberDraftIndices: members,
           });
         }
       }

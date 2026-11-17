@@ -156,7 +156,7 @@ export function deriveSpeciesAnatomyBaseline(species: SpeciesDefinition): Float3
   );
 
   const hillCost = sp?.terrainCost?.hills ?? 1.4;
-  const mtnCost = sp?.terrainCost?.mountains ?? 2.2;
+  const mtnCost = sp?.terrainCost?.mountain ?? 2.2;
   const climbBase = hillCost <= 1.2 || mtnCost <= 1.8 ? 0.45 : 0.16;
   base[ANATOMY_IDX.CLIMBING_AFFINITY] = clampRange(climbBase, ANATOMY_IDX.CLIMBING_AFFINITY);
 
@@ -184,6 +184,28 @@ export function deriveSpeciesAnatomyBaseline(species: SpeciesDefinition): Float3
 
   speciesAnatomyBaselineCache.set(species, base);
   return base;
+}
+
+const speciesBaselineStateCache = new WeakMap<SpeciesDefinition, OrganismAnatomyState>();
+
+/**
+ * Anatomy of an idealized individual sitting exactly on the species baseline (both allele copies
+ * at the baseline value, additive expression). Species parameters (thermal optimum, trophic and
+ * spatial profiles) are calibrated for this anatomy, so anatomical effects on performance are
+ * applied relative to it: an average member is unaffected and selection acts on heritable
+ * deviations from the species norm.
+ */
+export function getSpeciesBaselineAnatomy(species: SpeciesDefinition): OrganismAnatomyState {
+  const cached = speciesBaselineStateCache.get(species);
+  if (cached) return cached;
+  const base = deriveSpeciesAnatomyBaseline(species);
+  const maternal = new Float32Array(base);
+  const paternal = new Float32Array(base);
+  const dominance = new Float32Array(ANATOMY_LOCUS_COUNT).fill(0.5);
+  const { expressed, locomotionMode, viability } = expressAnatomy(maternal, paternal, dominance);
+  const state: OrganismAnatomyState = Object.freeze({ maternal, paternal, dominance, expressed, locomotionMode, viability });
+  speciesBaselineStateCache.set(species, state);
+  return state;
 }
 
 export function classifyLocomotionMode(aquaticAffinity: number): LocomotionMode {
@@ -357,9 +379,21 @@ export function ensureOrganismAnatomy(
   return org.anatomy;
 }
 
+/** Largest heritable change one mutation may cause per anatomy locus (developmental constraint). */
+function anatomyMaxMutationStep(locus: number): number {
+  return locus >= ANATOMY_IDX.ARMOR_PROTECTION && locus <= ANATOMY_IDX.CARNIVORY_APPARATUS ? 0.045 : 0.065;
+}
+
 /**
- * Symmetrically mutates and inherits diploid anatomy alleles using Mendelian recombination
- * and gradual morphospace step clamping (zero directional bias).
+ * Mendelian inheritance of the diploid anatomy genome with point mutations.
+ *
+ * Each parent contributes one randomly chosen allele copy per locus (independent assortment,
+ * as for the core genome). Mutations follow the species' `MutationConfig` contract exactly as
+ * core loci do: probability `baseRate` (times an optional per-locus `rateMultiplier`) per allele
+ * copy, normal step with standard deviation `stepScale` (times `scaleMultiplier`) of the locus
+ * range and mean `directionalBias` standard deviations (default 0: no direction). A single step
+ * is additionally capped by a developmental limit so no mutation can jump between anatomical
+ * types; results stay inside the locus range. The parents' states are only read.
  */
 export function inheritOrganismAnatomy(
   motherAnatomy: OrganismAnatomyState,
@@ -371,33 +405,29 @@ export function inheritOrganismAnatomy(
   const paternal = new Float32Array(ANATOMY_LOCUS_COUNT);
   const dominance = new Float32Array(ANATOMY_LOCUS_COUNT);
 
-  const mutRate = mutCfg.perLocusProbability;
-  const mutScale = mutCfg.stepStdDev;
+  const bias = mutCfg.directionalBias ?? 0;
   let mutCount = 0;
 
   for (let i = 0; i < ANATOMY_LOCUS_COUNT; i++) {
     const r = ANATOMY_RANGES[i];
     const span = r.max - r.min;
+    const override = mutCfg.locusOverrides?.[ANATOMY_LOCUS_NAMES[i]];
+    const rawRate = mutCfg.baseRate * (override?.rateMultiplier ?? 1);
+    const rate = rawRate < 0 ? 0 : rawRate > 1 ? 1 : rawRate;
+    const sigma = mutCfg.stepScale * (override?.scaleMultiplier ?? 1) * span;
+    const maxStep = anatomyMaxMutationStep(i);
 
     let matA = rng.chance(0.5) ? motherAnatomy.maternal[i] : motherAnatomy.paternal[i];
     let patA = rng.chance(0.5) ? fatherAnatomy.maternal[i] : fatherAnatomy.paternal[i];
 
-    // Gradual step limit prevents discontinuous jump between incompatible morphological types
-    const maxStep = i >= ANATOMY_IDX.ARMOR_PROTECTION && i <= ANATOMY_IDX.CARNIVORY_APPARATUS
-      ? 0.045
-      : 0.065;
-
-    if (mutRate > 0 && rng.chance(mutRate)) {
-      // Symmetric zero-mean triangular/Gaussian perturbation
-      const u = (rng.nextFloat() + rng.nextFloat() - 1.0) * mutScale * span * 1.4;
-      const step = Math.max(-maxStep, Math.min(maxStep, u));
-      matA = clampRange(matA + step, i);
+    if (rate > 0 && rng.chance(rate)) {
+      const u = sigma > 0 ? rng.gaussian(bias * sigma, sigma) : 0;
+      matA = clampRange(matA + (u < -maxStep ? -maxStep : u > maxStep ? maxStep : u), i);
       mutCount++;
     }
-    if (mutRate > 0 && rng.chance(mutRate)) {
-      const u = (rng.nextFloat() + rng.nextFloat() - 1.0) * mutScale * span * 1.4;
-      const step = Math.max(-maxStep, Math.min(maxStep, u));
-      patA = clampRange(patA + step, i);
+    if (rate > 0 && rng.chance(rate)) {
+      const u = sigma > 0 ? rng.gaussian(bias * sigma, sigma) : 0;
+      patA = clampRange(patA + (u < -maxStep ? -maxStep : u > maxStep ? maxStep : u), i);
       mutCount++;
     }
 
@@ -407,7 +437,7 @@ export function inheritOrganismAnatomy(
     const dM = motherAnatomy.dominance[i];
     const dP = fatherAnatomy.dominance[i];
     let d = dM === dP ? dM : rng.chance(0.5) ? dM : dP;
-    if (mutRate > 0 && rng.chance(mutRate * 0.25)) {
+    if (rate > 0 && rng.chance(rate * 0.25)) {
       const dd = (rng.nextFloat() - 0.5) * 0.1;
       d = Math.max(0, Math.min(1, d + dd));
     }
@@ -486,6 +516,30 @@ export function computeAnatomyPerformanceInto(
     viabilityPenalty;
 
   out.viability = anatomy.viability;
+  return out;
+}
+
+/**
+ * Performance of `anatomy` relative to the species baseline anatomy (see
+ * `getSpeciesBaselineAnatomy`): thermal offsets are differences, every scale is a ratio, so the
+ * baseline individual gets offsets 0 and scales 1.
+ */
+export function computeRelativeAnatomyPerformanceInto(
+  anatomy: OrganismAnatomyState,
+  baseline: AnatomyPerformance,
+  out: AnatomyPerformance
+): AnatomyPerformance {
+  computeAnatomyPerformanceInto(anatomy, out);
+  out.coldOffsetC -= baseline.coldOffsetC;
+  out.heatOffsetC -= baseline.heatOffsetC;
+  out.speedScale /= baseline.speedScale;
+  out.aquaticSpeedScale /= baseline.aquaticSpeedScale;
+  out.climbingScale /= baseline.climbingScale;
+  out.defenseScale /= baseline.defenseScale;
+  out.attackScale /= baseline.attackScale;
+  out.plantExtractScale /= baseline.plantExtractScale;
+  out.preyExtractScale /= baseline.preyExtractScale;
+  out.metabolicScale /= baseline.metabolicScale;
   return out;
 }
 

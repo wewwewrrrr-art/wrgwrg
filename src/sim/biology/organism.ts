@@ -60,7 +60,11 @@ export type OrganismDeathListener = (event: OrganismDeathEvent) => void;
 
 export interface Organism {
   readonly id: number;
-  readonly speciesId: string;
+  /**
+   * Species the organism belongs to. Changes only when its subpopulation founds a new species
+   * (cladogenesis, applied at COMMIT by `BiologySimulation`); the individual itself is unchanged.
+   */
+  speciesId: string;
   readonly sex: Sex;
   readonly generation: number;
   readonly parentAId: number | null;

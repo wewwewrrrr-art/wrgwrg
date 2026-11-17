@@ -1,5 +1,6 @@
 import { ANATOMY_LOCUS_COUNT, deriveSpeciesAnatomyBaseline } from './anatomy';
-import { SpeciesDefinition, TrophicType } from './species';
+import { SpeciesDefinition } from './species';
+import { TrophicType } from './trophicProfile';
 
 export type DivergenceCause = 'founder' | 'allopatric' | 'ecological' | 'parapatric';
 

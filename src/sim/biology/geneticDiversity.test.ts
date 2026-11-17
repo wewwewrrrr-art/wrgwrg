@@ -385,11 +385,11 @@ test('Genetics 3b: geographically isolated populations keep a measurable differe
   const body = pair.comparison.coreLoci[idx('bodySize')];
   assert.ok(Math.abs(body.meanDifference) > 0.3, `inherited body size difference ${body.meanDifference}`);
   assert.ok(body.differentiation > 0.5, `body size differentiation ${body.differentiation}`);
-  // Offspring produced by the simulation carry no anatomy genome; none is invented for them
+  // Offspring inherit an anatomy genome, so anatomy statistics cover every generation
   const p = sim.getGeneticProfile('raptor');
-  const carriers = orgs.filter((o) => o.anatomy !== undefined).length;
-  assert.equal(p.anatomyCarrierCount, carriers);
-  assert.ok(carriers < p.count);
+  assert.ok(orgs.every((o) => o.anatomy !== undefined), 'every organism carries an inherited anatomy genome');
+  assert.equal(p.anatomyCarrierCount, p.count);
+  assert.ok(orgs.filter((o) => o.generation > 0).length > 0);
 });
 
 // =================================================================================================
@@ -488,7 +488,8 @@ test('Genetics 5: results are deterministic, order-independent and reproducible 
 
   const pa = a.getGeneticProfile('raptor');
   const pb = b.getGeneticProfile('raptor');
-  assert.ok(pa.count > 50 && pa.count > pa.anatomyCarrierCount, 'a living, breeding population is analysed');
+  assert.ok(pa.count > 50 && pa.anatomyCarrierCount === pa.count, 'a living, breeding population is analysed');
+  assert.ok(a.getOrganisms('raptor').some((o) => o.generation > 0), 'it includes offspring');
   assert.deepEqual(pa, pb, 'same seed => identical profile');
   assert.deepEqual(a.analyzeSubpopulationGenetics('raptor', { minGroupSize: 3 }), b.analyzeSubpopulationGenetics('raptor', { minGroupSize: 3 }));
   assert.notDeepEqual(pa, c.getGeneticProfile('raptor'), 'another seed => another gene pool');

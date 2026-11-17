@@ -1,6 +1,31 @@
 import { deriveSeed, normalizeSeed, SeedInput } from '../prng';
 import { WORLD_BIOME_IDS, WorldGrid } from '../worldGrid';
-import { ANATOMY_IDX } from './anatomy';
+import { ANATOMY_IDX, getSpeciesBaselineAnatomy } from './anatomy';
+
+// Anatomy effects on locomotion, capture and thermal choice. They are applied as ratios /
+// differences against the species baseline anatomy (see getSpeciesBaselineAnatomy), so the species'
+// calibrated behaviour holds for an average member and heritable deviations change performance.
+function anatomyLandSpeed(an: Float32Array): number {
+  return (0.76 + 0.22 * an[ANATOMY_IDX.LIMB_LENGTH] + 0.05 * (an[ANATOMY_IDX.TAIL_LENGTH] - 1)) * (1 - 0.18 * an[ANATOMY_IDX.ARMOR_PROTECTION]);
+}
+function anatomyWaterPace(an: Float32Array): number {
+  return 0.72 + 0.55 * an[ANATOMY_IDX.AQUATIC_AFFINITY];
+}
+function anatomyHillPace(an: Float32Array): number {
+  return (0.82 + 0.4 * an[ANATOMY_IDX.CLIMBING_AFFINITY]) * (1 - 0.14 * an[ANATOMY_IDX.ARMOR_PROTECTION]);
+}
+function anatomyAttack(an: Float32Array): number {
+  return 0.78 + 0.16 * an[ANATOMY_IDX.HEAD_SIZE] + 0.14 * an[ANATOMY_IDX.CARNIVORY_APPARATUS];
+}
+function anatomyDefense(an: Float32Array): number {
+  return 1 + 0.65 * an[ANATOMY_IDX.ARMOR_PROTECTION] + 0.14 * an[ANATOMY_IDX.TORSO_ROBUSTNESS];
+}
+function anatomyColdShift(an: Float32Array): number {
+  return (an[ANATOMY_IDX.INTEGUMENT_THICKNESS] - 1.0) * 6.0 + (an[ANATOMY_IDX.TORSO_ROBUSTNESS] - 1.0) * 3.0;
+}
+function anatomyHeatShift(an: Float32Array): number {
+  return -(an[ANATOMY_IDX.INTEGUMENT_THICKNESS] - 1.0) * 4.8 - Math.max(0, an[ANATOMY_IDX.TORSO_ROBUSTNESS] - 1.0) * 2.0;
+}
 import { getPhysiologyIndices } from './lifecycle';
 import type { Organism } from './organism';
 import type { SpeciesDefinition } from './species';
@@ -224,6 +249,14 @@ interface SpeciesSpatialRuntime {
   readonly maxForageIntake: number;
   readonly preferredBiome: Uint8Array;
   readonly amphibiousDrinker: boolean;
+  /** Anatomy effect values of the species baseline anatomy (reference for relative effects). */
+  readonly anLand0: number;
+  readonly anWater0: number;
+  readonly anHill0: number;
+  readonly anAttack0: number;
+  readonly anDefense0: number;
+  readonly anCold0: number;
+  readonly anHeat0: number;
 }
 
 export interface SpatialStats {
@@ -670,6 +703,18 @@ export class SpatialBehaviorSystem {
         maxForageIntake: sp.physiology.maxForageIntakePerTick,
         preferredBiome: preferred,
         amphibiousDrinker: profile.locomotion === 'amphibious',
+        ...(() => {
+          const b = getSpeciesBaselineAnatomy(sp).expressed;
+          return {
+            anLand0: anatomyLandSpeed(b),
+            anWater0: anatomyWaterPace(b),
+            anHill0: anatomyHillPace(b),
+            anAttack0: anatomyAttack(b),
+            anDefense0: anatomyDefense(b),
+            anCold0: anatomyColdShift(b),
+            anHeat0: anatomyHeatShift(b),
+          };
+        })(),
       });
     }
 
@@ -1088,14 +1133,8 @@ export class SpatialBehaviorSystem {
     const vFat = clamp01(this.fatigue[vSlot] + this.x_fatigueAdd[vSlot]);
     const pAn = po.anatomy?.expressed;
     const vAn = vo.anatomy?.expressed;
-    const pAnSpeed = pAn
-      ? (0.76 + 0.22 * pAn[ANATOMY_IDX.LIMB_LENGTH] + 0.05 * (pAn[ANATOMY_IDX.TAIL_LENGTH] - 1)) *
-        (1 - 0.18 * pAn[ANATOMY_IDX.ARMOR_PROTECTION])
-      : 1;
-    const vAnSpeed = vAn
-      ? (0.76 + 0.22 * vAn[ANATOMY_IDX.LIMB_LENGTH] + 0.05 * (vAn[ANATOMY_IDX.TAIL_LENGTH] - 1)) *
-        (1 - 0.18 * vAn[ANATOMY_IDX.ARMOR_PROTECTION])
-      : 1;
+    const pAnSpeed = pAn ? anatomyLandSpeed(pAn) / rp.anLand0 : 1;
+    const vAnSpeed = vAn ? anatomyLandSpeed(vAn) / rv.anLand0 : 1;
     const pSpeed =
       this.trait(pe, rp.iSpeed, rp.baseSpeed) * pAnSpeed * rp.profile.cellsPerTick * rp.profile.sprintMultiplier * (1 - 0.5 * pFat);
     const vSpeed =
@@ -1124,12 +1163,8 @@ export class SpatialBehaviorSystem {
     // tropical-forest = 2, temperate-forest = 3: dense cover favors the prey
     const cover = biome === 2 || biome === 3 ? 0.85 : 1;
 
-    const pAttackScale = pAn
-      ? 0.78 + 0.16 * pAn[ANATOMY_IDX.HEAD_SIZE] + 0.14 * pAn[ANATOMY_IDX.CARNIVORY_APPARATUS]
-      : 1;
-    const vDefenseScale = vAn
-      ? 1 + 0.65 * vAn[ANATOMY_IDX.ARMOR_PROTECTION] + 0.14 * vAn[ANATOMY_IDX.TORSO_ROBUSTNESS]
-      : 1;
+    const pAttackScale = pAn ? anatomyAttack(pAn) / rp.anAttack0 : 1;
+    const vDefenseScale = vAn ? anatomyDefense(vAn) / rv.anDefense0 : 1;
 
     const p =
       (speedTerm *
@@ -2043,12 +2078,8 @@ export class SpatialBehaviorSystem {
     const coldTol = this.trait(ex, rt.iColdTol, rt.baseColdTol);
     const adapt = this.trait(ex, rt.iAdapt, rt.baseAdapt);
     const an = org.anatomy?.expressed;
-    const coldShift = an
-      ? (an[ANATOMY_IDX.INTEGUMENT_THICKNESS] - 1.0) * 6.0 + (an[ANATOMY_IDX.TORSO_ROBUSTNESS] - 1.0) * 3.0
-      : 0;
-    const heatShift = an
-      ? -(an[ANATOMY_IDX.INTEGUMENT_THICKNESS] - 1.0) * 4.8 - Math.max(0, an[ANATOMY_IDX.TORSO_ROBUSTNESS] - 1.0) * 2.0
-      : 0;
+    const coldShift = an ? anatomyColdShift(an) - rt.anCold0 : 0;
+    const heatShift = an ? anatomyHeatShift(an) - rt.anHeat0 : 0;
     const upper = rt.optTemp + rt.halfWidth + heatTol * 7.5 + adapt * 3.5 + heatShift;
     const lower = rt.optTemp - rt.halfWidth - coldTol * 8.0 - adapt * 3.5 - coldShift;
     const tHere = this.grid.temperature[cell];
@@ -2130,13 +2161,11 @@ export class SpatialBehaviorSystem {
     let anPaceMul = 1;
     if (an) {
       if (terr <= 1) {
-        anPaceMul = 0.72 + 0.55 * an[ANATOMY_IDX.AQUATIC_AFFINITY];
+        anPaceMul = anatomyWaterPace(an) / rt.anWater0;
       } else if (terr >= 4) {
-        anPaceMul = (0.82 + 0.40 * an[ANATOMY_IDX.CLIMBING_AFFINITY]) * (1 - 0.14 * an[ANATOMY_IDX.ARMOR_PROTECTION]);
+        anPaceMul = anatomyHillPace(an) / rt.anHill0;
       } else {
-        anPaceMul =
-          (0.76 + 0.22 * an[ANATOMY_IDX.LIMB_LENGTH] + 0.05 * (an[ANATOMY_IDX.TAIL_LENGTH] - 1)) *
-          (1 - 0.18 * an[ANATOMY_IDX.ARMOR_PROTECTION]);
+        anPaceMul = anatomyLandSpeed(an) / rt.anLand0;
       }
     }
     const paceEstimate =
