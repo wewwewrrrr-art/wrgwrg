@@ -6,7 +6,6 @@ import type { SpeciesDefinition } from './species';
 import {
   NAV_DX,
   NAV_DY,
-  PATH_DEFERRED,
   PATH_FOUND,
   PATH_PARTIAL,
   PATH_UNREACHABLE,
@@ -346,6 +345,8 @@ export class SpatialBehaviorSystem {
   private readonly height: number;
   private readonly cellCount: number;
   private readonly seed: number;
+  /** Entity slot of local index 0: every per-slot array is indexed by `entitySlot - slotBase`. */
+  private readonly slotBase: number;
   private readonly navOptions: SpatialNavigatorOptions;
   private readonly profileOverrides: Readonly<Record<string, Partial<SpatialSpeciesProfile>>>;
 
@@ -473,14 +474,12 @@ export class SpatialBehaviorSystem {
   private sc_bestFoodCell = -1;
   private sc_bestFoodScore = 0;
   private sc_bestFoodValue = 0;
-  private sc_threat = 0;
   /** Immediate threat (hunting predators within three cells, any predator within one). */
   private sc_threatNear = 0;
   private sc_threatX = 0;
   private sc_threatY = 0;
   private sc_threatCell = -1;
   private sc_preyCell = -1;
-  private sc_preyDist = 0;
   private sc_waterCell = -1;
   private sc_mateCell = -1;
   private sc_mateDist = 0;
@@ -509,7 +508,15 @@ export class SpatialBehaviorSystem {
 
   private view!: SpatialTickView;
 
-  constructor(grid: WorldGrid, seed: SeedInput, config: SpatialBehaviorConfig = {}) {
+  /**
+   * @param slotBase First entity slot that can hold an organism. Lower slots (e.g. the per-cell
+   *   background prey pools) never get spatial state, so no memory is spent on them.
+   */
+  constructor(grid: WorldGrid, seed: SeedInput, config: SpatialBehaviorConfig = {}, slotBase = 0) {
+    if (!Number.isInteger(slotBase) || slotBase < 0) {
+      throw new RangeError(`slotBase must be a non-negative integer, received: ${slotBase}`);
+    }
+    this.slotBase = slotBase;
     this.grid = grid;
     this.width = grid.width;
     this.height = grid.height;
@@ -739,7 +746,9 @@ export class SpatialBehaviorSystem {
   // Slot lifecycle
   // =============================================================================================
 
-  ensureCapacity(n: number): void {
+  /** Ensures spatial state exists for entity slots `[slotBase, entitySlotCount)`. */
+  ensureCapacity(entitySlotCount: number): void {
+    const n = entitySlotCount - this.slotBase;
     if (n <= this.capacity) return;
     let cap = Math.max(64, this.capacity);
     while (cap < n) cap *= 2;
@@ -806,9 +815,18 @@ export class SpatialBehaviorSystem {
     this.x_fatigueAdd = growF32(this.x_fatigueAdd, cap);
   }
 
-  /** Initializes the spatial state of a newly introduced or newly laid organism. Never throws. */
-  initSlot(slot: number, organismId: number, cell: number): void {
-    if (slot >= this.capacity) this.ensureCapacity(slot + 1);
+  /**
+   * Initializes the spatial state of a newly introduced or newly laid organism. Never throws.
+   *
+   * When `parentSlot` is given (offspring), the newborn starts with its mother's still-valid
+   * knowledge of water and food places (natal imprinting): previously acquired information handed
+   * on, instead of a blank individual that cannot know where the nearest water is.
+   */
+  initSlot(entitySlot: number, organismId: number, cell: number, tick = 0, parentEntitySlot = -1): void {
+    const slot = entitySlot - this.slotBase;
+    const parentSlot = parentEntitySlot >= this.slotBase ? parentEntitySlot - this.slotBase : -1;
+    if (slot < 0) return;
+    if (slot >= this.capacity) this.ensureCapacity(entitySlot + 1);
     this.slotOrgId[slot] = organismId;
     this.behavior[slot] = BEHAVIOR_REST;
     this.heading[slot] = -1;
@@ -839,12 +857,27 @@ export class SpatialBehaviorSystem {
       this.memTick[mBase + m] = 0;
       this.memValue[mBase + m] = 0;
     }
+    if (parentSlot >= 0 && parentSlot < this.capacity && parentSlot !== slot && this.slotOrgId[parentSlot] !== 0) {
+      const pBase = parentSlot * MEMORY_SLOTS;
+      let write = 0;
+      for (let m = 0; m < MEMORY_SLOTS; m++) {
+        const kind = this.memKind[pBase + m];
+        if (kind !== MEMORY_WATER && kind !== MEMORY_FOOD) continue;
+        if (tick - this.memTick[pBase + m] > this.memoryTtlTicks) continue;
+        this.memKind[mBase + write] = kind;
+        this.memCell[mBase + write] = this.memCell[pBase + m];
+        this.memTick[mBase + write] = tick;
+        this.memValue[mBase + write] = this.memValue[pBase + m];
+        write++;
+      }
+    }
     this.n_planned[slot] = 0;
     this.n_demandQ[slot] = 0;
   }
 
-  releaseSlot(slot: number): void {
-    if (slot < this.capacity) {
+  releaseSlot(entitySlot: number): void {
+    const slot = entitySlot - this.slotBase;
+    if (slot >= 0 && slot < this.capacity) {
       this.slotOrgId[slot] = 0;
       this.n_planned[slot] = 0;
       this.n_demandQ[slot] = 0;
@@ -901,6 +934,7 @@ export class SpatialBehaviorSystem {
     const occNext = this.occNext;
     const touched = this.occTouched;
     const slotToDraft = this.slotToDraft;
+    const slotBase = this.slotBase;
     let touchedCount = 0;
     // Reverse canonical order so each cell list is traversed in ascending organism id
     for (let ci = n - 1; ci >= 0; ci--) {
@@ -910,7 +944,7 @@ export class SpatialBehaviorSystem {
       if (head === -1) touched[touchedCount++] = c;
       occNext[d] = head;
       occHead[c] = d;
-      slotToDraft[slotArr[d]] = d;
+      slotToDraft[slotArr[d] - slotBase] = d;
     }
     this.occTouchedCount = touchedCount;
   }
@@ -926,6 +960,7 @@ export class SpatialBehaviorSystem {
     const cellArr = view.cell;
     const spArr = view.speciesIdx;
     const slotArr = view.slot;
+    const slotBase = this.slotBase;
     const behavior = this.behavior;
     for (let d = 0; d < n; d++) {
       const f = flags[d];
@@ -936,7 +971,7 @@ export class SpatialBehaviorSystem {
         const k = base + ((f & FLAG_FEMALE) !== 0 ? 1 : 2);
         if (counts[k] < 65535) counts[k]++;
       }
-      if (behavior[slotArr[d]] === BEHAVIOR_HUNT && counts[base + 3] < 65535) counts[base + 3]++;
+      if (behavior[slotArr[d] - slotBase] === BEHAVIOR_HUNT && counts[base + 3] < 65535) counts[base + 3]++;
     }
 
     // Derive, for every occupied cell, what each species perceives there as threat and as prey
@@ -1045,8 +1080,8 @@ export class SpatialBehaviorSystem {
     const vo = view.org[vd];
     const pe = po.phenotype.expressed;
     const ve = vo.phenotype.expressed;
-    const pSlot = view.slot[pd];
-    const vSlot = view.slot[vd];
+    const pSlot = view.slot[pd] - this.slotBase;
+    const vSlot = view.slot[vd] - this.slotBase;
 
     const pFat = clamp01(this.fatigue[pSlot] + this.x_fatigueAdd[pSlot]);
     const vFat = clamp01(this.fatigue[vSlot] + this.x_fatigueAdd[vSlot]);
@@ -1106,7 +1141,7 @@ export class SpatialBehaviorSystem {
     const sp = view.speciesIdx[pd];
     const rt = this.species[sp];
     if (!rt.hasPreyDiet) return -1;
-    const pSlot = view.slot[pd];
+    const pSlot = view.slot[pd] - this.slotBase;
     const pCell = view.cell[pd];
     const w = this.width;
     const py = (pCell / w) | 0;
@@ -1161,7 +1196,7 @@ export class SpatialBehaviorSystem {
     }
 
     const p = this.captureProbability(pd, vd, dist, opportunistic);
-    const vSlot = view.slot[vd];
+    const vSlot = view.slot[vd] - this.slotBase;
     const rv = this.species[view.speciesIdx[vd]];
 
     // Both animals burn a burst of energy and tire, whatever the outcome
@@ -1186,20 +1221,23 @@ export class SpatialBehaviorSystem {
   }
 
   /** Health lost this tick by the occupant of `slot` because it is fully dehydrated. */
-  dehydrationDamage(slot: number): number {
-    return this.hydrationEnabled && this.hydration[slot] <= 0 ? this.dehydrationDamagePerTick : 0;
+  dehydrationDamage(entitySlot: number): number {
+    return this.hydrationEnabled && this.hydration[entitySlot - this.slotBase] <= 0
+      ? this.dehydrationDamagePerTick
+      : 0;
   }
 
   /**
    * Health lost this tick by the occupant of `slot` because it moved on energy it did not have:
    * exertion beyond the reserve is paid with body condition instead of being free.
    */
-  exhaustionDamage(slot: number): number {
-    return this.exhaustion[slot] * this.exhaustionDamagePerTick;
+  exhaustionDamage(entitySlot: number): number {
+    return this.exhaustion[entitySlot - this.slotBase] * this.exhaustionDamagePerTick;
   }
 
   /** Locomotion + strike energy (EU quanta) staged for the occupant of `slot` this tick. */
-  stagedDemandQ(slot: number): number {
+  stagedDemandQ(entitySlot: number): number {
+    const slot = entitySlot - this.slotBase;
     return this.n_planned[slot] === 1 ? this.n_demandQ[slot] : this.x_extraDemandQ[slot];
   }
 
@@ -1373,7 +1411,6 @@ export class SpatialBehaviorSystem {
     let bestFoodCell = -1;
     let bestFoodScore = 0;
     let bestFoodValue = 0;
-    let threat = 0;
     let threatNear = 0;
     let threatX = 0;
     let threatY = 0;
@@ -1416,7 +1453,6 @@ export class SpatialBehaviorSystem {
           const tf = threatF[c];
           if (tf > 0) {
             threatHere = tf * (1 - dist * invR1);
-            threat += threatHere;
             // Flight is provoked by predators that are hunting within three cells and by any
             // predator sharing the animal's own cell; calm predators at a distance are tolerated.
             if (dist <= 3) {
@@ -1476,13 +1512,11 @@ export class SpatialBehaviorSystem {
     this.sc_bestFoodCell = bestFoodCell;
     this.sc_bestFoodScore = bestFoodScore;
     this.sc_bestFoodValue = bestFoodValue;
-    this.sc_threat = threat;
     this.sc_threatNear = threatNear;
     this.sc_threatX = threatX;
     this.sc_threatY = threatY;
     this.sc_threatCell = threatCell;
     this.sc_preyCell = preyCell;
-    this.sc_preyDist = preyDist;
     this.sc_waterCell = waterCell;
     this.sc_mateCell = mateCell;
     this.sc_mateDist = mateDist;
@@ -1805,7 +1839,7 @@ export class SpatialBehaviorSystem {
       for (let o = this.occHead[cell]; o !== -1 && examined < 12; o = this.occNext[o]) {
         if (o === d || view.speciesIdx[o] !== sp || (view.flags[o] & FLAG_DIED) !== 0) continue;
         examined++;
-        const oSlot = view.slot[o];
+        const oSlot = view.slot[o] - this.slotBase;
         const g = this.goalCell[oSlot];
         if (this.behavior[oSlot] === BEHAVIOR_MIGRATE && g >= 0 && g !== cell && comp[g] === myComp) {
           if (this.rand01(tick, id, SALT_FOLLOW) < rt.profile.sociality) return g;
@@ -1962,7 +1996,7 @@ export class SpatialBehaviorSystem {
 
   private planOrganism(d: number, flags: number, tick: number): void {
     const view = this.view;
-    const slot = view.slot[d];
+    const slot = view.slot[d] - this.slotBase;
     const sp = view.speciesIdx[d];
     const rt = this.species[sp];
     const prof = rt.profile;
@@ -2318,7 +2352,7 @@ export class SpatialBehaviorSystem {
         }
       } else if (best === BEHAVIOR_HUNT) {
         tgtId = view.orgId[preyDraft];
-        tgtSlot = view.slot[preyDraft];
+        tgtSlot = view.slot[preyDraft] - this.slotBase;
         newGoal = view.cell[preyDraft];
       } else if (best === BEHAVIOR_SEEK_WATER) {
         newGoal = prevBehavior === BEHAVIOR_SEEK_WATER && goal !== -1 && !arrived ? goal : waterGoal;
@@ -2484,11 +2518,12 @@ export class SpatialBehaviorSystem {
     const orgArr = view.org;
     const w = this.width;
     const epoch = this.nav.epoch;
+    const slotBase = this.slotBase;
     let movedCount = 0;
 
     for (let d = 0; d < n; d++) {
       if ((flags[d] & FLAG_DIED) !== 0) continue;
-      const slot = slotArr[d];
+      const slot = slotArr[d] - slotBase;
       if (this.n_planned[slot] !== 1) continue;
       const nc = this.n_cell[slot];
       const org = orgArr[d];
@@ -2559,8 +2594,9 @@ export class SpatialBehaviorSystem {
     const view = this.view;
     const n = view.draftCount;
     const slotArr = view.slot;
+    const slotBase = this.slotBase;
     for (let d = 0; d < n; d++) {
-      const slot = slotArr[d];
+      const slot = slotArr[d] - slotBase;
       this.slotToDraft[slot] = -1;
       this.x_attacked[slot] = 0;
       this.x_extraDemandQ[slot] = 0;
@@ -2590,7 +2626,8 @@ export class SpatialBehaviorSystem {
   // Inspection (never used by the simulation itself)
   // =============================================================================================
 
-  describeSlot(slot: number): OrganismSpatialState | undefined {
+  describeSlot(entitySlot: number): OrganismSpatialState | undefined {
+    const slot = entitySlot - this.slotBase;
     if (slot < 0 || slot >= this.capacity || this.slotOrgId[slot] === 0) return undefined;
     const memory: { kind: string; cell: number; tick: number; value: number }[] = [];
     const base = slot * MEMORY_SLOTS;
@@ -2605,7 +2642,7 @@ export class SpatialBehaviorSystem {
       });
     }
     return Object.freeze({
-      slot,
+      slot: entitySlot,
       behavior: this.behavior[slot],
       behaviorName: BEHAVIOR_NAMES[this.behavior[slot]],
       heading: this.heading[slot],
@@ -2625,16 +2662,22 @@ export class SpatialBehaviorSystem {
     });
   }
 
-  /** Bytes held by per-organism spatial state for the current slot capacity. */
+  /**
+   * Exact bytes held by per-organism spatial state (committed + staged + per-tick scratch) for the
+   * current slot capacity, measured from the live typed arrays.
+   */
   estimateStateBytes(): number {
-    const perSlot =
-      8 + 1 + 1 + 4 + 4 + 4 + 4 + 8 + 4 + 4 + 2 + 2 + 4 + 1 + 4 + 4 + 4 + 2 + 1 + 1 + 4 +
-      WAYPOINT_SLOTS * 4 +
-      MEMORY_SLOTS * (4 + 1 + 4 + 4) +
-      // staged mirror + per-tick scratch
-      (1 + 4 + 1 + 1 + 4 + 4 + 4 + 4 + 8 + 4 + 4 + 2 + 2 + 4 + 1 + 4 + 4 + 1 + 1 + 1 + 1 + WAYPOINT_SLOTS * 4 + 8) +
-      (4 + 1 + 8 + 4);
-    return perSlot * this.capacity;
+    const cap = this.capacity;
+    if (cap === 0) return 0;
+    let bytes = 0;
+    for (const value of Object.values(this) as unknown[]) {
+      if (!ArrayBuffer.isView(value) || value === this.occHead || value === this.occTouched) continue;
+      const view = value as unknown as { length: number; byteLength: number };
+      if (view.length === cap || view.length === cap * WAYPOINT_SLOTS || view.length === cap * MEMORY_SLOTS) {
+        bytes += view.byteLength;
+      }
+    }
+    return bytes;
   }
 }
 

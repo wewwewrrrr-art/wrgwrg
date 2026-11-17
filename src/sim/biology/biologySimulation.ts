@@ -1218,7 +1218,12 @@ export class BiologySimulation {
           'Spatial behavior uses the approved finite geography: wrapX must be false (no crossing between map edges)'
         );
       }
-      this.spatial = new SpatialBehaviorSystem(config.grid, seed, spatialCfg === true ? {} : spatialCfg);
+      this.spatial = new SpatialBehaviorSystem(
+        config.grid,
+        seed,
+        spatialCfg === true ? {} : spatialCfg,
+        this.organismSlotBase
+      );
       this.spatial.ensureCapacity(this.entityStore.capacity);
       const emptyF64 = new Float64Array(0);
       this.spatialView = {
@@ -4926,9 +4931,6 @@ export class BiologySimulation {
         const normEggE = rawEggNorm < 1 ? rawEggNorm : 1;
         egg.energy = normEggE;
         slotLastSyncedEnergy[slot] = normEggE;
-        if (this.spatial !== null) {
-          this.spatial.initSlot(slot, egg.id, egg.cellIndex);
-        }
         phenCtx.physicalMaturityScale = 0.15;
         phenCtx.neuralMaturityScale = 0.15;
         phenCtx.senescencePhysicalScale = 1.0;
@@ -4971,6 +4973,17 @@ export class BiologySimulation {
         for (let i = 0; i < touchedPops.length; i++) {
           touchedPops[i].invalidateSpatialIndex();
         }
+      }
+      // Newly laid eggs get their spatial state after the mother's own state (including what she
+      // learned this tick) became current, so they can inherit her knowledge of water and food.
+      const eggOrg = this.eggOrg;
+      const eggProvisioned = this.eggProvisioned;
+      const eggDraftSlot = this.eggDraftSlot;
+      for (let i = 0; i < eggPlanCount; i++) {
+        if (eggProvisioned[i] === 0) continue;
+        const egg = eggOrg[i];
+        const motherSlot = egg.parentAId !== null ? organismIdToSlot.get(egg.parentAId) : undefined;
+        this.spatial.initSlot(eggDraftSlot[i], egg.id, egg.cellIndex, targetTick, motherSlot ?? -1);
       }
     }
 

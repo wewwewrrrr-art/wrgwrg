@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { SeededRng } from '../prng';
 import { EnergyPool } from '../worldEnergyGrid';
-import { TerrainType, WorldCellPatch, WorldGrid } from '../worldGrid';
+import { WorldCellPatch, WorldGrid } from '../worldGrid';
 import { BiologySimulation, BiologySimulationConfig, BiologyStepPhase } from './biologySimulation';
 import { createIndividualGenome } from './genome';
 import { Organism, OrganismDeathEvent, Sex } from './organism';
@@ -643,10 +643,18 @@ test('Spatial 7: a population migrates away when its home region deteriorates', 
   const aliveAtOnset = sim.getOrganisms('grazer').length;
   assert.ok(aliveAtOnset >= 30);
   const firstMigrationTick = new Map<number, number>();
+  let largestTravellingGroup = 0;
   stepChecked(sim, ['grazer'], 90, (tick) => {
+    const sharedGoals = new Map<number, number>();
     for (const o of sim.getOrganisms('grazer')) {
       const st = sim.getOrganismSpatialState(o.id);
-      if (st && st.migrations > 0 && !firstMigrationTick.has(o.id)) firstMigrationTick.set(o.id, tick);
+      if (!st) continue;
+      if (st.migrations > 0 && !firstMigrationTick.has(o.id)) firstMigrationTick.set(o.id, tick);
+      if (st.behavior === BEHAVIOR_MIGRATE && st.goalCell >= 0) {
+        const n = (sharedGoals.get(st.goalCell) ?? 0) + 1;
+        sharedGoals.set(st.goalCell, n);
+        if (n > largestTravellingGroup) largestTravellingGroup = n;
+      }
     }
     assertExactEnergy(sim, 'heat wave');
   });
@@ -663,6 +671,8 @@ test('Spatial 7: a population migrates away when its home region deteriorates', 
   // Movement is the sum of individual decisions taken at different times, not one synchronous jump
   assert.ok(new Set(firstMigrationTick.values()).size >= 4, 'individuals must decide to leave at different moments');
   assert.ok(sim.spatial!.stats.migrationsSettled > 0, 'migrants must settle once they reach a good place');
+  // Group migration: neighbours join an individual that is already under way and share its destination
+  assert.ok(largestTravellingGroup >= 3, `some migrants must travel as a group (largest: ${largestTravellingGroup})`);
 });
 
 // =================================================================================================
@@ -986,4 +996,245 @@ test('Spatial 13: population spatial indices stay exact after mass movement, bir
   const deaths = ACTIVE_IDS.reduce((s, sp) => s + sim.getStats(sp).deathsTotal, 0);
   assert.ok(births > 50 && deaths > 20, 'mates must still find each other through the index after moving');
   assertExactEnergy(sim, 'index');
+});
+
+// =================================================================================================
+// 14. Long multi-species run across varied ecological conditions
+// =================================================================================================
+
+function hashWorldGrid(grid: WorldGrid): string {
+  const h = crypto.createHash('sha256');
+  for (const buf of [grid.elevation, grid.terrainCode, grid.temperature, grid.moisture, grid.biomeCode, grid.waterDepth, grid.biomass]) {
+    h.update(Buffer.from(buf.buffer));
+  }
+  return h.digest('hex');
+}
+
+function buildLivingWorld(seed: string): { sim: BiologySimulation; grid: WorldGrid } {
+  const grid = WorldGrid.generate({ width: 72, height: 48, seed: 'living-world-long' });
+  const sim = makeSim(grid, seed, [GRAZER, HUNTER, CLEANER, DIGGER], { backgroundPreyCapacityScale: 0, statsInterval: 1_000_000 });
+  sim.spawnFounderPopulation('grazer', 500);
+  sim.spawnFounderPopulation('hunter', 60, { center: { x: 22, y: 20, radius: 7 } });
+  sim.spawnFounderPopulation('cleaner', 40, { center: { x: 22, y: 20, radius: 7 } });
+  sim.spawnFounderPopulation('digger', 100, { center: { x: 30, y: 22, radius: 9 } });
+  return { sim, grid };
+}
+
+test('Spatial 14: 600-tick multi-species world with feeding, hunting, reproduction, mortality and migration', () => {
+  const ids = ['grazer', 'hunter', 'cleaner', 'digger'] as const;
+  const { sim, grid } = buildLivingWorld('living-world-long-sim');
+  const twin = buildLivingWorld('living-world-long-sim').sim;
+  const gridHash = hashWorldGrid(grid);
+  const stats = grid.getStats();
+  const biomesPresent = Object.values(stats.biomeCounts).filter((n) => n > 0).length;
+  assert.ok(biomesPresent >= 6, `the world must offer varied ecological conditions (${biomesPresent} biomes)`);
+  assert.ok(stats.waterCells > 0 && stats.landCells > 0);
+
+  const grazerSeries: number[] = [];
+  const hunterSeries: number[] = [];
+  const occupiedBiomes = new Set<number>();
+  const predationKills: OrganismDeathEvent[] = [];
+  sim.onDeath((ev) => {
+    if (ev.cause === 'predation') predationKills.push(ev);
+  });
+
+  stepChecked(sim, ids, 600, (tick) => {
+    if (tick % 25 === 0) {
+      assertExactEnergy(sim, `long run tick ${tick}`);
+      grazerSeries.push(sim.getOrganisms('grazer').length);
+      hunterSeries.push(sim.getOrganisms('hunter').length);
+      for (const sp of ids) for (const o of sim.getOrganisms(sp)) occupiedBiomes.add(grid.biomeCode[o.cellIndex]);
+    }
+    if (tick === 200) {
+      twin.stepMany(200);
+      assert.equal(fingerprint(sim, ids), fingerprint(twin, ids), 'the long run must be reproducible from its seed');
+    }
+  });
+
+  assert.equal(hashWorldGrid(grid), gridHash, 'biology must never write to WorldGrid');
+  const s = sim.spatial!.stats;
+  const grazers = sim.getStats('grazer');
+  const hunters = sim.getStats('hunter');
+
+  // Persistence and turnover
+  assert.ok(grazers.totalAlive > 100, `grazers must persist (${grazers.totalAlive})`);
+  assert.ok(hunters.totalAlive >= 2, `hunters must persist on live prey alone (${hunters.totalAlive})`);
+  assert.ok(Math.min(...hunterSeries) >= 2 && Math.min(...grazerSeries) >= 50, 'neither population may collapse on the way');
+  assert.ok(grazers.maxGeneration >= 8 && hunters.maxGeneration >= 4, 'many generations must have passed');
+  for (const sp of ids) {
+    assert.ok(sim.getStats(sp).birthsTotal > 0, `${sp} must have reproduced`);
+    assert.ok(sim.getStats(sp).deathsTotal > 0, `${sp} must have experienced mortality`);
+  }
+
+  // Every mortality pathway is exercised
+  const causes = (name: string) => ids.reduce((sum, sp) => sum + (sim.getStats(sp).deathsByCause[name] ?? 0), 0);
+  for (const cause of ['old-age', 'predation', 'starvation', 'thermal-stress', 'dehydration']) {
+    assert.ok(causes(cause) > 0, `expected deaths by ${cause}`);
+  }
+  assert.equal(predationKills.length, causes('predation'));
+  assert.ok(predationKills.every((k) => k.killerId !== null));
+
+  // Real feeding and hunting
+  assert.ok(s.huntAttempts > 1000 && s.huntSuccesses > 300, `hunting must be routine (${s.huntSuccesses}/${s.huntAttempts})`);
+  assert.ok(s.huntAttempts - s.huntSuccesses > 300, 'a large share of hunts must fail');
+  assert.ok(hunters.birthsTotal > 100, 'predators must gain enough from hunting to breed');
+
+  // Movement, navigation, water and migration
+  assert.ok(s.moves > 100_000, `organisms must move constantly (${s.moves})`);
+  assert.ok(s.drinks > 1000, 'animals must travel to water and drink');
+  assert.ok(s.pathRequests > 0, 'obstacles must force route planning');
+  assert.ok(s.migrationsStarted > 500 && s.migrationsSettled > 200, `migrations must start and end (${s.migrationsStarted}/${s.migrationsSettled})`);
+  assert.ok(occupiedBiomes.size >= 4, `life must spread over several biomes (${occupiedBiomes.size})`);
+
+  // Predator-prey dynamics: the prey population swings strongly while predators track it
+  const afterStart = grazerSeries.slice(4);
+  assert.ok(Math.max(...afterStart) >= 2 * Math.min(...afterStart), 'prey numbers must oscillate under predation');
+  assert.ok(Math.max(...hunterSeries) >= 3 * 60, 'predators must have boomed when prey was abundant');
+
+  // The populations are spatially structured (foundation for isolation)
+  const grazerGroups = sim.getSubpopulations('grazer', 3);
+  assert.equal(grazerGroups.reduce((sum, g) => sum + g.size, 0), grazers.totalAlive);
+  assert.ok(grazerGroups[0].cellCount > 50, 'the main group must occupy a real territory');
+  assertExactEnergy(sim, 'long run end');
+});
+
+// =================================================================================================
+// Hydration, locomotion modes, configuration and load
+// =================================================================================================
+
+test('Spatial: thirsty animals walk to water they perceive or remember; without water they die of dehydration', () => {
+  // Dry plain with a single wet strip on the east side
+  const grid = makeFlatGrid(26, 9, 'water', { moisture: 0.3 });
+  paint(grid, 9, 0, 10, 8, { moisture: 0.62 });
+  const sim = makeSim(grid, 'water-sim', [GRAZER], { backgroundPreyCapacityScale: 0 });
+  const w = grid.width;
+  const group: Organism[] = [];
+  for (let i = 0; i < 8; i++) {
+    group.push(spawn(sim, GRAZER, 5 + (i % 2), 2 + (i % 5), { energy: 0.8, sex: i % 2 ? 'male' : 'female', ageTicks: 40 }));
+  }
+  const drank = new Set<number>();
+  const remembered = new Set<number>();
+  let minHydration = 1;
+  stepChecked(sim, ['grazer'], 60, () => {
+    for (const o of group) {
+      if (!o.alive) continue;
+      const st = sim.getOrganismSpatialState(o.id)!;
+      if (st.hydration < minHydration) minHydration = st.hydration;
+      if (o.x === 9 || o.x === 10) drank.add(o.id);
+      if (st.memory.some((m) => m.kind === 'water' && (m.cell % w === 9 || m.cell % w === 10))) remembered.add(o.id);
+    }
+  });
+  assert.ok(drank.size >= 7, `animals must reach the water (${drank.size}/8)`);
+  assert.ok(remembered.size >= 7, 'the water place must be remembered');
+  assert.ok(sim.spatial!.stats.drinks >= 16, 'they must come back to drink repeatedly');
+  assert.ok(minHydration > 0, 'with water within reach nobody should run completely dry');
+  assert.equal(sim.getStats('grazer').deathsByCause['dehydration'] ?? 0, 0);
+
+  // Same animals on a plain with no water at all
+  const dry = makeFlatGrid(26, 9, 'no-water', { moisture: 0.3 });
+  const drySim = makeSim(dry, 'no-water-sim', [GRAZER], { backgroundPreyCapacityScale: 0 });
+  for (let i = 0; i < 6; i++) {
+    spawn(drySim, GRAZER, 5 + (i % 2), 2 + (i % 5), { energy: 0.8, sex: 'female', ageTicks: 40 });
+  }
+  const causes: string[] = [];
+  drySim.onDeath((ev) => causes.push(ev.cause));
+  stepChecked(drySim, ['grazer'], 70);
+  assert.equal(causes.length, 6, 'nobody survives without water');
+  assert.ok(causes.every((c) => c === 'dehydration'), `expected dehydration, got ${causes.join(',')}`);
+  assertExactEnergy(drySim, 'no water');
+});
+
+test('Spatial: terrestrial, amphibious and aquatic species obey their own terrain', () => {
+  const wader = makeSpecies('wader', 'herbivore', { bodySize: 0.6, spatial: { locomotion: 'amphibious' } });
+  const swimmer = makeSpecies('swimmer', 'scavenger', { bodySize: 0.7, spatial: { locomotion: 'aquatic' } });
+  const grid = makeFlatGrid(20, 9, 'modes', DESERT);
+  paint(grid, 8, 0, 9, 8, { terrain: 'shallow-water' }); // a ford: only waders can cross
+  paint(grid, 16, 0, 19, 8, WATER);
+  paint(grid, 10, 0, 15, 8, { moisture: 0.56 }); // rich land beyond the ford
+  const sim = makeSim(
+    grid,
+    'modes-sim',
+    [GRAZER, wader, swimmer],
+    { backgroundPreyCapacityScale: 0, plantPhotosynthesisRate: 0 },
+    { hydration: { enabled: false } }
+  );
+
+  assert.throws(() => spawn(sim, GRAZER, 8, 4), /impassable for its locomotion/);
+  assert.throws(() => spawn(sim, swimmer, 3, 3), /impassable for its locomotion/);
+  const walkers: Organism[] = [];
+  const waders: Organism[] = [];
+  for (let i = 0; i < 6; i++) {
+    walkers.push(spawn(sim, GRAZER, 6, 1 + i, { energy: 0.3, sex: i % 2 ? 'male' : 'female', ageTicks: 40 }));
+    waders.push(spawn(sim, wader, 7, 1 + i, { energy: 0.3, sex: i % 2 ? 'male' : 'female', ageTicks: 40 }));
+  }
+  const fish = [spawn(sim, swimmer, 17, 2, { ageTicks: 40 }), spawn(sim, swimmer, 18, 6, { sex: 'male', ageTicks: 40 })];
+  const founded = sim.spawnFounderPopulation('swimmer', 12);
+  assert.ok(founded.every((o) => grid.hasWater(o.x, o.y)), 'aquatic founders are placed in water');
+
+  const wadersAcross = new Set<number>();
+  stepChecked(sim, ['grazer', 'wader', 'swimmer'], 40, () => {
+    for (const o of walkers) if (o.alive) assert.ok(o.x <= 7, 'a land animal cannot enter the water');
+    for (const o of waders) if (o.alive && o.x >= 10) wadersAcross.add(o.id);
+    for (const o of sim.getOrganisms('swimmer')) assert.ok(grid.hasWater(o.x, o.y), 'an aquatic animal cannot leave the water');
+  });
+  assert.ok(wadersAcross.size >= 4, `amphibious animals must wade to the food (${wadersAcross.size}/6)`);
+  assert.ok(fish.some((o) => !o.alive || sim.getOrganismSpatialState(o.id)!.pathCostTravelled >= 0));
+  assertExactEnergy(sim, 'locomotion modes');
+});
+
+test('Spatial: configuration is validated and the feature is strictly opt-in', () => {
+  const grid = makeFlatGrid(8, 6, 'config');
+  const plain = makeSim(grid, 'config-off', [GRAZER], {}, false);
+  assert.equal(plain.spatial, null);
+  const o = spawn(plain, GRAZER, 2, 2);
+  plain.stepMany(5);
+  assert.equal(plain.getOrganismSpatialState(o.id), undefined);
+  assert.equal(o.x, 2, 'without spatial behavior organisms never move');
+  assert.equal(plain.getSubpopulations('grazer', 2)[0].size, 1);
+
+  assert.throws(() => new BiologySimulation({ grid, strictConservation: false, spatial: true }), /strict conservation/);
+  assert.throws(() => makeSim(grid, 'x', [GRAZER], {}, { thinkInterval: 0 }), /thinkInterval/);
+  assert.throws(() => makeSim(grid, 'x', [GRAZER], {}, { maxStepsPerTick: 0 }), /maxStepsPerTick/);
+  assert.throws(() => makeSim(grid, 'x', [GRAZER], {}, { hydration: { drinkPerTick: 2 } }), /drinkPerTick/);
+  assert.throws(
+    () => makeSim(grid, 'x', [GRAZER], {}, { speciesProfiles: { grazer: { sprintMultiplier: 0.5 } } }).spawnFounderPopulation('grazer', 1),
+    /sprintMultiplier/
+  );
+  assert.throws(
+    () => makeSim(grid, 'x', [makeSpecies('odd', 'herbivore', { spatial: { locomotion: 'flying' as never } })]).spawnFounderPopulation('odd', 1),
+    /locomotion invalid/
+  );
+  assert.throws(() => makeSim(grid, 'x', [GRAZER], { backgroundPreyCapacityScale: -1 }), /backgroundPreyCapacityScale/);
+
+  // Per-species overrides reach the behavior system
+  const tuned = makeSim(grid, 'config-tuned', [GRAZER], {}, { speciesProfiles: { grazer: { perceptionRangeCells: 5, cellsPerTick: 2 } } });
+  tuned.spawnFounderPopulation('grazer', 4);
+  assert.equal(tuned.spatial!.getSpeciesProfile(0).perceptionRangeCells, 5);
+  assert.equal(tuned.spatial!.getSpeciesProfile(0).cellsPerTick, 2);
+});
+
+test('Spatial: load smoke test at 1 000 and 10 000 organisms with exact conservation', () => {
+  for (const n of [1_000, 10_000]) {
+    const grid = WorldGrid.generate({ width: 128, height: 96, seed: 'spatial-load' });
+    const sim = makeSim(grid, 'spatial-load-sim', [GRAZER, HUNTER, CLEANER], { statsInterval: 1_000_000 });
+    sim.spawnFounderPopulation('grazer', Math.round(n * 0.75));
+    sim.spawnFounderPopulation('hunter', Math.round(n * 0.1));
+    sim.spawnFounderPopulation('cleaner', Math.round(n * 0.15));
+    sim.stepMany(3); // warm-up
+    const ticks = 8;
+    const t0 = performance.now();
+    sim.stepMany(ticks);
+    const msPerTick = (performance.now() - t0) / ticks;
+    const alive = ['grazer', 'hunter', 'cleaner'].reduce((s, sp) => s + sim.getOrganisms(sp).length, 0);
+    assertExactEnergy(sim, `load ${n}`);
+    assert.ok(alive >= n * 0.8, `population must still be there (${alive})`);
+    assert.ok(sim.spatial!.stats.moves > n, 'organisms must be moving under load');
+    // Generous regression guard, not a performance target (measured: a few microseconds per organism)
+    assert.ok(msPerTick < 60 + n * 0.05, `${n} organisms took ${msPerTick.toFixed(1)} ms/tick`);
+    // Navigation stays budgeted regardless of population size
+    assert.ok(sim.spatial!.navigator.tickStats.requests <= sim.spatial!.navigator.maxRequestsPerTick);
+    assert.ok(sim.spatial!.navigator.tickStats.nodesExpanded <= sim.spatial!.navigator.nodeBudgetPerTick + sim.spatial!.navigator.maxNodesPerRequest);
+    // Per-organism spatial state is compact fixed-size typed-array storage
+    assert.ok(sim.spatial!.estimateStateBytes() / sim.entityStore.capacity < 400);
+  }
 });
